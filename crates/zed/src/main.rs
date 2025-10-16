@@ -631,6 +631,7 @@ pub fn main() {
         zeta::init(cx);
         inspector_ui::init(app_state.clone(), cx);
         json_schema_store::init(cx);
+        which_key::init(cx);
 
         cx.observe_global::<SettingsStore>({
             let http = app_state.client.http_client();
