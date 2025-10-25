@@ -523,6 +523,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn move_tab_to_new_window(&self) {}
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
+    fn set_traffic_light_vertical_center(&self, _center: Option<Pixels>) {}
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::HWND;
@@ -1261,6 +1262,7 @@ impl Default for WindowOptions {
                 title: Default::default(),
                 appears_transparent: Default::default(),
                 traffic_light_position: Default::default(),
+                traffic_light_vertical_center: Default::default(),
             }),
             focus: true,
             show: true,
@@ -1290,6 +1292,11 @@ pub struct TitlebarOptions {
 
     /// The position of the macOS traffic light buttons
     pub traffic_light_position: Option<Point<Pixels>>,
+
+    /// Optional vertical center in window coordinates for macOS traffic light buttons.
+    /// When set, the buttons will be vertically centered around this value instead of using
+    /// a fixed offset from the top of the titlebar.
+    pub traffic_light_vertical_center: Option<Pixels>,
 }
 
 /// The kind of window to create

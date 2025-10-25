@@ -405,6 +405,7 @@ struct MacWindowState {
     last_key_equivalent: Option<KeyDownEvent>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
+    traffic_light_vertical_center: Option<Pixels>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
@@ -422,6 +423,11 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
+    fn set_traffic_light_vertical_center(&mut self, center: Option<Pixels>) {
+        self.traffic_light_vertical_center = center;
+        self.move_traffic_light();
+    }
+
     fn move_traffic_light(&self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -449,11 +455,16 @@ impl MacWindowState {
                 let mut close_button_frame: CGRect = msg_send![close_button, frame];
                 let mut min_button_frame: CGRect = msg_send![min_button, frame];
                 let mut zoom_button_frame: CGRect = msg_send![zoom_button, frame];
+                let button_height = px(close_button_frame.size.height as f32);
+                let desired_center = if let Some(center) = self.traffic_light_vertical_center {
+                    center
+                } else {
+                    titlebar_height - traffic_light_position.y - button_height * 0.5
+                };
+
                 let mut origin = point(
                     traffic_light_position.x,
-                    titlebar_height
-                        - traffic_light_position.y
-                        - px(close_button_frame.size.height as f32),
+                    desired_center - button_height * 0.5,
                 );
                 let button_spacing =
                     px((min_button_frame.origin.x - close_button_frame.origin.x) as f32);
@@ -710,6 +721,9 @@ impl MacWindow {
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
+                traffic_light_vertical_center: titlebar
+                    .as_ref()
+                    .and_then(|titlebar| titlebar.traffic_light_vertical_center),
                 transparent_titlebar: titlebar
                     .as_ref()
                     .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -1039,6 +1053,10 @@ impl PlatformWindow for MacWindow {
                 let _: () = msg_send![native_window, setTabbingIdentifier:nil];
             }
         }
+    }
+
+    fn set_traffic_light_vertical_center(&self, center: Option<Pixels>) {
+        self.0.lock().set_traffic_light_vertical_center(center);
     }
 
     fn scale_factor(&self) -> f32 {

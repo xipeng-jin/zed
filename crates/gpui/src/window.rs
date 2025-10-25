@@ -4445,6 +4445,13 @@ impl Window {
         self.platform_window.toggle_window_tab_overview()
     }
 
+    /// Sets the vertical center for the macOS traffic light buttons.
+    /// This is macOS specific.
+    pub fn set_traffic_light_vertical_center(&self, center: Option<Pixels>) {
+        self.platform_window
+            .set_traffic_light_vertical_center(center)
+    }
+
     /// Sets the tabbing identifier for the window.
     /// This is macOS specific.
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
