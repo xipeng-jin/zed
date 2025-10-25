@@ -596,6 +596,7 @@ pub fn open_settings_editor(
                     title: Some("Zed — Settings".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(12.0), px(12.0))),
+                    traffic_light_vertical_center: None,
                 }),
                 focus: true,
                 show: true,

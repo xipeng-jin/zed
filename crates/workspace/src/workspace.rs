@@ -112,6 +112,8 @@ use task::{DebugScenario, SpawnInTerminal, TaskContext};
 use theme::{ActiveTheme, GlobalTheme, SystemAppearance, ThemeSettings};
 pub use toolbar::{Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView};
 pub use ui;
+#[cfg(target_os = "macos")]
+use ui::Tab;
 use ui::{Window, prelude::*};
 use util::{
     ResultExt, TryFutureExt,
@@ -2088,13 +2090,25 @@ impl Workspace {
         &self.app_state.client
     }
 
-    pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_titlebar_item(
+        &mut self,
+        item: AnyView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.titlebar_item = Some(item);
+        #[cfg(target_os = "macos")]
+        window.set_traffic_light_vertical_center(None);
         cx.notify();
     }
 
-    pub fn clear_titlebar_item(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn clear_titlebar_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.titlebar_item = None;
+        #[cfg(target_os = "macos")]
+        {
+            let tab_height = Tab::container_height(cx);
+            window.set_traffic_light_vertical_center(Some(tab_height * 0.5));
+        }
         cx.notify();
     }
 
