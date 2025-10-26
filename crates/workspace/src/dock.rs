@@ -4,13 +4,15 @@ use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
 use gpui::{
-    Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
+    Action, AnyView, App, Axis, Context, Corner, Div, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
     Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
     px,
 };
 use settings::SettingsStore;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use ui::Tab;
 use ui::{ContextMenu, Divider, DividerColor, IconButton, Tooltip, h_flex};
 use ui::{prelude::*, right_click_menu};
 
@@ -745,6 +747,46 @@ impl Dock {
             }
         }
     }
+
+    fn should_reserve_traffic_light_space(&self, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if self.position != DockPosition::Left {
+                return false;
+            }
+
+            let Some(workspace) = self.workspace.upgrade() else {
+                return false;
+            };
+
+            return workspace.read(cx).titlebar_item().is_none();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            false
+        }
+    }
+
+    fn traffic_light_placeholder(&self, cx: &mut Context<Self>) -> Div {
+        #[cfg(target_os = "macos")]
+        {
+            return div()
+                .flex_none()
+                .h(Tab::container_height(cx))
+                .w_full()
+                .bg(cx.theme().colors().panel_background)
+                .border_b_1()
+                .border_color(cx.theme().colors().border);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            div().flex_none()
+        }
+    }
 }
 
 impl Render for Dock {
@@ -752,6 +794,11 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let size = entry.panel.size(window, cx);
+            let mut traffic_light_placeholder = if self.should_reserve_traffic_light_space(cx) {
+                Some(self.traffic_light_placeholder(cx))
+            } else {
+                None
+            };
 
             let position = self.position;
             let create_resize_handle = || {
@@ -829,19 +876,27 @@ impl Render for Dock {
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
-                .child(
-                    div()
-                        .map(|this| match self.position().axis() {
-                            Axis::Horizontal => this.min_w(size).h_full(),
-                            Axis::Vertical => this.min_h(size).w_full(),
-                        })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
-                )
+                .child({
+                    let panel_view = entry
+                        .panel
+                        .to_any()
+                        .cached(StyleRefinement::default().v_flex().size_full());
+                    let container = match self.position().axis() {
+                        Axis::Horizontal => div().min_w(size).h_full(),
+                        Axis::Vertical => div().min_h(size).w_full(),
+                    };
+
+                    if let Some(placeholder) = traffic_light_placeholder.take() {
+                        container.child(
+                            v_flex()
+                                .size_full()
+                                .child(placeholder)
+                                .child(div().flex_1().size_full().child(panel_view)),
+                        )
+                    } else {
+                        container.child(panel_view)
+                    }
+                })
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
                 })
