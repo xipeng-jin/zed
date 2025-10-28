@@ -208,6 +208,8 @@ pub struct Dock {
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
     _subscriptions: [Subscription; 2],
+    #[cfg(target_os = "macos")]
+    traffic_lights_reserved: bool,
 }
 
 impl Focusable for Dock {
@@ -303,6 +305,8 @@ impl Dock {
                 serialized_dock: None,
                 zoom_layer_open: false,
                 modal_layer,
+                #[cfg(target_os = "macos")]
+                traffic_lights_reserved: false,
             }
         });
 
@@ -416,6 +420,50 @@ impl Dock {
 
             cx.notify();
         }
+
+        #[cfg(target_os = "macos")]
+        self.update_traffic_light_visibility(window, cx);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_traffic_light_visibility(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.position != DockPosition::Left {
+            return;
+        }
+
+        let visible = if self.traffic_lights_reserved {
+            self.is_open
+        } else {
+            true
+        };
+
+        window.set_traffic_lights_visible(visible);
+
+        if visible && self.traffic_lights_reserved {
+            let tab_height = Tab::container_height(cx);
+            window.set_traffic_light_vertical_center(Some(tab_height * 0.5));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_light_reservation(
+        &mut self,
+        reserve: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.position != DockPosition::Left {
+            return;
+        }
+
+        if self.traffic_lights_reserved == reserve {
+            return;
+        }
+
+        self.traffic_lights_reserved = reserve;
+        cx.notify();
+
+        self.update_traffic_light_visibility(window, cx);
     }
 
     pub fn set_panel_zoomed(
@@ -751,15 +799,12 @@ impl Dock {
     fn should_reserve_traffic_light_space(&self, cx: &mut Context<Self>) -> bool {
         #[cfg(target_os = "macos")]
         {
+            let _ = cx;
             if self.position != DockPosition::Left {
                 return false;
             }
 
-            let Some(workspace) = self.workspace.upgrade() else {
-                return false;
-            };
-
-            return workspace.read(cx).titlebar_item().is_none();
+            return self.traffic_lights_reserved;
         }
 
         #[cfg(not(target_os = "macos"))]

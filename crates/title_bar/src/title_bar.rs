@@ -65,6 +65,41 @@ actions!(
     ]
 );
 
+fn apply_title_bar_visibility(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let should_show = match TitleBarSettings::get_global(cx).show {
+        TitleBarVisibility::Always => true,
+        TitleBarVisibility::Never => false,
+        TitleBarVisibility::HideInFullScreen => !window.is_fullscreen(),
+    };
+
+    let has_titlebar = workspace.titlebar_item().is_some();
+
+    if should_show {
+        if !has_titlebar {
+            let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
+            workspace.set_titlebar_item(window, cx, Some(item.into()));
+        }
+    } else if has_titlebar {
+        workspace.set_titlebar_item(window, cx, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let reserve_for_dock = !should_show;
+        let left_dock = workspace.left_dock().clone();
+        left_dock.update(cx, |dock, dock_cx| {
+            dock.set_traffic_light_reservation(reserve_for_dock, window, dock_cx);
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    window.set_traffic_lights_visible(should_show);
+}
+
 pub fn init(cx: &mut App) {
     TitleBarSettings::register(cx);
     SystemWindowTabs::init(cx);
@@ -73,49 +108,15 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
-        // let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
-        // workspace.set_titlebar_item(item.into(), window, cx);
-        let should_show = match TitleBarSettings::get_global(cx).show {
-            TitleBarVisibility::Always => true,
-            TitleBarVisibility::Never => false,
-            TitleBarVisibility::HideInFullScreen => !window.is_fullscreen(),
-        };
-        if should_show {
-            let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
-            workspace.set_titlebar_item(item.into(), window, cx);
-        };
+        apply_title_bar_visibility(workspace, window, cx);
 
         cx.observe_global_in::<settings::SettingsStore>(window, |workspace, window, cx| {
-            let should_show = match TitleBarSettings::get_global(cx).show {
-                TitleBarVisibility::Always => true,
-                TitleBarVisibility::Never => false,
-                TitleBarVisibility::HideInFullScreen => !window.is_fullscreen(),
-            };
-            if should_show {
-                if workspace.titlebar_item().is_none() {
-                    let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
-                    workspace.set_titlebar_item(item.into(), window, cx);
-                }
-            } else {
-                workspace.clear_titlebar_item(window, cx);
-            }
+            apply_title_bar_visibility(workspace, window, cx);
         })
         .detach();
 
         cx.observe_window_bounds(window, |workspace, window, cx| {
-            let should_show = match TitleBarSettings::get_global(cx).show {
-                TitleBarVisibility::Always => true,
-                TitleBarVisibility::Never => false,
-                TitleBarVisibility::HideInFullScreen => !window.is_fullscreen(),
-            };
-            if should_show {
-                if workspace.titlebar_item().is_none() {
-                    let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
-                    workspace.set_titlebar_item(item.into(), window, cx);
-                }
-            } else {
-                workspace.clear_titlebar_item(window, cx);
-            }
+            apply_title_bar_visibility(workspace, window, cx);
         })
         .detach();
 
