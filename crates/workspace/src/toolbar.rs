@@ -54,6 +54,7 @@ pub struct Toolbar {
     active_item: Option<Box<dyn ItemHandle>>,
     hidden: bool,
     can_navigate: bool,
+    tab_bar_visible: bool,
     items: Vec<(Box<dyn ToolbarItemViewHandle>, ToolbarItemLocation)>,
 }
 
@@ -106,15 +107,23 @@ impl Render for Toolbar {
         let has_left_items = self.left_items().count() > 0;
         let has_right_items = self.right_items().count() > 0;
 
+        let border_color = if self.tab_bar_visible {
+            cx.theme().colors().border_variant
+        } else {
+            cx.theme().colors().border
+        };
+
         v_flex()
             .group("toolbar")
             .relative()
-            .p(DynamicSpacing::Base08.rems(cx))
+            .w_full()
+            .px(DynamicSpacing::Base08.rems(cx))
+            .py(DynamicSpacing::Base04.rems(cx))
             .when(has_left_items || has_right_items, |this| {
                 this.gap(DynamicSpacing::Base08.rems(cx))
             })
             .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
+            .border_color(border_color)
             .bg(cx.theme().colors().toolbar_background)
             .when(has_left_items || has_right_items, |this| {
                 this.child(
@@ -168,12 +177,20 @@ impl Toolbar {
             items: Default::default(),
             hidden: false,
             can_navigate: true,
+            tab_bar_visible: true,
         }
     }
 
     pub fn set_can_navigate(&mut self, can_navigate: bool, cx: &mut Context<Self>) {
         self.can_navigate = can_navigate;
         cx.notify();
+    }
+
+    pub fn set_tab_bar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.tab_bar_visible != visible {
+            self.tab_bar_visible = visible;
+            cx.notify();
+        }
     }
 
     pub fn add_item<T>(&mut self, item: Entity<T>, window: &mut Window, cx: &mut Context<Self>)

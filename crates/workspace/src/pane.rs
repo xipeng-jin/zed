@@ -3711,6 +3711,9 @@ impl Render for Pane {
         let Some(project) = self.project.upgrade() else {
             return div().track_focus(&self.focus_handle(cx));
         };
+        self.toolbar.update(cx, |toolbar, cx| {
+            toolbar.set_tab_bar_visible(display_tab_bar, cx);
+        });
         let is_local = project.read(cx).is_local();
 
         v_flex()
