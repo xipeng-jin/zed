@@ -4452,6 +4452,12 @@ impl Window {
             .set_traffic_light_vertical_center(center)
     }
 
+    /// Toggle visibility of the native macOS traffic-light controls.
+    /// This is macOS specific
+    pub fn set_traffic_lights_visible(&self, visible: bool) {
+        self.platform_window.set_traffic_lights_visible(visible);
+    }
+
     /// Sets the tabbing identifier for the window.
     /// This is macOS specific.
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {

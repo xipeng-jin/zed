@@ -428,6 +428,30 @@ impl MacWindowState {
         self.move_traffic_light();
     }
 
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        let native_window = self.native_window;
+        let hidden = if visible { NO } else { YES };
+        self.executor
+            .spawn(async move {
+                unsafe {
+                    let buttons = [
+                        NSWindowButton::NSWindowCloseButton,
+                        NSWindowButton::NSWindowMiniaturizeButton,
+                        NSWindowButton::NSWindowZoomButton,
+                        NSWindowButton::NSWindowFullScreenButton,
+                    ];
+
+                    for button in buttons {
+                        let view: id = msg_send![native_window, standardWindowButton: button];
+                        if !view.is_null() {
+                            let _: () = msg_send![view, setHidden: hidden];
+                        }
+                    }
+                }
+            })
+            .detach();
+    }
+
     fn move_traffic_light(&self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -1057,6 +1081,10 @@ impl PlatformWindow for MacWindow {
 
     fn set_traffic_light_vertical_center(&self, center: Option<Pixels>) {
         self.0.lock().set_traffic_light_vertical_center(center);
+    }
+
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        self.0.lock().set_traffic_lights_visible(visible);
     }
 
     fn scale_factor(&self) -> f32 {

@@ -2092,20 +2092,15 @@ impl Workspace {
 
     pub fn set_titlebar_item(
         &mut self,
-        item: AnyView,
         window: &mut Window,
         cx: &mut Context<Self>,
+        item: Option<AnyView>,
     ) {
-        self.titlebar_item = Some(item);
+        self.titlebar_item = item;
         #[cfg(target_os = "macos")]
-        window.set_traffic_light_vertical_center(None);
-        cx.notify();
-    }
-
-    pub fn clear_titlebar_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.titlebar_item = None;
-        #[cfg(target_os = "macos")]
-        {
+        if self.titlebar_item.is_some() {
+            window.set_traffic_light_vertical_center(None);
+        } else {
             let tab_height = Tab::container_height(cx);
             window.set_traffic_light_vertical_center(Some(tab_height * 0.5));
         }
