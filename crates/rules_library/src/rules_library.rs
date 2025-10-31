@@ -130,6 +130,7 @@ pub fn open_rules_library(
                         title: Some("Rules Library".into()),
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(12.0), px(12.0))),
+                        traffic_light_vertical_center: None,
                     }),
                     app_id: Some(app_id.to_owned()),
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
