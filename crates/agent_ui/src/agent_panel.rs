@@ -18,7 +18,7 @@ use zed_actions::agent::{OpenClaudeCodeOnboardingModal, ReauthenticateAgent};
 use crate::ManageProfiles;
 use crate::ui::{AcpOnboardingModal, ClaudeCodeOnboardingModal};
 use crate::{
-    AddContextServer, AgentDiffPane, Follow, InlineAssistant, NewTextThread, NewThread,
+    AddContextServer, AgentDiffPane, EditTitle, Follow, InlineAssistant, NewTextThread, NewThread,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell,
     ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu,
     acp::AcpThreadView,
@@ -39,7 +39,7 @@ use assistant_slash_command::SlashCommandWorkingSet;
 use assistant_text_thread::{TextThread, TextThreadEvent, TextThreadSummary};
 use client::{UserStore, zed_urls};
 use cloud_llm_client::{Plan, PlanV1, PlanV2, UsageLimit};
-use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer};
+use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer, actions::Cancel};
 use extension::ExtensionEvents;
 use extension_host::ExtensionStore;
 use fs::Fs;
@@ -50,6 +50,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, LanguageModelRegistry};
+use menu::Confirm;
 use project::{Project, ProjectPath, Worktree};
 use prompt_store::{PromptBuilder, PromptStore, UserPromptId};
 use rules_library::{RulesLibrary, open_rules_library};
@@ -74,6 +75,7 @@ use zed_actions::{
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
+const LOADING_SUMMARY_PLACEHOLDER: &str = "Loading Summary…";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SerializedAgentPanel {
@@ -168,6 +170,12 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| {
                             panel.toggle_options_menu(&ToggleOptionsMenu, window, cx);
                         });
+                    }
+                })
+                .register_action(|workspace, _: &EditTitle, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| panel.focus_title_editor(window, cx));
                     }
                 })
                 .register_action(|workspace, _: &ToggleNewThreadMenu, window, cx| {
@@ -479,6 +487,7 @@ pub struct AgentPanel {
     tabs: Vec<AgentPanelTab>,
     active_tab_id: TabId,
     tab_bar_scroll_handle: ScrollHandle,
+    title_edit_overlay_tab_id: Option<TabId>,
 }
 
 impl AgentPanel {
@@ -748,6 +757,7 @@ impl AgentPanel {
             tabs: vec![AgentPanelTab::new(active_view, selected_agent)],
             active_tab_id: 0,
             tab_bar_scroll_handle: ScrollHandle::new(),
+            title_edit_overlay_tab_id: None,
         };
 
         // Initial sync of agent servers from extensions
@@ -1128,25 +1138,18 @@ impl AgentPanel {
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit_overlay_tab_id.take().is_some() {
+            self.focus_active_panel_thread(window, cx);
+            return;
+        }
+
         match self.active_view() {
             ActiveView::Configuration | ActiveView::History => {
                 if let Some(previous_tab_id) = self.overlay_previous_tab_id.take() {
                     self.active_tab_id = previous_tab_id;
                     self.overlay_view = None;
-
-                    match self.active_view() {
-                        ActiveView::ExternalAgentThread { thread_view } => {
-                            thread_view.focus_handle(cx).focus(window);
-                        }
-                        ActiveView::TextThread {
-                            text_thread_editor, ..
-                        } => {
-                            text_thread_editor.focus_handle(cx).focus(window);
-                        }
-                        ActiveView::History | ActiveView::Configuration => {}
-                    }
+                    self.focus_active_panel_thread(window, cx);
                 }
-                cx.notify();
             }
             _ => {}
         }
@@ -1168,6 +1171,15 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.agent_panel_menu_handle.toggle(window, cx);
+    }
+
+    fn edit_active_view_title(
+        &mut self,
+        _: &EditTitle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_title_editor(window, cx);
     }
 
     pub fn toggle_new_thread_menu(
@@ -1405,6 +1417,7 @@ impl AgentPanel {
 
         self.overlay_view = None;
         self.overlay_previous_tab_id = None;
+        self.title_edit_overlay_tab_id = None;
         self.active_tab_id = new_id;
         self.tab_bar_scroll_handle.scroll_to_item(new_id);
 
@@ -1587,6 +1600,7 @@ impl AgentPanel {
     }
 
     fn set_overlay_view(&mut self, view: ActiveView, window: &mut Window, cx: &mut Context<Self>) {
+        self.title_edit_overlay_tab_id = None;
         self.overlay_previous_tab_id = Some(self.active_tab_id);
         self.overlay_view = Some(view);
         self.focus_handle(cx).focus(window);
@@ -1655,8 +1669,19 @@ impl AgentPanel {
                 self.active_tab_id
             };
 
-            self.active_tab_id = new_id;
-            self.set_active_tab_by_id(new_id, false, window, cx);
+            if let Some(edit_id) = self.title_edit_overlay_tab_id {
+                if edit_id == removed_id {
+                    self.title_edit_overlay_tab_id = None;
+                } else if edit_id > removed_id {
+                    self.title_edit_overlay_tab_id = Some(edit_id - 1);
+                }
+            }
+
+            if new_id == self.active_tab_id {
+                self.tab_bar_scroll_handle.scroll_to_item(new_id);
+            } else {
+                self.set_active_tab_by_id(new_id, false, window, cx);
+            }
         } else {
             log::info!("View id is not valid.");
         }
@@ -1676,6 +1701,49 @@ impl AgentPanel {
             let preview: String = title.chars().take(MAX_CHARS).collect();
             (format!("{preview}...").into(), Some(title))
         }
+    }
+
+    fn focus_active_panel_thread(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_view() {
+            ActiveView::ExternalAgentThread { thread_view } => {
+                thread_view.focus_handle(cx).focus(window);
+            }
+            ActiveView::TextThread {
+                text_thread_editor, ..
+            } => {
+                text_thread_editor.focus_handle(cx).focus(window);
+            }
+            ActiveView::History | ActiveView::Configuration => {}
+        }
+        cx.notify();
+    }
+
+    fn focus_title_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_view.is_some()
+            || self.title_edit_overlay_tab_id.is_some()
+            || !matches!(
+                self.tabs.get(self.active_tab_id).map(|tab| tab.view()),
+                Some(ActiveView::ExternalAgentThread { .. } | ActiveView::TextThread { .. })
+            )
+        {
+            return;
+        }
+
+        self.title_edit_overlay_tab_id = Some(self.active_tab_id);
+        if let Some(tab) = self.tabs.get(self.active_tab_id) {
+            match tab.view() {
+                ActiveView::ExternalAgentThread { thread_view } => {
+                    if let Some(editor) = thread_view.read(cx).title_editor() {
+                        editor.focus_handle(cx).focus(window);
+                    }
+                }
+                ActiveView::TextThread { title_editor, .. } => {
+                    title_editor.focus_handle(cx).focus(window);
+                }
+                ActiveView::History | ActiveView::Configuration => {}
+            }
+        }
+        cx.notify();
     }
 }
 
@@ -1792,8 +1860,6 @@ impl AgentPanel {
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> TabLabelRender {
-        const LOADING_SUMMARY_PLACEHOLDER: &str = "Loading Summary…";
-
         match view {
             ActiveView::ExternalAgentThread { thread_view } => {
                 let text = thread_view
@@ -1874,6 +1940,118 @@ impl AgentPanel {
                 tooltip: None,
             },
         }
+    }
+
+    fn render_overlay_title_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tab_id = self.title_edit_overlay_tab_id?;
+        let tab = self.tabs.get(tab_id)?;
+        let content = match tab.view() {
+            ActiveView::ExternalAgentThread { thread_view } => {
+                if let Some(title_editor) = thread_view.read(cx).title_editor() {
+                    h_flex()
+                        .flex_grow()
+                        .items_center()
+                        .child(title_editor.clone())
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .flex_grow()
+                        .items_center()
+                        .child(
+                            Label::new(thread_view.read(cx).title(cx))
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .into_any_element()
+                }
+            }
+            ActiveView::TextThread {
+                title_editor,
+                text_thread_editor,
+                ..
+            } => {
+                let summary = text_thread_editor.read(cx).text_thread().read(cx).summary();
+
+                match summary {
+                    TextThreadSummary::Pending => h_flex()
+                        .flex_grow()
+                        .items_center()
+                        .child(
+                            Label::new(TextThreadSummary::DEFAULT)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .into_any_element(),
+                    TextThreadSummary::Content(summary) => {
+                        if summary.done {
+                            h_flex()
+                                .flex_grow()
+                                .items_center()
+                                .child(title_editor.clone())
+                                .into_any_element()
+                        } else {
+                            h_flex()
+                                .flex_grow()
+                                .items_center()
+                                .child(
+                                    Label::new(LOADING_SUMMARY_PLACEHOLDER)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                                .into_any_element()
+                        }
+                    }
+                    TextThreadSummary::Error => h_flex()
+                        .flex_grow()
+                        .items_center()
+                        .gap(DynamicSpacing::Base04.rems(cx))
+                        .child(title_editor.clone())
+                        .child(
+                            IconButton::new("retry-summary-generation", IconName::RotateCcw)
+                                .icon_size(IconSize::Small)
+                                .on_click({
+                                    let text_thread_editor = text_thread_editor.clone();
+                                    move |_, _window, cx| {
+                                        text_thread_editor
+                                            .update(cx, |editor, cx| editor.regenerate_summary(cx));
+                                    }
+                                })
+                                .tooltip(move |_window, cx| {
+                                    cx.new(|_| {
+                                        Tooltip::new("Failed to generate title")
+                                            .meta("Click to try again")
+                                    })
+                                    .into()
+                                }),
+                        )
+                        .into_any_element(),
+                }
+            }
+            ActiveView::History | ActiveView::Configuration => {
+                return None;
+            }
+        };
+
+        Some(
+            h_flex()
+                .flex_grow()
+                .h(Tab::content_height(cx))
+                .px(DynamicSpacing::Base04.px(cx))
+                .gap(DynamicSpacing::Base04.rems(cx))
+                .child(self.render_toolbar_back_button(cx).into_any_element())
+                .child(h_flex().flex_grow().items_center().child(content))
+                .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                    if this.title_edit_overlay_tab_id.take().is_some() {
+                        this.focus_active_panel_thread(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                    if this.title_edit_overlay_tab_id.take().is_some() {
+                        this.focus_active_panel_thread(window, cx);
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_panel_options_menu(
@@ -1971,6 +2149,7 @@ impl AgentPanel {
                             .action("Profiles", Box::new(ManageProfiles::default()))
                             .action("Settings", Box::new(OpenSettings))
                             .separator()
+                            .action("Edit Title", Box::new(EditTitle))
                             .action(full_screen_label, Box::new(ToggleZoom));
 
                         if selected_agent == AgentType::Gemini {
@@ -2407,8 +2586,7 @@ impl AgentPanel {
             .map(|thread| thread.read(cx).is_loading())
             .unwrap_or(false);
 
-        let mut tab_bar = TabBar::new("agent-tab-bar")
-            .track_scroll(&self.tab_bar_scroll_handle);
+        let mut tab_bar = TabBar::new("agent-tab-bar").track_scroll(&self.tab_bar_scroll_handle);
 
         if show_tab_bar_controls {
             tab_bar = tab_bar.end_child(end_slot);
@@ -2430,6 +2608,10 @@ impl AgentPanel {
                 .into_any_element();
 
             return tab_bar.child(overlay_title).into_any_element();
+        }
+
+        if let Some(overlay_editor) = self.render_overlay_title_editor(cx) {
+            return tab_bar.child(overlay_editor).into_any_element();
         }
 
         let active_index = self.active_tab_id;
@@ -2857,6 +3039,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::toggle_navigation_menu))
             .on_action(cx.listener(Self::toggle_options_menu))
+            .on_action(cx.listener(Self::edit_active_view_title))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
