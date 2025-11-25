@@ -739,8 +739,6 @@ impl AgentPanel {
             configuration: None,
             configuration_subscription: None,
             context_server_registry,
-            previous_view: None,
-            inline_assist_context_store,
             overlay_previous_tab_id: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
