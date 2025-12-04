@@ -37,7 +37,7 @@ use remote::RemoteConnectionOptions;
 use settings::{Settings, SettingsLocation};
 use std::sync::Arc;
 use theme::ActiveTheme;
-use title_bar_settings::TitleBarSettings;
+pub use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, Chip, ContextMenu, IconWithIndicator, Indicator, PopoverMenu,
     PopoverMenuHandle, TintColor, Tooltip, prelude::*,
