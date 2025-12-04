@@ -70,6 +70,8 @@ actions!(
         OpenTelemetryLog,
         /// Opens the performance profiler.
         OpenPerformanceProfiler,
+        /// Toggles the title bar display.
+        ToggleTitleBar,
     ]
 );
 
