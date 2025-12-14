@@ -350,9 +350,10 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
-    {
+    let skip_single_instance_enforcement = cfg!(debug_assertions)
+        || *zed_env_vars::ZED_STATELESS
+        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev;
+    let failed_single_instance_check = if skip_single_instance_enforcement {
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
