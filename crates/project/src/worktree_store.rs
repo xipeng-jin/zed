@@ -126,6 +126,19 @@ impl WorktreeStore {
         self.scanning_enabled = false;
     }
 
+    pub fn set_scanning_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.scanning_enabled == enabled {
+            return;
+        }
+
+        self.scanning_enabled = enabled;
+        for worktree in self.worktrees() {
+            worktree.update(cx, |worktree, cx| {
+                worktree.set_scanning_enabled(enabled, cx)
+            });
+        }
+    }
+
     /// Iterates through all worktrees, including ones that don't appear in the project panel
     pub fn worktrees(&self) -> impl '_ + DoubleEndedIterator<Item = Entity<Worktree>> {
         self.worktrees

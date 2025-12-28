@@ -157,6 +157,7 @@ pub use lsp_store::{
 };
 pub use toolchain_store::{ToolchainStore, Toolchains};
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
+const WINDOW_ACTIVE_DEACTIVATION_GRACE_PERIOD: Duration = Duration::from_millis(750);
 
 pub trait ProjectItem: 'static {
     fn try_open(
@@ -185,6 +186,7 @@ pub enum OpenedBufferEvent {
 /// Can be either local (for the project opened on the same host) or remote.(for collab projects, browsed by multiple remote users).
 pub struct Project {
     active_entry: Option<ProjectEntryId>,
+    window_active: bool,
     buffer_ordered_messages_tx: mpsc::UnboundedSender<BufferOrderedMessage>,
     languages: Arc<LanguageRegistry>,
     dap_store: Entity<DapStore>,
@@ -209,6 +211,7 @@ pub struct Project {
     _subscriptions: Vec<gpui::Subscription>,
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
     git_diff_debouncer: DebouncedDelay<Self>,
+    window_active_debouncer: DebouncedDelay<Self>,
     remotely_created_models: Arc<Mutex<RemotelyCreatedModels>>,
     terminals: Terminals,
     node: Option<NodeRuntime>,
@@ -1225,6 +1228,7 @@ impl Project {
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![cx.on_release(Self::release)],
                 active_entry: None,
+                window_active: true,
                 snippets,
                 languages,
                 collab_client: client,
@@ -1239,6 +1243,7 @@ impl Project {
 
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
+                window_active_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
                 },
@@ -1443,6 +1448,7 @@ impl Project {
                     }),
                 ],
                 active_entry: None,
+                window_active: true,
                 snippets,
                 languages,
                 collab_client: client,
@@ -1453,6 +1459,7 @@ impl Project {
                 remote_client: Some(remote.clone()),
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
+                window_active_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
                 },
@@ -1688,6 +1695,7 @@ impl Project {
                 lsp_store: lsp_store.clone(),
                 context_server_store,
                 active_entry: None,
+                window_active: true,
                 collaborators: Default::default(),
                 join_project_response_message_id: response.message_id,
                 languages,
@@ -1712,6 +1720,7 @@ impl Project {
                 agent_server_store,
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
+                window_active_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
                 },
@@ -4430,6 +4439,42 @@ impl Project {
             });
             cx.emit(Event::ActiveEntryChanged(new_active_entry));
         }
+    }
+
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.window_active == active {
+            return;
+        }
+
+        self.window_active = active;
+        if active {
+            self.window_active_debouncer.cancel();
+            self.worktree_store.update(cx, |worktree_store, cx| {
+                worktree_store.set_scanning_enabled(true, cx);
+            });
+            self.lsp_store.update(cx, |lsp_store, cx| {
+                lsp_store.set_watched_paths_enabled(true, cx);
+            });
+            return;
+        }
+
+        self.window_active_debouncer.fire_new(
+            WINDOW_ACTIVE_DEACTIVATION_GRACE_PERIOD,
+            cx,
+            |project, cx| {
+                if project.window_active {
+                    return Task::ready(());
+                }
+
+                project.worktree_store.update(cx, |worktree_store, cx| {
+                    worktree_store.set_scanning_enabled(false, cx);
+                });
+                project.lsp_store.update(cx, |lsp_store, cx| {
+                    lsp_store.set_watched_paths_enabled(false, cx);
+                });
+                Task::ready(())
+            },
+        );
     }
 
     pub fn language_servers_running_disk_based_diagnostics<'a>(

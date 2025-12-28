@@ -1053,7 +1053,12 @@ impl Window {
             window_decorations,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            tabbing_target_window_id,
         } = options;
+
+        #[cfg(target_os = "macos")]
+        let should_seed_tab_controller = tabbing_identifier.is_some();
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
         let mut platform_window = cx.platform.open_window(
@@ -1071,6 +1076,8 @@ impl Window {
                 window_min_size,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
+                #[cfg(target_os = "macos")]
+                tabbing_target_window_id,
             },
         )?;
 
@@ -1078,6 +1085,15 @@ impl Window {
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
         if let Some(tabs) = platform_window.tabbed_windows() {
             SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+        } else {
+            #[cfg(target_os = "macos")]
+            if should_seed_tab_controller {
+                SystemWindowTabController::add_tab(
+                    cx,
+                    handle.window_id(),
+                    vec![SystemWindowTab::new(SharedString::from(""), handle)],
+                );
+            }
         }
 
         let display_id = platform_window.display().map(|display| display.id());
@@ -1113,6 +1129,7 @@ impl Window {
                 let _ = handle.update(&mut cx, |_, window, _| window.remove_window());
                 let _ = cx.update(|cx| {
                     SystemWindowTabController::remove_tab(cx, window_id);
+                    SystemWindowTabController::remove_tab_base_title(cx, window_id);
                 });
             }
         }));
@@ -1250,8 +1267,17 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move || {
                 handle
-                    .update(&mut cx, |_, _window, cx| {
+                    .update(&mut cx, |_, window, cx| {
                         SystemWindowTabController::move_tab_to_new_window(cx, handle.window_id());
+
+                        // Sync from the actual platform tab state to ensure accuracy
+                        if let Some(tabs) = window.tabbed_windows() {
+                            SystemWindowTabController::sync_tabs_from_platform(
+                                cx,
+                                handle.window_id(),
+                                tabs,
+                            );
+                        }
                     })
                     .log_err();
             })
@@ -1260,8 +1286,18 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move || {
                 handle
-                    .update(&mut cx, |_, _window, cx| {
+                    .update(&mut cx, |_, window, cx| {
+                        // First update internal state with a merge operation
                         SystemWindowTabController::merge_all_windows(cx, handle.window_id());
+
+                        // Then sync from the actual platform tab state to ensure accuracy
+                        if let Some(tabs) = window.tabbed_windows() {
+                            SystemWindowTabController::sync_tabs_from_platform(
+                                cx,
+                                handle.window_id(),
+                                tabs,
+                            );
+                        }
                     })
                     .log_err();
             })

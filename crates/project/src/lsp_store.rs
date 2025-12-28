@@ -269,6 +269,7 @@ pub struct LocalLspStore {
     buffers_being_formatted: HashSet<BufferId>,
     last_workspace_edits_by_language_server: HashMap<LanguageServerId, ProjectTransaction>,
     language_server_watched_paths: HashMap<LanguageServerId, LanguageServerWatchedPaths>,
+    watched_paths_enabled: bool,
     watched_manifest_filenames: HashSet<ManifestName>,
     language_server_paths_watched_for_rename:
         HashMap<LanguageServerId, RenamePathsWatchedForServer>,
@@ -3546,6 +3547,12 @@ impl LocalLspStore {
         language_server_id: LanguageServerId,
         cx: &mut Context<LspStore>,
     ) {
+        if !self.watched_paths_enabled {
+            self.language_server_watched_paths
+                .remove(&language_server_id);
+            return;
+        }
+
         let Some(registrations) = self
             .language_server_dynamic_registrations
             .get(&language_server_id)
@@ -4030,6 +4037,7 @@ impl LspStore {
                 language_servers: Default::default(),
                 last_workspace_edits_by_language_server: Default::default(),
                 language_server_watched_paths: Default::default(),
+                watched_paths_enabled: true,
                 language_server_paths_watched_for_rename: Default::default(),
                 language_server_dynamic_registrations: Default::default(),
                 buffers_being_formatted: Default::default(),
@@ -4608,6 +4616,30 @@ impl LspStore {
 
     pub fn set_active_entry(&mut self, active_entry: Option<ProjectEntryId>) {
         self.active_entry = active_entry;
+    }
+
+    pub fn set_watched_paths_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+
+        if local.watched_paths_enabled == enabled {
+            return;
+        }
+
+        local.watched_paths_enabled = enabled;
+        if enabled {
+            let server_ids = local
+                .language_server_dynamic_registrations
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for server_id in server_ids {
+                local.rebuild_watched_paths(server_id, cx);
+            }
+        } else {
+            local.language_server_watched_paths.clear();
+        }
     }
 
     pub(crate) fn send_diagnostic_summaries(&self, worktree: &mut Worktree) {

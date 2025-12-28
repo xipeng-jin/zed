@@ -85,7 +85,7 @@ use workspace::utility_pane::utility_slot_for_dock_position;
 use workspace::{
     AppState, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace, WorkspaceSettings,
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
-    open_new,
+    open_new, prompt_open_project_destination,
 };
 use workspace::{
     CloseIntent, CloseWindow, NotificationFrame, RestoreBanner, with_active_or_new_workspace,
@@ -841,25 +841,41 @@ fn register_actions(
         })
         .register_action(|workspace, _: &workspace::Open, window, cx| {
             telemetry::event!("Project Opened");
-            let paths = workspace.prompt_for_open_path(
+            let app_state = workspace.app_state().clone();
+            let fs = app_state.fs.clone();
+            let paths_future = workspace.prompt_for_open_path(
                 PathPromptOptions {
                     files: true,
                     directories: true,
                     multiple: true,
                     prompt: None,
                 },
-                DirectoryLister::Local(
-                    workspace.project().clone(),
-                    workspace.app_state().fs.clone(),
-                ),
+                DirectoryLister::Local(workspace.project().clone(), fs.clone()),
                 window,
                 cx,
             );
 
+            let window_handle = window.window_handle().downcast::<Workspace>();
+
             cx.spawn_in(window, async move |this, cx| {
-                let Some(paths) = paths.await.log_err().flatten() else {
+                let Some(paths) = paths_future.await.log_err().flatten() else {
                     return;
                 };
+
+                let should_prompt_for_tabs = cx
+                    .update(|_, cx| workspace::should_open_new_workspace_as_tab(cx))
+                    .unwrap_or(false);
+                if prompt_open_project_destination(
+                    app_state,
+                    &paths,
+                    window_handle,
+                    should_prompt_for_tabs,
+                    cx,
+                )
+                .await
+                {
+                    return;
+                }
 
                 if let Some(task) = this
                     .update_in(cx, |this, window, cx| {
@@ -2643,12 +2659,12 @@ mod tests {
         app_state
             .fs
             .as_fake()
-            .insert_tree(path!("/root"), json!({"a": "hey"}))
+            .insert_tree(path!("/root-disabled"), json!({"a": "hey"}))
             .await;
 
         cx.update(|cx| {
             open_paths(
-                &[PathBuf::from(path!("/root/a"))],
+                &[PathBuf::from(path!("/root-disabled/a"))],
                 app_state.clone(),
                 workspace::OpenOptions::default(),
                 cx,
@@ -2731,7 +2747,7 @@ mod tests {
         // Opening the buffer again doesn't impact the window's edited state.
         cx.update(|cx| {
             open_paths(
-                &[PathBuf::from(path!("/root/a"))],
+                &[PathBuf::from(path!("/root-disabled/a"))],
                 app_state,
                 workspace::OpenOptions::default(),
                 cx,
@@ -2785,20 +2801,44 @@ mod tests {
         cx.simulate_prompt_answer("Don't Save");
         executor.run_until_parked();
         assert_eq!(cx.update(|cx| cx.windows().len()), 0);
+
+        // Reset the global setting for subsequent tests
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(true)
+                });
+            });
+        });
     }
 
     #[gpui::test]
     async fn test_window_edit_state_restoring_enabled(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(true)
+                });
+            });
+        });
+
         app_state
             .fs
             .as_fake()
-            .insert_tree(path!("/root"), json!({"a": "hey"}))
+            .insert_tree(path!("/root-enabled"), json!({"a": "hey"}))
             .await;
 
         cx.update(|cx| {
             open_paths(
-                &[PathBuf::from(path!("/root/a"))],
+                &[PathBuf::from(path!("/root-enabled/a"))],
                 app_state.clone(),
                 workspace::OpenOptions::default(),
                 cx,
@@ -2850,8 +2890,9 @@ mod tests {
         // When we now reopen the window, the edited state and the edited buffer are back
         cx.update(|cx| {
             open_paths(
-                &[PathBuf::from(path!("/root/a"))],
+                &[PathBuf::from(path!("/root-enabled/a"))],
                 app_state.clone(),
+                // Don't use open_new_workspace here because we want to test workspace restoration
                 workspace::OpenOptions::default(),
                 cx,
             )

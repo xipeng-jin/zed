@@ -78,6 +78,7 @@ use project::{
     DirectoryLister, Project, ProjectEntryId, ProjectPath, ResolvedPath, Worktree, WorktreeId,
     WorktreeSettings,
     debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
+    git_store::{GitStoreEvent, RepositoryEvent},
     project_settings::ProjectSettings,
     toolchain_store::ToolchainStoreEvent,
     trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
@@ -126,6 +127,7 @@ use util::{
     paths::{PathStyle, SanitizedPath},
     rel_path::RelPath,
     serde::default_true,
+    truncate_and_trailoff,
 };
 use uuid::Uuid;
 pub use workspace_settings::{
@@ -149,6 +151,9 @@ use crate::{
 };
 
 pub const SERIALIZATION_THROTTLE_TIME: Duration = Duration::from_millis(200);
+const MAX_WORKSPACE_TAB_TITLE_LENGTH: usize = 60;
+const MAX_WORKSPACE_TAB_BRANCH_NAME_LENGTH: usize = 60;
+const MAX_WORKSPACE_TAB_PATH_SUFFIX_LENGTH: usize = 60;
 
 static ZED_WINDOW_SIZE: LazyLock<Option<Size<Pixels>>> = LazyLock::new(|| {
     env::var("ZED_WINDOW_SIZE")
@@ -562,6 +567,21 @@ fn prompt_and_open_paths(app_state: Arc<AppState>, options: PathPromptOptions, c
     cx.spawn(
         async move |cx| match paths.await.anyhow().and_then(|res| res) {
             Ok(Some(paths)) => {
+                let should_prompt_for_tabs = cx
+                    .update(|cx| should_open_new_workspace_as_tab(cx))
+                    .unwrap_or(false);
+                if prompt_open_project_destination(
+                    app_state.clone(),
+                    &paths,
+                    None,
+                    should_prompt_for_tabs,
+                    cx,
+                )
+                .await
+                {
+                    return;
+                }
+
                 cx.update(|cx| {
                     open_paths(&paths, app_state, OpenOptions::default(), cx).detach_and_log_err(cx)
                 })
@@ -587,6 +607,127 @@ fn prompt_and_open_paths(app_state: Arc<AppState>, options: PathPromptOptions, c
         },
     )
     .detach();
+}
+
+pub fn should_open_new_workspace_as_tab(cx: &App) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        WorkspaceSettings::get_global(cx).use_system_window_tabs
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cx;
+        false
+    }
+}
+
+/// Prompts for where to open project paths when system window tabs are supported and enabled.
+/// Returns true if the prompt handled the open action.
+pub async fn prompt_open_project_destination(
+    app_state: Arc<AppState>,
+    paths: &[PathBuf],
+    requesting_window: Option<WindowHandle<Workspace>>,
+    should_prompt_for_tabs: bool,
+    cx: &mut AsyncApp,
+) -> bool {
+    if !should_prompt_for_tabs {
+        return false;
+    }
+
+    let active_workspace_window = requesting_window.or_else(|| {
+        cx.update(|cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<Workspace>())
+        })
+        .ok()
+        .flatten()
+    });
+
+    let Some(active_workspace_window) = active_workspace_window else {
+        return false;
+    };
+
+    let metadatas =
+        futures::future::join_all(paths.iter().map(|path| app_state.fs.metadata(path))).await;
+
+    let contains_directory = metadatas
+        .into_iter()
+        .filter_map(|metadata| metadata.ok().flatten())
+        .any(|metadata| metadata.is_dir);
+
+    if !contains_directory {
+        return false;
+    }
+
+    let tabbing_target_window_id = active_workspace_window.window_id();
+    let prompt = active_workspace_window
+        .update(cx, |_, window, cx| {
+            window.prompt(
+                PromptLevel::Info,
+                "Open Project",
+                None,
+                &[
+                    "Open in New Workspace Tab",
+                    "Replace Current Workspace",
+                    "Cancel",
+                ],
+                cx,
+            )
+        })
+        .log_err();
+
+    let Some(prompt) = prompt else {
+        return false;
+    };
+
+    match prompt.await.log_err() {
+        Some(0) => {
+            cx.update(|cx| {
+                open_paths(
+                    paths,
+                    app_state.clone(),
+                    OpenOptions {
+                        open_new_workspace: Some(true),
+                        tabbing_target_window_id: Some(tabbing_target_window_id),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .detach_and_log_err(cx)
+            })
+            .ok();
+        }
+        Some(1) => {
+            let should_replace = active_workspace_window
+                .update(cx, |workspace, window, cx| {
+                    workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
+                })
+                .log_err();
+
+            if let Some(should_replace) = should_replace
+                && should_replace.await.log_err().unwrap_or(false)
+            {
+                cx.update(|cx| {
+                    open_paths(
+                        paths,
+                        app_state.clone(),
+                        OpenOptions {
+                            open_new_workspace: Some(true),
+                            replace_window: Some(active_workspace_window),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                    .detach_and_log_err(cx)
+                })
+                .ok();
+            }
+        }
+        _ => {}
+    }
+
+    true
 }
 
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
@@ -1177,6 +1318,11 @@ pub struct Workspace {
     last_leaders_by_pane: HashMap<WeakEntity<Pane>, CollaboratorId>,
     window_edited: bool,
     last_window_title: Option<String>,
+    last_tab_base_title: Option<String>,
+    last_tab_title: Option<String>,
+    tab_title_primary_path: Option<PathBuf>,
+    tab_title_path_components: Option<Arc<[String]>>,
+    tab_title_suffixes_by_depth: HashMap<usize, String>,
     dirty_items: HashMap<EntityId, Subscription>,
     active_call: Option<(Entity<ActiveCall>, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
@@ -1365,6 +1511,20 @@ impl Workspace {
             }
             cx.notify()
         })
+        .detach();
+
+        let git_store = project.read(cx).git_store().clone();
+        cx.subscribe_in(
+            &git_store,
+            window,
+            |this, _, event, window, cx| match event {
+                GitStoreEvent::ActiveRepositoryChanged(_)
+                | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, true) => {
+                    this.update_window_title(window, cx);
+                }
+                _ => {}
+            },
+        )
         .detach();
 
         cx.subscribe_in(
@@ -1592,6 +1752,11 @@ impl Workspace {
             dispatching_keystrokes: Default::default(),
             window_edited: false,
             last_window_title: None,
+            last_tab_base_title: None,
+            last_tab_title: None,
+            tab_title_primary_path: None,
+            tab_title_path_components: None,
+            tab_title_suffixes_by_depth: HashMap::default(),
             dirty_items: Default::default(),
             active_call,
             database_id: workspace_id,
@@ -1629,6 +1794,7 @@ impl Workspace {
         abs_paths: Vec<PathBuf>,
         app_state: Arc<AppState>,
         requesting_window: Option<WindowHandle<Workspace>>,
+        tabbing_target_window_id: Option<WindowId>,
         env: Option<HashMap<String, String>>,
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
         cx: &mut App,
@@ -1784,6 +1950,7 @@ impl Workspace {
                 // Use the serialized workspace to construct the new window
                 let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx))?;
                 options.window_bounds = window_bounds;
+                options.tabbing_target_window_id = tabbing_target_window_id;
                 let centered_layout = serialized_workspace
                     .as_ref()
                     .map(|w| w.centered_layout)
@@ -2380,7 +2547,15 @@ impl Workspace {
             Task::ready(Ok(callback(self, window, cx)))
         } else {
             let env = self.project.read(cx).cli_environment(cx);
-            let task = Self::new_local(Vec::new(), self.app_state.clone(), None, env, None, cx);
+            let task = Self::new_local(
+                Vec::new(),
+                self.app_state.clone(),
+                None,
+                None,
+                env,
+                None,
+                cx,
+            );
             cx.spawn_in(window, async move |_vh, cx| {
                 let (workspace, _) = task.await?;
                 workspace.update(cx, callback)
@@ -4761,7 +4936,384 @@ impl Workspace {
     }
 
     fn update_window_title(&mut self, window: &mut Window, cx: &mut App) {
-        let project = self.project().read(cx);
+        let window_id = window.window_handle().window_id();
+        let (window_title, tab_base_title) = {
+            let project = self.project().read(cx);
+            let workspace_title = Self::compute_workspace_title_prefix(&project, cx);
+            let mut window_title = workspace_title.clone();
+
+            if let Some(path) = self.active_item(cx).and_then(|item| item.project_path(cx)) {
+                let filename = path.path.file_name().or_else(|| {
+                    Some(
+                        project
+                            .worktree_for_id(path.worktree_id, cx)?
+                            .read(cx)
+                            .root_name_str(),
+                    )
+                });
+
+                if let Some(filename) = filename {
+                    window_title.push_str(" — ");
+                    window_title.push_str(filename.as_ref());
+                }
+            }
+
+            if project.is_via_collab() {
+                window_title.push_str(" ↙");
+            } else if project.is_shared() {
+                window_title.push_str(" ↗");
+            }
+
+            let tab_base_title =
+                Self::compute_workspace_tab_base_title(&project, &workspace_title, cx);
+
+            (window_title, tab_base_title)
+        };
+
+        if self.last_window_title.as_deref() != Some(&window_title) {
+            window.set_window_title(&window_title);
+            self.last_window_title = Some(window_title);
+        }
+
+        // The title shown in the workspace tab strip should be stable and workspace-focused.
+        // This intentionally excludes the active file name.
+        let previous_tab_base_title = self.last_tab_base_title.clone();
+        let base_changed = previous_tab_base_title.as_deref() != Some(tab_base_title.as_str());
+        let needs_tab_title_init = self.last_tab_title.is_none();
+
+        if base_changed {
+            self.last_tab_base_title = Some(tab_base_title.clone());
+        }
+
+        let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
+        let mut tab_title_out_of_sync = false;
+        let mut tab_count = 1;
+        if use_system_window_tabs {
+            let controller = cx.global::<SystemWindowTabController>();
+            let tabs = controller.tabs(window_id);
+            tab_count = tabs.map(|tabs| tabs.len()).unwrap_or(1);
+            let current_title = tabs
+                .and_then(|tabs| tabs.iter().find(|tab| tab.id == window_id))
+                .map(|tab| tab.title.as_ref());
+            tab_title_out_of_sync = match (self.last_tab_title.as_deref(), current_title) {
+                (Some(last_title), Some(current_title)) => last_title != current_title,
+                (None, Some(_)) | (Some(_), None) | (None, None) => true,
+            };
+            SystemWindowTabController::update_tab_base_title(
+                cx,
+                window_id,
+                SharedString::from(tab_base_title.clone()),
+            );
+        }
+
+        let should_refresh_tabs = base_changed || needs_tab_title_init || tab_title_out_of_sync;
+        if use_system_window_tabs && should_refresh_tabs {
+            if tab_count <= 1 {
+                SystemWindowTabController::update_tab_title(
+                    cx,
+                    window_id,
+                    SharedString::from(tab_base_title.clone()),
+                );
+                self.last_tab_title = Some(tab_base_title);
+                return;
+            }
+
+            let controller = cx.global::<SystemWindowTabController>();
+            let current_count = controller.count_tabs_with_base_title(window_id, &tab_base_title);
+            let previous_count = if base_changed {
+                previous_tab_base_title
+                    .as_deref()
+                    .and_then(|title| controller.count_tabs_with_base_title(window_id, title))
+            } else {
+                current_count
+            };
+            let can_skip_refresh = match (current_count, previous_count) {
+                (Some(current), Some(previous)) => current <= 1 && previous <= 1,
+                _ => false,
+            };
+
+            if can_skip_refresh {
+                SystemWindowTabController::update_tab_title(
+                    cx,
+                    window_id,
+                    SharedString::from(tab_base_title.clone()),
+                );
+                self.last_tab_title = Some(tab_base_title);
+            } else {
+                let primary_worktree_abs_path = {
+                    let project = self.project().read(cx);
+                    Self::primary_visible_worktree_abs_path(&project, cx)
+                };
+                self.refresh_system_window_tab_titles(
+                    window_id,
+                    tab_base_title,
+                    primary_worktree_abs_path,
+                    previous_tab_base_title,
+                    cx,
+                );
+            }
+        } else if should_refresh_tabs {
+            SystemWindowTabController::update_tab_title(
+                cx,
+                window_id,
+                SharedString::from(tab_base_title.clone()),
+            );
+            self.last_tab_title = Some(tab_base_title);
+        }
+    }
+
+    fn refresh_system_window_tab_titles(
+        &mut self,
+        current_window_id: WindowId,
+        current_base_title: String,
+        current_primary_worktree_abs_path: Option<Arc<std::path::Path>>,
+        previous_base_title: Option<String>,
+        cx: &mut App,
+    ) {
+        #[derive(Debug)]
+        struct TabTitleInfo {
+            window_id: WindowId,
+            workspace_window: Option<WindowHandle<Workspace>>,
+            suffixes_by_depth: HashMap<usize, String>,
+        }
+
+        #[derive(Debug)]
+        struct TabTitleUpdate {
+            window_id: WindowId,
+            workspace_window: Option<WindowHandle<Workspace>>,
+            base_title: String,
+            title: String,
+        }
+
+        let tabs = cx
+            .global::<SystemWindowTabController>()
+            .tabs(current_window_id)
+            .cloned()
+            .unwrap_or_default();
+        let has_controller_tab = !tabs.is_empty();
+
+        let mut affected_base_titles = HashSet::default();
+        affected_base_titles.insert(current_base_title.clone());
+        if let Some(previous_base_title) = previous_base_title {
+            if previous_base_title != current_base_title {
+                affected_base_titles.insert(previous_base_title);
+            }
+        }
+
+        let current_primary_worktree_abs_path = current_primary_worktree_abs_path.as_deref();
+        let mut tab_infos_by_base_title: HashMap<String, Vec<TabTitleInfo>> = HashMap::default();
+        tab_infos_by_base_title
+            .entry(current_base_title.clone())
+            .or_default()
+            .push(TabTitleInfo {
+                window_id: current_window_id,
+                workspace_window: None,
+                suffixes_by_depth: HashMap::default(),
+            });
+
+        for tab in tabs {
+            if tab.id == current_window_id {
+                continue;
+            }
+
+            let Some(workspace_window) = tab.handle.downcast::<Workspace>() else {
+                continue;
+            };
+
+            let mut base_title = cx
+                .global::<SystemWindowTabController>()
+                .tab_base_title(tab.id)
+                .map(|title| title.to_string());
+            if base_title.is_none() {
+                base_title = workspace_window
+                    .update(cx, |workspace, _, cx| {
+                        let project = workspace.project().read(cx);
+                        let workspace_title = Self::compute_workspace_title_prefix(&project, cx);
+                        Self::compute_workspace_tab_base_title(&project, &workspace_title, cx)
+                    })
+                    .ok();
+            }
+
+            let Some(base_title) = base_title else {
+                continue;
+            };
+
+            if !affected_base_titles.contains(&base_title) {
+                continue;
+            }
+
+            if cx
+                .global::<SystemWindowTabController>()
+                .tab_base_title(tab.id)
+                .is_none()
+            {
+                SystemWindowTabController::update_tab_base_title(
+                    cx,
+                    tab.id,
+                    SharedString::from(base_title.clone()),
+                );
+            }
+
+            tab_infos_by_base_title
+                .entry(base_title.clone())
+                .or_default()
+                .push(TabTitleInfo {
+                    window_id: tab.id,
+                    workspace_window: Some(workspace_window),
+                    suffixes_by_depth: HashMap::default(),
+                });
+        }
+
+        let mut updates = Vec::new();
+        for (base_title, mut infos) in tab_infos_by_base_title {
+            if infos.len() == 1 {
+                let info = infos.pop().unwrap();
+                updates.push(TabTitleUpdate {
+                    window_id: info.window_id,
+                    workspace_window: info.workspace_window,
+                    base_title: base_title.clone(),
+                    title: base_title,
+                });
+                continue;
+            }
+
+            let mut max_parent_depth = 0;
+            for info in &infos {
+                let components_len = match info.workspace_window.as_ref() {
+                    None => self
+                        .cached_tab_title_path_components(current_primary_worktree_abs_path)
+                        .map(|components| components.len()),
+                    Some(workspace_window) => workspace_window
+                        .update(cx, |workspace, _, cx| {
+                            let project = workspace.project().read(cx);
+                            let primary_path =
+                                Self::primary_visible_worktree_abs_path(&project, cx);
+                            workspace
+                                .cached_tab_title_path_components(primary_path.as_deref())
+                                .map(|components| components.len())
+                        })
+                        .ok()
+                        .flatten(),
+                };
+
+                if let Some(components_len) = components_len
+                    && components_len > 1
+                {
+                    max_parent_depth = max_parent_depth.max(components_len - 1);
+                }
+            }
+
+            let depth_range = 1..=max_parent_depth.max(1);
+            for info in &mut infos {
+                if !info.suffixes_by_depth.is_empty() {
+                    continue;
+                }
+
+                let suffixes = match info.workspace_window.as_ref() {
+                    None => self.tab_title_suffixes_for_depths(
+                        current_primary_worktree_abs_path,
+                        depth_range.clone(),
+                    ),
+                    Some(workspace_window) => workspace_window
+                        .update(cx, |workspace, _, cx| {
+                            let project = workspace.project().read(cx);
+                            let primary_path =
+                                Self::primary_visible_worktree_abs_path(&project, cx);
+                            workspace.tab_title_suffixes_for_depths(
+                                primary_path.as_deref(),
+                                depth_range.clone(),
+                            )
+                        })
+                        .ok()
+                        .unwrap_or_default(),
+                };
+
+                if suffixes.is_empty() {
+                    let fallback = Self::truncate_workspace_tab_suffix(&format!(
+                        "window {}",
+                        info.window_id.as_u64()
+                    ));
+                    info.suffixes_by_depth = depth_range
+                        .clone()
+                        .map(|depth| (depth, fallback.clone()))
+                        .collect();
+                } else {
+                    info.suffixes_by_depth = suffixes;
+                }
+            }
+
+            let mut chosen_depth = 1;
+            for depth in depth_range.clone() {
+                let mut seen: HashSet<&str> = HashSet::default();
+                let mut all_unique = true;
+
+                for info in &infos {
+                    let Some(suffix) = info.suffixes_by_depth.get(&depth) else {
+                        all_unique = false;
+                        break;
+                    };
+                    if !seen.insert(suffix.as_str()) {
+                        all_unique = false;
+                        break;
+                    }
+                }
+
+                if all_unique {
+                    chosen_depth = depth;
+                    break;
+                }
+            }
+
+            for info in infos {
+                let suffix = info
+                    .suffixes_by_depth
+                    .get(&chosen_depth)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Self::truncate_workspace_tab_suffix(&format!(
+                            "window {}",
+                            info.window_id.as_u64()
+                        ))
+                    });
+                updates.push(TabTitleUpdate {
+                    window_id: info.window_id,
+                    workspace_window: info.workspace_window,
+                    base_title: base_title.clone(),
+                    title: format!("{base_title} — {suffix}"),
+                });
+            }
+        }
+
+        for update in updates {
+            SystemWindowTabController::update_tab_title(
+                cx,
+                update.window_id,
+                SharedString::from(update.title.clone()),
+            );
+            if update.window_id == current_window_id {
+                if has_controller_tab {
+                    self.last_tab_title = Some(update.title);
+                }
+            } else if let Some(workspace_window) = update.workspace_window {
+                let base_title = update.base_title;
+                let title = update.title;
+                let _ = workspace_window.update(cx, move |workspace, _, _| {
+                    let base_changed =
+                        workspace.last_tab_base_title.as_deref() != Some(base_title.as_str());
+                    let title_changed = workspace.last_tab_title.as_deref() != Some(title.as_str());
+
+                    if base_changed {
+                        workspace.last_tab_base_title = Some(base_title);
+                    }
+                    if title_changed {
+                        workspace.last_tab_title = Some(title);
+                    }
+                });
+            }
+        }
+    }
+
+    fn compute_workspace_title_prefix(project: &Project, cx: &App) -> String {
         let mut title = String::new();
 
         for (i, worktree) in project.visible_worktrees(cx).enumerate() {
@@ -4777,6 +5329,7 @@ impl Workspace {
                     None => worktree.read(cx).root_name_str(),
                 }
             };
+
             if i > 0 {
                 title.push_str(", ");
             }
@@ -4787,40 +5340,166 @@ impl Workspace {
             title = "empty project".to_string();
         }
 
-        if let Some(path) = self.active_item(cx).and_then(|item| item.project_path(cx)) {
-            let filename = path.path.file_name().or_else(|| {
-                Some(
-                    project
-                        .worktree_for_id(path.worktree_id, cx)?
-                        .read(cx)
-                        .root_name_str(),
-                )
-            });
+        title
+    }
 
-            if let Some(filename) = filename {
-                title.push_str(" — ");
-                title.push_str(filename.as_ref());
-            }
+    fn compute_workspace_tab_base_title(
+        project: &Project,
+        workspace_title: &str,
+        cx: &App,
+    ) -> String {
+        let mut tab_title = Self::sanitize_workspace_tab_base_title(workspace_title);
+
+        if let Some(branch_name) = project.active_repository(cx).and_then(|repo| {
+            repo.read(cx).branch.as_ref().and_then(|branch| {
+                let sanitized = Self::sanitize_workspace_tab_text(branch.name());
+                let sanitized =
+                    truncate_and_trailoff(sanitized.trim(), MAX_WORKSPACE_TAB_BRANCH_NAME_LENGTH);
+                if sanitized.is_empty() {
+                    None
+                } else {
+                    Some(sanitized)
+                }
+            })
+        }) {
+            tab_title.push_str(" — ");
+            tab_title.push_str(&branch_name);
         }
 
         if project.is_via_collab() {
-            title.push_str(" ↙");
+            tab_title.push_str(" ↙");
         } else if project.is_shared() {
-            title.push_str(" ↗");
+            tab_title.push_str(" ↗");
         }
 
-        if let Some(last_title) = self.last_window_title.as_ref()
-            && &title == last_title
-        {
-            return;
+        tab_title
+    }
+
+    fn primary_visible_worktree_abs_path(
+        project: &Project,
+        cx: &App,
+    ) -> Option<Arc<std::path::Path>> {
+        let worktree = project.visible_worktrees(cx).next()?;
+        Some(worktree.read(cx).abs_path())
+    }
+
+    fn cached_tab_title_path_components(
+        &mut self,
+        primary_path: Option<&Path>,
+    ) -> Option<Arc<[String]>> {
+        if self.tab_title_primary_path.as_deref() != primary_path {
+            self.tab_title_primary_path = primary_path.map(Path::to_path_buf);
+            self.tab_title_path_components = primary_path
+                .map(Self::path_components_for_disambiguation)
+                .map(Arc::from);
+            self.tab_title_suffixes_by_depth.clear();
         }
-        window.set_window_title(&title);
-        SystemWindowTabController::update_tab_title(
-            cx,
-            window.window_handle().window_id(),
-            SharedString::from(&title),
-        );
-        self.last_window_title = Some(title);
+
+        self.tab_title_path_components.clone()
+    }
+
+    fn tab_title_suffixes_for_depths(
+        &mut self,
+        primary_path: Option<&Path>,
+        depths: impl IntoIterator<Item = usize>,
+    ) -> HashMap<usize, String> {
+        let Some(components) = self.cached_tab_title_path_components(primary_path) else {
+            return HashMap::default();
+        };
+
+        let mut suffixes = HashMap::default();
+        for depth in depths {
+            let suffix = if let Some(cached) = self.tab_title_suffixes_by_depth.get(&depth) {
+                cached.clone()
+            } else {
+                let computed = Self::path_suffix_for_disambiguation(Some(&components), depth);
+                self.tab_title_suffixes_by_depth
+                    .insert(depth, computed.clone());
+                computed
+            };
+            suffixes.insert(depth, suffix);
+        }
+
+        suffixes
+    }
+
+    fn path_components_for_disambiguation(path: &std::path::Path) -> Vec<String> {
+        path.iter()
+            .filter_map(|component| {
+                let component = component.to_string_lossy();
+                let component = Self::sanitize_workspace_tab_text(component.as_ref());
+                let component = component.trim();
+                (!component.is_empty() && component != "/").then(|| component.to_string())
+            })
+            .collect()
+    }
+
+    fn path_suffix_for_disambiguation(path_components: Option<&[String]>, depth: usize) -> String {
+        let Some(components) = path_components else {
+            return "unknown".to_string();
+        };
+
+        if components.len() <= 1 {
+            let suffix = components.join("/");
+            return Self::truncate_workspace_tab_suffix(&suffix);
+        }
+
+        let parent = &components[..components.len() - 1];
+        if parent.is_empty() {
+            let suffix = components.join("/");
+            return Self::truncate_workspace_tab_suffix(&suffix);
+        }
+
+        let start = parent.len().saturating_sub(depth);
+        let suffix = parent[start..].join("/");
+        Self::truncate_workspace_tab_suffix(&suffix)
+    }
+
+    fn truncate_workspace_tab_suffix(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return "unknown".to_string();
+        }
+
+        let truncated = truncate_and_trailoff(trimmed, MAX_WORKSPACE_TAB_PATH_SUFFIX_LENGTH);
+        if truncated.is_empty() {
+            "unknown".to_string()
+        } else {
+            truncated
+        }
+    }
+
+    fn sanitize_workspace_tab_text(value: &str) -> String {
+        value
+            .chars()
+            .filter(|c| !c.is_control() && !Self::is_disallowed_bidi_control(*c))
+            .collect()
+    }
+
+    fn sanitize_workspace_tab_base_title(value: &str) -> String {
+        let sanitized = Self::sanitize_workspace_tab_text(value);
+        let sanitized = sanitized.trim();
+        if sanitized.is_empty() {
+            return "empty project".to_string();
+        }
+
+        let truncated = truncate_and_trailoff(sanitized, MAX_WORKSPACE_TAB_TITLE_LENGTH);
+        if truncated.is_empty() {
+            "empty project".to_string()
+        } else {
+            truncated
+        }
+    }
+
+    fn is_disallowed_bidi_control(c: char) -> bool {
+        matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
     }
 
     fn update_window_edited(&mut self, window: &mut Window, cx: &mut App) {
@@ -5420,7 +6099,26 @@ impl Workspace {
     }
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.is_window_active() {
+        let window_active = window.is_window_active();
+        let should_throttle_background = cfg!(target_os = "macos")
+            && WorkspaceSettings::get_global(cx).use_system_window_tabs
+            && cx
+                .global::<SystemWindowTabController>()
+                .tabs(window.window_handle().window_id())
+                .map(|tabs| tabs.len() > 1)
+                .unwrap_or(false);
+        let effective_active = if should_throttle_background {
+            window_active
+        } else {
+            true
+        };
+
+        self.project.update(cx, |project, cx| {
+            project.set_window_active(effective_active, cx);
+        });
+
+        if window_active {
+            self.update_window_title(window, cx);
             self.update_active_view_for_followers(window, cx);
 
             if let Some(database_id) = self.database_id {
@@ -7827,6 +8525,7 @@ pub fn join_channel(
                         requesting_window,
                         None,
                         None,
+                        None,
                         cx,
                     )
                 })?
@@ -7894,8 +8593,10 @@ pub async fn get_any_active_workspace(
     // find an existing workspace to focus and show call controls
     let active_window = activate_any_workspace_window(&mut cx);
     if active_window.is_none() {
-        cx.update(|cx| Workspace::new_local(vec![], app_state.clone(), None, None, None, cx))?
-            .await?;
+        cx.update(|cx| {
+            Workspace::new_local(vec![], app_state.clone(), None, None, None, None, cx)
+        })?
+        .await?;
     }
     activate_any_workspace_window(&mut cx).context("could not open zed")
 }
@@ -7942,6 +8643,7 @@ pub struct OpenOptions {
     pub open_new_workspace: Option<bool>,
     pub prefer_focused_window: bool,
     pub replace_window: Option<WindowHandle<Workspace>>,
+    pub tabbing_target_window_id: Option<WindowId>,
     pub env: Option<HashMap<String, String>>,
 }
 
@@ -8060,6 +8762,7 @@ pub fn open_paths(
                     abs_paths,
                     app_state.clone(),
                     open_options.replace_window,
+                    open_options.tabbing_target_window_id,
                     open_options.env,
                     None,
                     cx,
@@ -8110,6 +8813,7 @@ pub fn open_new(
         Vec::new(),
         app_state,
         None,
+        open_options.tabbing_target_window_id,
         open_options.env,
         Some(Box::new(init)),
         cx,
