@@ -492,7 +492,7 @@ impl MacWindowState {
     fn set_traffic_light_visible(&self, visible: bool) {
         let native_window = self.native_window;
         let hidden = if visible { NO } else { YES };
-        self.executor
+        self.foreground_executor
             .spawn(async move {
                 unsafe {
                     let buttons = [
@@ -620,6 +620,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            tabbing_target_window_id,
         }: WindowParams,
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
@@ -823,7 +824,28 @@ impl MacWindow {
             native_window.makeFirstResponder_(native_view);
 
             let app: id = NSApplication::sharedApplication(nil);
-            let main_window: id = msg_send![app, mainWindow];
+            let parent_window: id = msg_send![app, mainWindow];
+            let should_force_add_as_tab = tabbing_target_window_id.is_some();
+            let tabbing_host_window: id = tabbing_target_window_id
+                .and_then(|tabbing_target_window_id| {
+                    let windows: id = msg_send![app, orderedWindows];
+                    let count: NSUInteger = msg_send![windows, count];
+
+                    let mut host_window = None;
+                    for i in 0..count {
+                        let window: id = msg_send![windows, objectAtIndex:i];
+                        if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                            let handle = get_window_state(&*window).lock().handle;
+                            if handle.window_id() == tabbing_target_window_id {
+                                host_window = Some(window);
+                                break;
+                            }
+                        }
+                    }
+
+                    host_window
+                })
+                .unwrap_or(parent_window);
             let mut sheet_parent = None;
 
             match kind {
@@ -869,11 +891,11 @@ impl MacWindow {
                     );
                 }
                 WindowKind::Dialog => {
-                    if !main_window.is_null() {
+                    if !parent_window.is_null() {
                         let parent = {
-                            let active_sheet: id = msg_send![main_window, attachedSheet];
+                            let active_sheet: id = msg_send![parent_window, attachedSheet];
                             if active_sheet.is_null() {
-                                main_window
+                                parent_window
                             } else {
                                 active_sheet
                             }
@@ -886,29 +908,33 @@ impl MacWindow {
             }
 
             if allows_automatic_window_tabbing
-                && !main_window.is_null()
-                && main_window != native_window
+                && !tabbing_host_window.is_null()
+                && tabbing_host_window != native_window
             {
-                let main_window_is_fullscreen = main_window
+                let tabbing_host_window_is_fullscreen = tabbing_host_window
                     .styleMask()
                     .contains(NSWindowStyleMask::NSFullScreenWindowMask);
                 let user_tabbing_preference = Self::get_user_tabbing_preference()
                     .unwrap_or(UserTabbingPreference::InFullScreen);
-                let should_add_as_tab = user_tabbing_preference == UserTabbingPreference::Always
+                let should_add_as_tab = should_force_add_as_tab
+                    || user_tabbing_preference == UserTabbingPreference::Always
                     || user_tabbing_preference == UserTabbingPreference::InFullScreen
-                        && main_window_is_fullscreen;
+                        && tabbing_host_window_is_fullscreen;
 
                 if should_add_as_tab {
-                    let main_window_can_tab: BOOL =
-                        msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
-                    let main_window_visible: BOOL = msg_send![main_window, isVisible];
+                    let tabbing_host_window_can_tab: BOOL = msg_send![
+                        tabbing_host_window,
+                        respondsToSelector: sel!(addTabbedWindow:ordered:)
+                    ];
+                    let tabbing_host_window_visible: BOOL =
+                        msg_send![tabbing_host_window, isVisible];
 
-                    if main_window_can_tab == YES && main_window_visible == YES {
-                        let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
+                    if tabbing_host_window_can_tab == YES && tabbing_host_window_visible == YES {
+                        let _: () = msg_send![tabbing_host_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
 
                         // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
-                        // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
-                        if !main_window_is_fullscreen {
+                        // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the tab host window is not fullscreen.
+                        if !tabbing_host_window_is_fullscreen {
                             let _: () = msg_send![native_window, orderFront: nil];
                         }
                     }

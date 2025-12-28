@@ -33,7 +33,7 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     CloseIntent, HistoryManager, ModalView, OpenOptions, PathList, SerializedWorkspaceLocation,
     WORKSPACE_DB, Workspace, WorkspaceId, notifications::DetachAndPromptErr,
-    with_active_or_new_workspace,
+    should_open_new_workspace_as_tab, with_active_or_new_workspace,
 };
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
 
@@ -500,7 +500,7 @@ impl EventEmitter<DismissEvent> for RecentProjectsDelegate {}
 impl PickerDelegate for RecentProjectsDelegate {
     type ListItem = ListItem;
 
-    fn placeholder_text(&self, window: &mut Window, _: &mut App) -> Arc<str> {
+    fn placeholder_text(&self, window: &mut Window, cx: &mut App) -> Arc<str> {
         let (create_window, reuse_window) = if self.create_new_window {
             (
                 window.keystroke_text_for(&menu::Confirm),
@@ -512,8 +512,14 @@ impl PickerDelegate for RecentProjectsDelegate {
                 window.keystroke_text_for(&menu::Confirm),
             )
         };
+        let destination = if should_open_new_workspace_as_tab(cx) {
+            "tab"
+        } else {
+            "window"
+        };
+
         Arc::from(format!(
-            "{reuse_window} reuses this window, {create_window} opens a new one",
+            "{reuse_window} reuses this {destination}, {create_window} opens a new {destination}",
         ))
     }
 
@@ -628,12 +634,42 @@ impl PickerDelegate for RecentProjectsDelegate {
                                     Ok(())
                                 }
                             })
+                        } else if self.create_new_window && should_open_new_workspace_as_tab(cx) {
+                            let app_state = workspace.app_state().clone();
+                            let tabbing_target_window_id = window.window_handle().window_id();
+                            cx.spawn_in(window, async move |_, cx| {
+                                cx.update(|_, cx| {
+                                    workspace::open_paths(
+                                        &paths,
+                                        app_state,
+                                        OpenOptions {
+                                            open_new_workspace: Some(true),
+                                            tabbing_target_window_id: Some(
+                                                tabbing_target_window_id,
+                                            ),
+                                            ..Default::default()
+                                        },
+                                        cx,
+                                    )
+                                })?
+                                .await?;
+                                Ok(())
+                            })
                         } else {
                             workspace.open_workspace_for_paths(false, paths, window, cx)
                         }
                     }
                     SerializedWorkspaceLocation::Remote(mut connection) => {
                         let app_state = workspace.app_state().clone();
+
+                        let tabbing_target_window_id = if !replace_current_window
+                            && self.create_new_window
+                            && should_open_new_workspace_as_tab(cx)
+                        {
+                            Some(window.window_handle().window_id())
+                        } else {
+                            None
+                        };
 
                         let replace_window = if replace_current_window {
                             window.window_handle().downcast::<Workspace>()
@@ -642,7 +678,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                         };
 
                         let open_options = OpenOptions {
+                            open_new_workspace: Some(true),
                             replace_window,
+                            tabbing_target_window_id,
                             ..Default::default()
                         };
 

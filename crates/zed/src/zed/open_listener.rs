@@ -30,7 +30,7 @@ use util::ResultExt;
 use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{AppState, OpenOptions, SerializedWorkspaceLocation, Workspace};
+use workspace::{AppState, OpenOptions, SerializedWorkspaceLocation, Workspace, WorkspaceSettings};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -556,6 +556,31 @@ async fn open_workspaces(
     Ok(())
 }
 
+/// Computes open options when the CLI requests reuse of an existing window.
+/// Chooses between tab reuse or window replacement based on system tab settings.
+fn compute_open_options_for_reuse(
+    reuse: bool,
+    open_new_workspace: Option<bool>,
+    host_window: Option<WindowHandle<Workspace>>,
+    use_system_window_tabs: bool,
+) -> (
+    Option<bool>,
+    Option<WindowHandle<Workspace>>,
+    Option<gpui::WindowId>,
+) {
+    if !reuse {
+        return (open_new_workspace, None, None);
+    }
+
+    let tabbing_target_window_id = host_window.as_ref().map(|window| window.window_id());
+
+    if use_system_window_tabs {
+        (Some(true), None, tabbing_target_window_id)
+    } else {
+        (Some(true), host_window, None)
+    }
+}
+
 async fn open_local_workspace(
     workspace_paths: Vec<String>,
     diff_paths: Vec<[String; 2]>,
@@ -571,14 +596,21 @@ async fn open_local_workspace(
         derive_paths_with_position(app_state.fs.as_ref(), workspace_paths).await;
 
     // If reuse flag is passed, open a new workspace in an existing window.
-    let (open_new_workspace, replace_window) = if reuse {
-        (
-            Some(true),
-            cx.update(|cx| workspace::local_workspace_windows(cx).into_iter().next()),
-        )
+    let host_window = cx.update(|cx| workspace::local_workspace_windows(cx).into_iter().next());
+
+    let use_system_window_tabs = if cfg!(target_os = "macos") {
+        cx.update(|cx| WorkspaceSettings::get_global(cx).use_system_window_tabs)
     } else {
-        (open_new_workspace, None)
+        false
     };
+
+    let (open_new_workspace, replace_window, tabbing_target_window_id) =
+        compute_open_options_for_reuse(
+            reuse,
+            open_new_workspace,
+            host_window,
+            use_system_window_tabs,
+        );
 
     let (workspace, items) = match open_paths_with_positions(
         &paths_with_position,
@@ -587,6 +619,7 @@ async fn open_local_workspace(
         workspace::OpenOptions {
             open_new_workspace,
             replace_window,
+            tabbing_target_window_id,
             prefer_focused_window: wait,
             env: env.cloned(),
             ..Default::default()
@@ -719,9 +752,11 @@ mod tests {
     use remote::SshConnectionOptions;
     use rope::Rope;
     use serde_json::json;
+    use settings::SettingsStore;
     use std::{sync::Arc, task::Poll};
     use util::path;
-    use workspace::{AppState, Workspace};
+    use workspace::item::test::TestItem;
+    use workspace::{AppState, CloseIntent, Workspace};
 
     #[gpui::test]
     fn test_parse_ssh_url(cx: &mut TestAppContext) {
@@ -1032,6 +1067,12 @@ mod tests {
     async fn test_reuse_flag_functionality(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
 
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |content| {
+                content.workspace.use_system_window_tabs = Some(false);
+            });
+        });
+
         let root_dir = if cfg!(windows) { "C:\\root" } else { "/root" };
         let file1_path = if cfg!(windows) {
             "C:\\root\\file1.txt"
@@ -1078,7 +1119,7 @@ mod tests {
         let (response_tx, _response_rx) = ipc::channel::<CliResponse>().unwrap();
         let workspace_paths = vec![file1_path.to_string()];
 
-        let _errored = cx
+        let errored = cx
             .spawn({
                 let app_state = app_state.clone();
                 let response_tx = response_tx.clone();
@@ -1099,8 +1140,11 @@ mod tests {
             })
             .await;
 
-        // Now test the reuse functionality - should replace the existing workspace
-        let workspace_paths_reuse = vec![file1_path.to_string()];
+        assert!(!errored);
+        assert_eq!(cx.windows().len(), 1);
+
+        // Now test the reuse functionality - should replace the existing workspace (not open a new tab).
+        let workspace_paths_reuse = vec![file2_path.to_string()];
 
         let errored_reuse = cx
             .spawn({
@@ -1124,6 +1168,264 @@ mod tests {
             .await;
 
         assert!(!errored_reuse);
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_reuse_flag_opens_new_tab_when_system_window_tabs_enabled(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |content| {
+                content.workspace.use_system_window_tabs = Some(true);
+            });
+        });
+
+        let root_dir = "/root";
+        let file1_path = "/root/file1.txt";
+        let file2_path = "/root/file2.txt";
+
+        app_state.fs.create_dir(Path::new(root_dir)).await.unwrap();
+        app_state
+            .fs
+            .create_file(Path::new(file1_path), Default::default())
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .save(
+                Path::new(file1_path),
+                &Rope::from("content1"),
+                LineEnding::Unix,
+            )
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .create_file(Path::new(file2_path), Default::default())
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .save(
+                Path::new(file2_path),
+                &Rope::from("content2"),
+                LineEnding::Unix,
+            )
+            .await
+            .unwrap();
+
+        let (response_tx, _response_rx) = ipc::channel::<CliResponse>().unwrap();
+
+        let errored = cx
+            .spawn({
+                let app_state = app_state.clone();
+                let response_tx = response_tx.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![file1_path.to_string()],
+                        vec![],
+                        None,
+                        false,
+                        false,
+                        &response_tx,
+                        None,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+        assert!(!errored);
+        assert_eq!(cx.windows().len(), 1);
+
+        let errored_reuse = cx
+            .spawn({
+                let app_state = app_state.clone();
+                let response_tx = response_tx.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![file2_path.to_string()],
+                        vec![],
+                        None,
+                        true,
+                        false,
+                        &response_tx,
+                        None,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(!errored_reuse);
+        assert_eq!(cx.windows().len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_replace_window_prompt_scoped_to_target_workspace(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |content| {
+                content.workspace.use_system_window_tabs = Some(true);
+            });
+        });
+
+        let root_dir = "/root";
+        let workspace_a_dir = "/root/workspace_a";
+        let workspace_b_dir = "/root/workspace_b";
+        let file_a_path = "/root/workspace_a/file_a.txt";
+        let file_b_path = "/root/workspace_b/file_b.txt";
+
+        app_state.fs.create_dir(Path::new(root_dir)).await.unwrap();
+        app_state
+            .fs
+            .create_dir(Path::new(workspace_a_dir))
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .create_dir(Path::new(workspace_b_dir))
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .create_file(Path::new(file_a_path), Default::default())
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .save(
+                Path::new(file_a_path),
+                &Rope::from("content a"),
+                LineEnding::Unix,
+            )
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .create_file(Path::new(file_b_path), Default::default())
+            .await
+            .unwrap();
+        app_state
+            .fs
+            .save(
+                Path::new(file_b_path),
+                &Rope::from("content b"),
+                LineEnding::Unix,
+            )
+            .await
+            .unwrap();
+
+        let (response_tx, _response_rx) = ipc::channel::<CliResponse>().unwrap();
+
+        let errored_a = cx
+            .spawn({
+                let app_state = app_state.clone();
+                let response_tx = response_tx.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![file_a_path.to_string()],
+                        vec![],
+                        None,
+                        false,
+                        false,
+                        &response_tx,
+                        None,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+        assert!(!errored_a);
+        assert_eq!(cx.windows().len(), 1);
+        let workspace_a = cx.windows()[0]
+            .downcast::<Workspace>()
+            .expect("workspace_a window");
+
+        let errored_b = cx
+            .spawn({
+                let app_state = app_state.clone();
+                let response_tx = response_tx.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![file_b_path.to_string()],
+                        vec![],
+                        None,
+                        true,
+                        false,
+                        &response_tx,
+                        None,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+        assert!(!errored_b);
+        assert_eq!(cx.windows().len(), 2);
+        let workspace_a_window_id = workspace_a.window_id();
+        let workspace_b = cx
+            .windows()
+            .iter()
+            .find_map(|window| {
+                let workspace = window.downcast::<Workspace>()?;
+                (workspace.window_id() != workspace_a_window_id).then_some(workspace)
+            })
+            .expect("workspace_b window");
+
+        let dirty_item_1 = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+        let dirty_item_2 = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+        workspace_a
+            .update(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(dirty_item_1.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+                workspace.add_item_to_active_pane(
+                    Box::new(dirty_item_2.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+
+        let close_b = workspace_b
+            .update(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(close_b.await.unwrap());
+
+        let close_a = workspace_a
+            .update(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.executor().run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(!close_a.await.unwrap());
     }
 
     #[gpui::test]

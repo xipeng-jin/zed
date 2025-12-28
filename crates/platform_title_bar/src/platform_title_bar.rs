@@ -84,6 +84,10 @@ impl Render for PlatformTitleBar {
         let close_action = Box::new(workspace::CloseWindow);
         let children = mem::take(&mut self.children);
 
+        // Check if we should show embedded workspace tabs
+        let show_embedded_tabs =
+            SystemWindowTabs::should_show_embedded_tabs(window, cx) && cfg!(target_os = "macos");
+
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)
             .w_full()
@@ -166,6 +170,10 @@ impl Render for PlatformTitleBar {
                     .w_full()
                     .children(children),
             )
+            .when(show_embedded_tabs, |title_bar| {
+                // Render embedded tabs alongside the normal title bar children.
+                title_bar.child(self.system_window_tabs.clone().into_any_element())
+            })
             .when(!window.is_fullscreen(), |title_bar| {
                 match self.platform_style {
                     PlatformStyle::Mac => title_bar,
@@ -189,10 +197,8 @@ impl Render for PlatformTitleBar {
                 }
             });
 
-        v_flex()
-            .w_full()
-            .child(title_bar)
-            .child(self.system_window_tabs.clone().into_any_element())
+        // Only render the title bar - tabs are now embedded inside when needed
+        title_bar.into_any_element()
     }
 }
 

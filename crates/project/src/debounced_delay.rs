@@ -23,6 +23,13 @@ impl<E: 'static> DebouncedDelay<E> {
         }
     }
 
+    pub fn cancel(&mut self) {
+        if let Some(channel) = self.cancel_channel.take() {
+            _ = channel.send(());
+        }
+        self.task = None;
+    }
+
     pub fn fire_new<F>(&mut self, delay: Duration, cx: &mut Context<E>, func: F)
     where
         F: 'static + Send + FnOnce(&mut E, &mut Context<E>) -> Task<()>,

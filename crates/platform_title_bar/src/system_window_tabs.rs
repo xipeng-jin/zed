@@ -1,14 +1,14 @@
-use settings::{Settings, SettingsStore};
-
+use crate::PlatformTitleBar;
 use gpui::{
     AnyWindowHandle, Context, Hsla, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
     Styled, SystemWindowTab, SystemWindowTabController, Window, WindowId, actions, canvas, div,
 };
+use settings::{Settings, SettingsStore};
 
 use theme::ThemeSettings;
 use ui::{
     Color, ContextMenu, DynamicSpacing, IconButton, IconButtonShape, IconName, IconSize, Label,
-    LabelSize, Tab, h_flex, prelude::*, right_click_menu,
+    LabelSize, h_flex, prelude::*, right_click_menu,
 };
 use workspace::{
     CloseWindow, ItemSettings, Workspace, WorkspaceSettings,
@@ -25,6 +25,9 @@ actions!(
     ]
 );
 
+const TAB_DRAG_MIN_WIDTH_REM: f32 = 10.0;
+const TAB_CONTAINER_MIN_WIDTH_REM: f32 = 8.0;
+
 #[derive(Clone)]
 pub struct DraggedWindowTab {
     pub id: WindowId,
@@ -40,7 +43,12 @@ pub struct DraggedWindowTab {
 pub struct SystemWindowTabs {
     tab_bar_scroll_handle: ScrollHandle,
     measured_tab_width: Pixels,
+    last_measured_tab_count: usize,
+    last_measured_tab_bar_width: Pixels,
     last_dragged_tab: Option<DraggedWindowTab>,
+    cached_tabs: Vec<SystemWindowTab>,
+    cached_tabs_revision: Option<u64>,
+    cached_fallback_title: Option<String>,
 }
 
 impl SystemWindowTabs {
@@ -48,8 +56,59 @@ impl SystemWindowTabs {
         Self {
             tab_bar_scroll_handle: ScrollHandle::new(),
             measured_tab_width: px(0.),
+            last_measured_tab_count: 0,
+            last_measured_tab_bar_width: px(0.),
             last_dragged_tab: None,
+            cached_tabs: Vec::new(),
+            cached_tabs_revision: None,
+            cached_fallback_title: None,
         }
+    }
+
+    fn refresh_cached_tabs(&mut self, window: &Window, cx: &App) {
+        let window_id = window.window_handle().window_id();
+        let controller = cx.global::<SystemWindowTabController>();
+        let tabs_revision = controller.tabs_revision();
+
+        if let Some(tabs) = controller.tabs(window_id) {
+            if self.cached_tabs_revision != Some(tabs_revision) || self.cached_tabs.is_empty() {
+                self.cached_tabs = tabs.clone();
+                self.cached_tabs_revision = Some(tabs_revision);
+                self.cached_fallback_title = None;
+            }
+            return;
+        }
+
+        let window_title = window.window_title();
+        let needs_refresh = self.cached_tabs_revision != Some(tabs_revision)
+            || self.cached_tabs.is_empty()
+            || self
+                .cached_fallback_title
+                .as_deref()
+                .is_some_and(|title| title != window_title.as_str());
+        if needs_refresh {
+            let shared_title = SharedString::from(window_title.clone());
+            self.cached_tabs = vec![SystemWindowTab::new(shared_title, window.window_handle())];
+            self.cached_tabs_revision = Some(tabs_revision);
+            self.cached_fallback_title = Some(window_title);
+        }
+    }
+
+    /// Returns true if workspace tabs should be shown in the title bar.
+    /// This hides the embedded tab bar when the system tabs feature is off
+    /// or when there is only a single workspace tab.
+    pub fn should_show_embedded_tabs(window: &Window, cx: &App) -> bool {
+        let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
+        if !use_system_window_tabs {
+            return false;
+        }
+
+        let controller = cx.global::<SystemWindowTabController>();
+        let tabs = controller.tabs(window.window_handle().window_id());
+        let tab_count = tabs.map(|t| t.len()).unwrap_or(1);
+
+        // Show tabs when the setting is enabled and there's more than 1 tab
+        tab_count > 1
     }
 
     pub fn init(cx: &mut App) {
@@ -142,8 +201,7 @@ impl SystemWindowTabs {
     fn render_tab(
         &self,
         ix: usize,
-        item: SystemWindowTab,
-        tabs: Vec<SystemWindowTab>,
+        item: &SystemWindowTab,
         active_background_color: Hsla,
         inactive_background_color: Hsla,
         window: &mut Window,
@@ -155,11 +213,17 @@ impl SystemWindowTabs {
         let show_close_button = &settings.show_close_button;
 
         let rem_size = window.rem_size();
-        let width = self.measured_tab_width.max(rem_size * 10);
-        let is_active = window.window_handle().window_id() == item.id;
-        let title = item.title.to_string();
+        let tab_height = PlatformTitleBar::height(window);
+        let width = self
+            .measured_tab_width
+            .max(rem_size * TAB_DRAG_MIN_WIDTH_REM);
+        let item_id = item.id;
+        let item_handle = item.handle;
+        let title = item.title.clone();
+        let title_string = title.to_string();
+        let is_active = window.window_handle().window_id() == item_id;
 
-        let label = Label::new(&title)
+        let label = Label::new(title)
             .size(LabelSize::Small)
             .truncate()
             .color(if is_active {
@@ -171,21 +235,21 @@ impl SystemWindowTabs {
         let tab = h_flex()
             .id(ix)
             .group("tab")
-            .w_full()
             .overflow_hidden()
-            .h(Tab::content_height(cx))
+            .h(tab_height)
             .relative()
             .px(DynamicSpacing::Base16.px(cx))
+            .items_center()
             .justify_center()
             .border_l_1()
             .border_color(cx.theme().colors().border)
             .cursor_pointer()
             .on_drag(
                 DraggedWindowTab {
-                    id: item.id,
+                    id: item_id,
                     ix,
-                    handle: item.handle,
-                    title: item.title.to_string(),
+                    handle: item_handle,
+                    title: title_string,
                     width,
                     is_active,
                     active_background_color,
@@ -223,15 +287,15 @@ impl SystemWindowTabs {
                 })
             })
             .on_click(move |_, _, cx| {
-                let _ = item.handle.update(cx, |_, window, _| {
+                let _ = item_handle.update(cx, |_, window, _| {
                     window.activate_window();
                 });
             })
             .on_mouse_up(MouseButton::Middle, move |_, window, cx| {
-                if item.handle.window_id() == window.window_handle().window_id() {
+                if item_handle.window_id() == window.window_handle().window_id() {
                     window.dispatch_action(Box::new(CloseWindow), cx);
                 } else {
-                    let _ = item.handle.update(cx, |_, window, cx| {
+                    let _ = item_handle.update(cx, |_, window, cx| {
                         window.dispatch_action(Box::new(CloseWindow), cx);
                     });
                 }
@@ -240,11 +304,12 @@ impl SystemWindowTabs {
             .map(|this| match show_close_button {
                 ShowCloseButton::Hidden => this,
                 _ => this.child(
-                    div()
+                    h_flex()
                         .absolute()
-                        .top_2()
+                        .top_0()
+                        .bottom_0()
                         .w_4()
-                        .h_4()
+                        .justify_center()
                         .map(|this| match close_side {
                             ClosePosition::Left => this.left_1(),
                             ClosePosition::Right => this.right_1(),
@@ -256,12 +321,12 @@ impl SystemWindowTabs {
                                 .icon_size(IconSize::XSmall)
                                 .on_click({
                                     move |_, window, cx| {
-                                        if item.handle.window_id()
+                                        if item_handle.window_id()
                                             == window.window_handle().window_id()
                                         {
                                             window.dispatch_action(Box::new(CloseWindow), cx);
                                         } else {
-                                            let _ = item.handle.update(cx, |_, window, cx| {
+                                            let _ = item_handle.update(cx, |_, window, cx| {
                                                 window.dispatch_action(Box::new(CloseWindow), cx);
                                             });
                                         }
@@ -280,18 +345,16 @@ impl SystemWindowTabs {
             .trigger(|_, _, _| tab)
             .menu(move |window, cx| {
                 let focus_handle = cx.focus_handle();
-                let tabs = tabs.clone();
-                let other_tabs = tabs.clone();
-                let move_tabs = tabs.clone();
-                let merge_tabs = tabs.clone();
 
                 ContextMenu::build(window, cx, move |mut menu, _window_, _cx| {
                     menu = menu.entry("Close Tab", None, move |window, cx| {
+                        let controller = cx.global::<SystemWindowTabController>();
+                        let tabs = controller.tabs(item_id).cloned().unwrap_or_default();
                         Self::handle_right_click_action(
                             cx,
                             window,
                             &tabs,
-                            |tab| tab.id == item.id,
+                            |tab| tab.id == item_id,
                             |window, cx| {
                                 window.dispatch_action(Box::new(CloseWindow), cx);
                             },
@@ -299,11 +362,13 @@ impl SystemWindowTabs {
                     });
 
                     menu = menu.entry("Close Other Tabs", None, move |window, cx| {
+                        let controller = cx.global::<SystemWindowTabController>();
+                        let tabs = controller.tabs(item_id).cloned().unwrap_or_default();
                         Self::handle_right_click_action(
                             cx,
                             window,
-                            &other_tabs,
-                            |tab| tab.id != item.id,
+                            &tabs,
+                            |tab| tab.id != item_id,
                             |window, cx| {
                                 window.dispatch_action(Box::new(CloseWindow), cx);
                             },
@@ -311,11 +376,13 @@ impl SystemWindowTabs {
                     });
 
                     menu = menu.entry("Move Tab to New Window", None, move |window, cx| {
+                        let controller = cx.global::<SystemWindowTabController>();
+                        let tabs = controller.tabs(item_id).cloned().unwrap_or_default();
                         Self::handle_right_click_action(
                             cx,
                             window,
-                            &move_tabs,
-                            |tab| tab.id == item.id,
+                            &tabs,
+                            |tab| tab.id == item_id,
                             |window, cx| {
                                 SystemWindowTabController::move_tab_to_new_window(
                                     cx,
@@ -327,11 +394,13 @@ impl SystemWindowTabs {
                     });
 
                     menu = menu.entry("Show All Tabs", None, move |window, cx| {
+                        let controller = cx.global::<SystemWindowTabController>();
+                        let tabs = controller.tabs(item_id).cloned().unwrap_or_default();
                         Self::handle_right_click_action(
                             cx,
                             window,
-                            &merge_tabs,
-                            |tab| tab.id == item.id,
+                            &tabs,
+                            |tab| tab.id == item_id,
                             |window, _cx| {
                                 window.toggle_window_tab_overview();
                             },
@@ -344,14 +413,12 @@ impl SystemWindowTabs {
 
         div()
             .flex_1()
-            .min_w(rem_size * 10)
+            .h_full()
+            .min_w(rem_size * TAB_CONTAINER_MIN_WIDTH_REM)
             .when(is_active, |this| this.bg(active_background_color))
-            .border_t_1()
-            .border_color(if is_active {
-                active_background_color
-            } else {
-                cx.theme().colors().border
-            })
+            .when(!is_active, |this| this.bg(inactive_background_color))
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
             .child(menu)
     }
 
@@ -362,7 +429,7 @@ impl SystemWindowTabs {
     fn handle_right_click_action<F, P>(
         cx: &mut App,
         window: &mut Window,
-        tabs: &Vec<SystemWindowTab>,
+        tabs: &[SystemWindowTab],
         predicate: P,
         mut action: F,
     ) where
@@ -386,29 +453,20 @@ impl SystemWindowTabs {
 impl Render for SystemWindowTabs {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
-        let active_background_color = cx.theme().colors().title_bar_background;
-        let inactive_background_color = cx.theme().colors().tab_bar_background;
+        let active_background_color = cx.theme().colors().tab_bar_background;
+        let inactive_background_color = cx.theme().colors().title_bar_background;
         let entity = cx.entity();
 
-        let controller = cx.global::<SystemWindowTabController>();
-        let visible = controller.is_visible();
-        let current_window_tab = vec![SystemWindowTab::new(
-            SharedString::from(window.window_title()),
-            window.window_handle(),
-        )];
-        let tabs = controller
-            .tabs(window.window_handle().window_id())
-            .unwrap_or(&current_window_tab)
-            .clone();
-
+        self.refresh_cached_tabs(window, cx);
+        let tabs = self.cached_tabs.as_slice();
+        let number_of_tabs = tabs.len().max(1);
         let tab_items = tabs
             .iter()
             .enumerate()
             .map(|(ix, item)| {
                 self.render_tab(
                     ix,
-                    item.clone(),
-                    tabs.clone(),
+                    item,
                     active_background_color,
                     inactive_background_color,
                     window,
@@ -417,17 +475,22 @@ impl Render for SystemWindowTabs {
             })
             .collect::<Vec<_>>();
 
-        let number_of_tabs = tab_items.len().max(1);
-        if (!window.tab_bar_visible() && !visible)
-            || (!use_system_window_tabs && number_of_tabs == 1)
-        {
+        // Don't show if the feature is disabled or there's only one tab
+        if !use_system_window_tabs || number_of_tabs <= 1 {
+            self.last_measured_tab_count = if use_system_window_tabs {
+                number_of_tabs
+            } else {
+                0
+            };
+            self.last_measured_tab_bar_width = px(0.);
             return h_flex().into_any_element();
         }
 
+        // Render embedded in title bar (takes full height of parent, fills available width)
         h_flex()
-            .w_full()
-            .h(Tab::container_height(cx))
-            .bg(inactive_background_color)
+            .flex_1()
+            .h_full()
+            .items_center()
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
@@ -446,9 +509,9 @@ impl Render for SystemWindowTabs {
             .child(
                 h_flex()
                     .id("window tabs")
-                    .w_full()
-                    .h(Tab::container_height(cx))
-                    .bg(inactive_background_color)
+                    .flex_1()
+                    .h_full()
+                    .items_center()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_bar_scroll_handle)
                     .children(tab_items)
@@ -458,9 +521,14 @@ impl Render for SystemWindowTabs {
                             move |bounds, _, _, cx| {
                                 let entity = entity.clone();
                                 entity.update(cx, |this, cx| {
-                                    let width = bounds.size.width / number_of_tabs as f32;
-                                    if width != this.measured_tab_width {
+                                    let tab_bar_width = bounds.size.width;
+                                    if number_of_tabs != this.last_measured_tab_count
+                                        || tab_bar_width != this.last_measured_tab_bar_width
+                                    {
+                                        let width = tab_bar_width / number_of_tabs as f32;
                                         this.measured_tab_width = width;
+                                        this.last_measured_tab_count = number_of_tabs;
+                                        this.last_measured_tab_bar_width = tab_bar_width;
                                         cx.notify();
                                     }
                                 });
@@ -473,10 +541,8 @@ impl Render for SystemWindowTabs {
             .child(
                 h_flex()
                     .h_full()
+                    .items_center()
                     .px(DynamicSpacing::Base06.rems(cx))
-                    .border_t_1()
-                    .border_l_1()
-                    .border_color(cx.theme().colors().border)
                     .child(
                         IconButton::new("plus", IconName::Plus)
                             .icon_size(IconSize::Small)
@@ -498,7 +564,7 @@ impl Render for SystemWindowTabs {
 impl Render for DraggedWindowTab {
     fn render(
         &mut self,
-        _window: &mut gpui::Window,
+        window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
@@ -512,7 +578,7 @@ impl Render for DraggedWindowTab {
             });
 
         h_flex()
-            .h(Tab::container_height(cx))
+            .h(PlatformTitleBar::height(window))
             .w(self.width)
             .px(DynamicSpacing::Base16.px(cx))
             .justify_center()

@@ -44,7 +44,7 @@ use crate::{
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
     Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
     ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TaskTiming,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    ThreadTaskTimings, Window, WindowControlArea, WindowId, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -1234,6 +1234,11 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// If set, attempts to add the window as a native tab into the specified window.
+    ///
+    /// This is macOS specific.
+    pub tabbing_target_window_id: Option<WindowId>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1283,6 +1288,8 @@ pub(crate) struct WindowParams {
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+    #[cfg(target_os = "macos")]
+    pub tabbing_target_window_id: Option<WindowId>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1341,6 +1348,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            tabbing_target_window_id: None,
         }
     }
 }

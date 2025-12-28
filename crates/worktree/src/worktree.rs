@@ -671,6 +671,19 @@ impl Worktree {
         }
     }
 
+    pub fn set_scanning_enabled(&mut self, enabled: bool, cx: &Context<Self>) {
+        let Some(worktree) = self.as_local_mut() else {
+            return;
+        };
+
+        if worktree.scanning_enabled == enabled {
+            return;
+        }
+
+        worktree.scanning_enabled = enabled;
+        worktree.restart_background_scanners(cx);
+    }
+
     pub fn replica_id(&self) -> ReplicaId {
         match self {
             Worktree::Local(_) => ReplicaId::LOCAL,
