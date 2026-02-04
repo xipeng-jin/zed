@@ -82,8 +82,8 @@ fn apply_title_bar_visibility(
         workspace.set_titlebar_item(None, window, cx);
     }
 
-    #[cfg(target_os = "macos")]
-    window.set_traffic_light_visible(should_show);
+    // #[cfg(target_os = "macos")]
+    // window.set_traffic_light_visible(should_show);
 }
 
 pub fn init(cx: &mut App) {
