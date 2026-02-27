@@ -37,7 +37,7 @@ use settings::Settings;
 use settings::WorktreeId;
 use std::sync::Arc;
 use theme::ActiveTheme;
-use title_bar_settings::TitleBarSettings;
+pub use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, ContextMenu, IconWithIndicator, Indicator, PopoverMenu, PopoverMenuHandle,
     TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
@@ -73,6 +73,27 @@ actions!(
     ]
 );
 
+fn apply_title_bar_visibility(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let should_show = TitleBarSettings::get_global(cx).show;
+    let has_titlebar = workspace.titlebar_item().is_some();
+
+    if should_show {
+        if !has_titlebar {
+            let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
+            workspace.set_titlebar_item(Some(item.into()), window, cx);
+        }
+    } else {
+        workspace.set_titlebar_item(None, window, cx);
+    }
+
+    // #[cfg(target_os = "macos")]
+    // window.set_traffic_light_visible(should_show);
+}
+
 pub fn init(cx: &mut App) {
     platform_title_bar::PlatformTitleBar::init(cx);
 
@@ -80,8 +101,14 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
-        let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
-        workspace.set_titlebar_item(item.into(), window, cx);
+        // let item = cx.new(|cx| TitleBar::new("title-bar", workspace, window, cx));
+        // workspace.set_titlebar_item(item.into(), window, cx);
+        apply_title_bar_visibility(workspace, window, cx);
+
+        cx.observe_global_in::<settings::SettingsStore>(window, |workspace, window, cx| {
+            apply_title_bar_visibility(workspace, window, cx);
+        })
+        .detach();
 
         workspace.register_action(|workspace, _: &SimulateUpdateAvailable, _window, cx| {
             if let Some(titlebar) = workspace

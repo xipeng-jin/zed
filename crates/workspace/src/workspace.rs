@@ -2393,8 +2393,17 @@ impl Workspace {
         &self.app_state.client
     }
 
-    pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
-        self.titlebar_item = Some(item);
+    // pub fn set_titlebar_item(&mut self, item: AnyView, _: &mut Window, cx: &mut Context<Self>) {
+    //     self.titlebar_item = Some(item);
+    //     cx.notify();
+    // }
+    pub fn set_titlebar_item(
+        &mut self,
+        item: Option<AnyView>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.titlebar_item = item;
         cx.notify();
     }
 
