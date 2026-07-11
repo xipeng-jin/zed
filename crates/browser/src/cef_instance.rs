@@ -406,9 +406,7 @@ impl CefInstance {
         #[cfg(target_os = "macos")]
         {
             let running_from_bundle = CEF_LIBRARY_LOADER.lock().is_some();
-            if !running_from_bundle
-                && let Some(cef_dir) = resolve_cef_dir_from_env()
-            {
+            if !running_from_bundle && let Some(cef_dir) = resolve_cef_dir_from_env() {
                 let framework_path = cef_dir.join("Chromium Embedded Framework.framework");
                 if framework_path.exists()
                     && let Some(framework_path_str) = framework_path.to_str()

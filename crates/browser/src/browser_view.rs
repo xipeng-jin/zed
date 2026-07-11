@@ -11,18 +11,25 @@
 //! presenter, so this file is platform-neutral and testable with a scripted
 //! stub backend.
 
-use crate::browser_tab::BrowserTab;
+use crate::browser_tab::{BrowserTab, ClosedTab};
 use crate::omnibox::{Omnibox, OmniboxEvent};
+use crate::session;
 use crate::tab_backend::TabBackend;
+use anyhow::anyhow;
+use db::kvp::KeyValueStore;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Render, ScrollWheelEvent, SharedString, Window, actions, canvas, div, img,
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, SharedUri,
+    Subscription, Task, WeakEntity, Window, actions, canvas, div, img,
 };
+use project::Project;
+use std::sync::Arc;
+use std::time::Duration;
 use ui::{CommonAnimationExt, IconButtonShape, Tab, TabPosition, Tooltip, prelude::*};
-#[cfg(any(feature = "cef", test))]
-use workspace::Workspace;
-use workspace::item::{Item, ItemEvent, TabContentParams, TabTooltipContent};
+use util::ResultExt as _;
+use workspace::item::{Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent};
+use workspace::{ItemId, Workspace, WorkspaceId};
 
 actions!(
     browser,
@@ -60,11 +67,43 @@ pub const DEFAULT_URL: &str = "https://zed.dev";
 /// (`Glass:crates/browser/src/browser_view.rs:41`).
 const MAX_CLOSED_TABS: usize = 20;
 
-/// Creates the engine backend for each new browser tab.
-pub(crate) type TabBackendFactory = Box<dyn Fn() -> Box<dyn TabBackend>>;
+/// How long tab mutations batch before the session is written
+/// (`Glass:crates/browser/src/browser_view/session.rs:166`).
+const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Creates the engine backend for each new browser tab. Installed as a GPUI
+/// global by `init` so workspace item deserialization can construct browser
+/// views; tests install a stub factory.
+#[derive(Clone)]
+pub struct TabBackendFactory(Arc<dyn Fn() -> Box<dyn TabBackend>>);
+
+impl TabBackendFactory {
+    pub fn new(create: impl Fn() -> Box<dyn TabBackend> + 'static) -> Self {
+        Self(Arc::new(create))
+    }
+
+    fn create_backend(&self) -> Box<dyn TabBackend> {
+        (self.0)()
+    }
+}
+
+impl Global for TabBackendFactory {}
+
+/// The single designated writer of the persisted session (plan §3.5): the
+/// first non-incognito browser view claims ownership, restores the saved
+/// session, and is the only view that saves it — so browser views in other
+/// workspaces cannot fight over the global key.
+#[derive(Default)]
+struct SessionOwner(Option<EntityId>);
+
+impl Global for SessionOwner {}
 
 #[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
+    cx.set_global(TabBackendFactory::new(|| {
+        Box::new(crate::tab::CefTab::new())
+    }));
+    workspace::register_serializable_item::<BrowserView>(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenBrowser, window, cx| {
             BrowserView::open(workspace, window, cx);
@@ -82,13 +121,20 @@ pub struct BrowserView {
     tabs: Vec<BrowserTab>,
     active_tab_index: usize,
     /// Recently closed tabs, most recent last (the reopen stack).
-    closed_tabs: Vec<crate::browser_tab::ClosedTab>,
+    closed_tabs: Vec<ClosedTab>,
     next_tab_id: usize,
     omnibox: Entity<Omnibox>,
     /// Window-relative bounds of the page content area, captured at draw time;
     /// pointer events are translated into content-relative coordinates with
     /// its origin before crossing the tab-backend seam.
     content_bounds: Bounds<Pixels>,
+    /// Excluded from session persistence (CONTEXT.md "incognito window"). The
+    /// incognito UI arrives with its own ticket; only the persistence
+    /// exclusion is modeled here.
+    is_incognito: bool,
+    /// Debounced session write; replacing it pushes the deadline out.
+    pending_session_save: Option<Task<()>>,
+    _quit_flush: Subscription,
 }
 
 /// M1 subset of Glass's three-way key dispatch
@@ -107,14 +153,54 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(backend_factory, Some(initial_url), false, window, cx)
+    }
+
+    /// A browser view excluded from session persistence: it never claims
+    /// session ownership, never restores, and never saves (CONTEXT.md
+    /// "incognito window"). The incognito UI arrives with its own ticket.
+    pub fn new_incognito(
+        backend_factory: TabBackendFactory,
+        initial_url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(backend_factory, Some(initial_url), true, window, cx)
+    }
+
+    /// A browser view that restores the persisted session if it becomes the
+    /// session owner and one is saved; otherwise it starts with a fresh
+    /// default tab. Used when the view opens organically (`OpenBrowser`) and
+    /// when the workspace restores the item.
+    fn restore_or_new(
+        backend_factory: TabBackendFactory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(backend_factory, None, false, window, cx)
+    }
+
+    fn build(
+        backend_factory: TabBackendFactory,
+        initial_url: Option<String>,
+        is_incognito: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let weak = cx.weak_entity();
         crate::observe_pumps(cx, move |cx| {
             weak.update(cx, |view, cx| view.drain_engine_events(cx))
                 .is_ok()
         });
 
+        let entity_id = cx.entity_id();
+        Self::claim_session_ownership(is_incognito, cx);
+
         let window_handle = window.window_handle();
         cx.on_release(move |this, cx| {
+            // Backstop for teardown paths that skip `on_removed`, e.g. the
+            // whole window closing with the item still in its pane.
+            Self::release_session_ownership(entity_id, cx);
             // The window may already be gone during app teardown; the sprite
             // atlas dies with it, so a failed update needs no handling.
             window_handle
@@ -147,25 +233,85 @@ impl BrowserView {
             next_tab_id: 0,
             omnibox,
             content_bounds: Bounds::default(),
+            is_incognito,
+            pending_session_save: None,
+            _quit_flush: cx.on_app_quit(Self::flush_session_on_quit),
         };
-        let tab = this.create_tab(initial_url);
-        this.tabs.push(tab);
+
+        let saved = if initial_url.is_none() && Self::is_session_owner(cx) {
+            session::restore(cx).filter(|saved| !saved.tabs.is_empty())
+        } else {
+            None
+        };
+        match saved {
+            Some(saved) => this.restore_session(saved),
+            None => {
+                let url = initial_url.unwrap_or_else(|| DEFAULT_URL.to_string());
+                let tab = this.create_tab(url);
+                this.tabs.push(tab);
+            }
+        }
         this
+    }
+
+    /// Rebuild browser tabs from the saved session. Restoration is lazy: only
+    /// the active tab creates its engine browser (on the first draw); the
+    /// others wait until activated.
+    fn restore_session(&mut self, saved: session::SerializedBrowserTabs) {
+        if saved.tabs.is_empty() {
+            return;
+        }
+        for serialized in saved.tabs {
+            let id = self.allocate_tab_id();
+            let tab = BrowserTab::restore(
+                id,
+                self.backend_factory.create_backend(),
+                ClosedTab {
+                    url: serialized.url,
+                    title: serialized.title,
+                    favicon_url: serialized.favicon_url.map(SharedUri::from),
+                    is_pinned: serialized.is_pinned,
+                },
+            );
+            self.tabs.push(tab);
+        }
+        self.active_tab_index = saved.active_index.min(self.tabs.len() - 1);
+        // The saved order is strip order, but re-sort so an older or
+        // hand-edited blob cannot violate the pinned-first invariant.
+        let active_id = self.tabs[self.active_tab_index].id;
+        self.tabs.sort_by_key(|tab| !tab.is_pinned());
+        if let Some(index) = self.tabs.iter().position(|tab| tab.id == active_id) {
+            self.active_tab_index = index;
+        }
     }
 
     #[cfg(feature = "cef")]
     pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-        Self::open_with_factory(workspace, window, cx, || {
-            Box::new(crate::tab::CefTab::new())
-        });
+        let backend_factory = cx.global::<TabBackendFactory>().clone();
+        Self::open_internal(workspace, backend_factory, window, cx);
     }
 
-    #[cfg(any(feature = "cef", test))]
+    #[cfg(test)]
     fn open_with_factory(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
         backend_factory: impl Fn() -> Box<dyn TabBackend> + 'static,
+    ) {
+        Self::open_internal(
+            workspace,
+            TabBackendFactory::new(backend_factory),
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(any(feature = "cef", test))]
+    fn open_internal(
+        workspace: &mut Workspace,
+        backend_factory: TabBackendFactory,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
     ) {
         // One browser view per workspace (ADR-0004); reopening focuses it.
         let existing = workspace.items_of_type::<BrowserView>(cx).next();
@@ -173,14 +319,7 @@ impl BrowserView {
             workspace.activate_item(&existing, true, true, window, cx);
             return;
         }
-        let view = cx.new(|cx| {
-            BrowserView::new(
-                Box::new(backend_factory),
-                DEFAULT_URL.to_string(),
-                window,
-                cx,
-            )
-        });
+        let view = cx.new(|cx| BrowserView::restore_or_new(backend_factory, window, cx));
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
@@ -190,7 +329,90 @@ impl BrowserView {
 
     fn create_tab(&mut self, url: String) -> BrowserTab {
         let id = self.allocate_tab_id();
-        BrowserTab::new(id, (self.backend_factory)(), url)
+        BrowserTab::new(id, self.backend_factory.create_backend(), url)
+    }
+
+    /// Whether this view holds the session-owner slot: the single designated
+    /// writer of the persisted session.
+    fn is_session_owner(cx: &Context<Self>) -> bool {
+        cx.try_global::<SessionOwner>()
+            .is_some_and(|owner| owner.0 == Some(cx.entity_id()))
+    }
+
+    /// Claim the session-owner slot if it is free. Incognito views never
+    /// participate.
+    fn claim_session_ownership(is_incognito: bool, cx: &mut Context<Self>) {
+        if is_incognito {
+            return;
+        }
+        let entity_id = cx.entity_id();
+        let owner = cx.default_global::<SessionOwner>();
+        if owner.0.is_none() {
+            owner.0 = Some(entity_id);
+        }
+    }
+
+    fn release_session_ownership(entity_id: EntityId, cx: &mut App) {
+        let owner = cx.default_global::<SessionOwner>();
+        if owner.0 == Some(entity_id) {
+            owner.0 = None;
+        }
+    }
+
+    /// The session as saved: all tabs in strip order plus the active index.
+    /// `None` when this view must not write the session (incognito, or not
+    /// the session owner).
+    fn serialize_session(&self, cx: &Context<Self>) -> Option<String> {
+        if self.is_incognito || !Self::is_session_owner(cx) {
+            return None;
+        }
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| session::SerializedTab {
+                url: tab.url().to_string(),
+                title: tab.title().to_string(),
+                is_pinned: tab.is_pinned(),
+                favicon_url: tab.favicon_url().map(|url| url.to_string()),
+            })
+            .collect();
+        serde_json::to_string(&session::SerializedBrowserTabs {
+            tabs,
+            active_index: self.active_tab_index,
+        })
+        .log_err()
+    }
+
+    /// Debounced session write: tab mutations within the window batch into
+    /// one KV write. Quit flushes immediately instead
+    /// ([`flush_session_on_quit`](Self::flush_session_on_quit)).
+    fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
+        if self.is_incognito || !Self::is_session_owner(cx) {
+            return;
+        }
+        self.pending_session_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SESSION_SAVE_DEBOUNCE).await;
+            let Ok((session, store)) = this.update(cx, |this, cx| {
+                this.pending_session_save = None;
+                (this.serialize_session(cx), KeyValueStore::global(cx))
+            }) else {
+                return;
+            };
+            if let Some(session) = session {
+                session::save(store, session).await.log_err();
+            }
+        }));
+    }
+
+    fn flush_session_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.pending_session_save = None;
+        let Some(session) = self.serialize_session(cx) else {
+            return Task::ready(());
+        };
+        let store = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            session::save(store, session).await.log_err();
+        })
     }
 
     // `tabs` is never empty and `active_tab_index` is kept in bounds by every
@@ -235,17 +457,25 @@ impl BrowserView {
         let mut needs_notify = self.active_tab().wants_start();
 
         let mut active_identity_changed = false;
+        let mut session_changed = false;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let changes = tab.drain_events();
             if changes.identity_changed || changes.needs_notify {
                 // Any tab's title or favicon shows in the tab strip.
                 needs_notify = true;
             }
-            if changes.identity_changed && index == self.active_tab_index {
-                active_identity_changed = true;
+            if changes.identity_changed {
+                // URL, title, and favicon are part of the saved session.
+                session_changed = true;
+                if index == self.active_tab_index {
+                    active_identity_changed = true;
+                }
             }
         }
 
+        if session_changed {
+            self.schedule_session_save(cx);
+        }
         if active_identity_changed {
             cx.emit(ItemEvent::UpdateTab);
         }
@@ -272,6 +502,7 @@ impl BrowserView {
         self.active_tab_mut().navigate(url);
         window.focus(&self.focus_handle, cx);
         self.active_tab_mut().set_focus(true);
+        self.schedule_session_save(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -321,6 +552,7 @@ impl BrowserView {
         tab.set_focus(true);
         window.focus(&self.focus_handle, cx);
 
+        self.schedule_session_save(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -361,6 +593,7 @@ impl BrowserView {
             tab.set_focus(true);
         }
 
+        self.schedule_session_save(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -380,7 +613,7 @@ impl BrowserView {
             return;
         };
         let id = self.allocate_tab_id();
-        let tab = BrowserTab::restore(id, (self.backend_factory)(), closed);
+        let tab = BrowserTab::restore(id, self.backend_factory.create_backend(), closed);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.resort_tabs_pinned_first(cx);
@@ -429,6 +662,7 @@ impl BrowserView {
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == active_id) {
             self.active_tab_index = index;
         }
+        self.schedule_session_save(cx);
         cx.notify();
     }
 
@@ -718,9 +952,14 @@ impl BrowserView {
             )
             .child(self.omnibox.clone())
             .when(!title.is_empty(), |this| {
-                this.child(div().flex_none().max_w_64().child(
-                    Label::new(title).size(LabelSize::Small).color(Color::Muted).truncate(),
-                ))
+                this.child(
+                    div().flex_none().max_w_64().child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+                )
             })
     }
 }
@@ -742,13 +981,17 @@ impl Render for BrowserView {
             omnibox.set_current_url(&url, window, cx);
         });
 
-        let this = cx.entity();
+        // Weak: the window retains the last frame's element tree, so a strong
+        // handle here would keep a closed view (and its session ownership)
+        // alive until an unrelated redraw.
+        let this = cx.weak_entity();
         let bounds_tracker = canvas(
             move |bounds, window, cx| {
                 let scale_factor = window.scale_factor();
                 this.update(cx, |view, _| {
                     view.handle_content_bounds(bounds, scale_factor)
-                });
+                })
+                .ok();
                 bounds
             },
             |_, _, _, _| {},
@@ -802,12 +1045,14 @@ impl Render for BrowserView {
             .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
                 this.activate_previous_tab(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &PinTab, _, cx| {
-                this.pin_tab_at(this.active_tab_index, cx)
-            }))
-            .on_action(cx.listener(|this, _: &UnpinTab, _, cx| {
-                this.unpin_tab_at(this.active_tab_index, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &PinTab, _, cx| this.pin_tab_at(this.active_tab_index, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &UnpinTab, _, cx| {
+                    this.unpin_tab_at(this.active_tab_index, cx)
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .child(self.render_tab_strip(cx))
@@ -869,14 +1114,95 @@ impl Item for BrowserView {
             Some(TabTooltipContent::Text(url.to_string().into()))
         }
     }
+
+    fn added_to_workspace(
+        &mut self,
+        _workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Re-claim after the release in `on_removed` when the removal was a
+        // move to another pane; a no-op when this view already owns the slot.
+        Self::claim_session_ownership(self.is_incognito, cx);
+    }
+
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        // Deterministic release when the item leaves its pane: waiting for
+        // entity release would leave the slot taken for a few more frames
+        // (the window retains recent element trees), blocking a browser view
+        // opened right after this one closes.
+        Self::release_session_ownership(cx.entity_id(), cx);
+    }
+}
+
+impl SerializableItem for BrowserView {
+    fn serialized_item_kind() -> &'static str {
+        "Browser"
+    }
+
+    fn cleanup(
+        _workspace_id: WorkspaceId,
+        _alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        // The session is one global KV blob, not per-item rows; there is
+        // nothing to prune when items disappear from a workspace.
+        Task::ready(Ok(()))
+    }
+
+    fn serialize(
+        &mut self,
+        _workspace: &mut Workspace,
+        _item_id: ItemId,
+        closing: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        if closing {
+            let session = self.serialize_session(cx)?;
+            // This write captures the current state, so a pending debounced
+            // write would only repeat it.
+            self.pending_session_save = None;
+            let store = KeyValueStore::global(cx);
+            Some(cx.background_spawn(async move { session::save(store, session).await }))
+        } else {
+            // Steady-state saves stay on this view's own debounce; writing
+            // here would put the workspace's 200ms serialization throttle in
+            // charge of the cadence instead.
+            self.schedule_session_save(cx);
+            None
+        }
+    }
+
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::UpdateTab)
+    }
+
+    fn deserialize(
+        _project: Entity<Project>,
+        _workspace: WeakEntity<Workspace>,
+        _workspace_id: WorkspaceId,
+        _item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        // Installed by `init`; absent when the engine failed to initialize,
+        // in which case the item cannot come back with the workspace.
+        let Some(backend_factory) = cx.try_global::<TabBackendFactory>().cloned() else {
+            return Task::ready(Err(anyhow!(
+                "no browser engine available to restore the browser view"
+            )));
+        };
+        let view = cx.new(|cx| BrowserView::restore_or_new(backend_factory, window, cx));
+        Task::ready(Ok(view))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stub_tab_backend::{
-        RecordedCommand, StubBackendFactory, StubTabController,
-    };
+    use crate::stub_tab_backend::{RecordedCommand, StubBackendFactory, StubTabController};
     use crate::tab_backend::{SoftwareFrame, TabBackendEvent};
     use gpui::{
         Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext, point, size,
@@ -887,6 +1213,10 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            // Every test gets its own in-memory database: the session lives
+            // under one global KV key, so tests sharing the process-wide
+            // fallback database would see each other's saves.
+            cx.set_global(db::AppDatabase::test_new());
             let app_state = AppState::test(cx);
             editor::init(cx);
             app_state
@@ -895,7 +1225,7 @@ mod tests {
 
     fn backend_factory(factory: &StubBackendFactory) -> TabBackendFactory {
         let factory = factory.clone();
-        Box::new(move || factory.create_backend())
+        TabBackendFactory::new(move || factory.create_backend())
     }
 
     /// A browser view with a stub-backed tab, opened in a bare test window.
@@ -934,7 +1264,10 @@ mod tests {
     }
 
     /// The tab ids in strip order plus the active tab's id.
-    fn tab_order_and_active(view: &Entity<BrowserView>, cx: &mut VisualTestContext) -> (Vec<usize>, usize) {
+    fn tab_order_and_active(
+        view: &Entity<BrowserView>,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<usize>, usize) {
         view.update(cx, |view, _| {
             (
                 view.tabs.iter().map(|tab| tab.id).collect(),
@@ -1071,8 +1404,12 @@ mod tests {
         init_test(cx);
         let factory = StubBackendFactory::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let view =
-                BrowserView::new(backend_factory(&factory), DEFAULT_URL.to_string(), window, cx);
+            let view = BrowserView::new(
+                backend_factory(&factory),
+                DEFAULT_URL.to_string(),
+                window,
+                cx,
+            );
             factory.controller(0).fail_next_start("engine exploded");
             view
         });
@@ -1081,10 +1418,7 @@ mod tests {
 
         assert_eq!(controller.started_with(), None);
         view.update(cx, |view, _| {
-            assert_eq!(
-                view.active_tab().engine_error(),
-                Some("engine exploded")
-            );
+            assert_eq!(view.active_tab().engine_error(), Some("engine exploded"));
         });
 
         // Further pumps and renders must not retry the failed start.
@@ -1135,9 +1469,7 @@ mod tests {
         let factory = StubBackendFactory::new(true);
         workspace.update_in(cx, |workspace, window, cx| {
             let factory = factory.clone();
-            BrowserView::open_with_factory(workspace, window, cx, move || {
-                factory.create_backend()
-            });
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
         });
         cx.run_until_parked();
         let controller = factory.controller(0);
@@ -1435,9 +1767,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_tab_opens_activates_and_starts_a_fresh_engine_tab(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_new_tab_opens_activates_and_starts_a_fresh_engine_tab(cx: &mut TestAppContext) {
         init_test(cx);
         let (view, cx, factory) = stub_view(true, "https://example.com", cx);
         view.update_in(cx, |view, window, cx| {
@@ -1465,13 +1795,11 @@ mod tests {
         // The old tab was blurred and hidden when the new one took over.
         let old_commands = factory.controller(0).commands();
         assert!(
-            old_commands
-                .windows(2)
-                .any(|pair| pair
-                    == [
-                        RecordedCommand::SetFocus { focused: false },
-                        RecordedCommand::SetHidden { hidden: true },
-                    ]),
+            old_commands.windows(2).any(|pair| pair
+                == [
+                    RecordedCommand::SetFocus { focused: false },
+                    RecordedCommand::SetHidden { hidden: true },
+                ]),
             "switching away blurs and hides the previous tab, got {old_commands:?}"
         );
     }
@@ -1794,9 +2122,7 @@ mod tests {
         let factory = StubBackendFactory::new(true);
         workspace.update_in(cx, |workspace, window, cx| {
             let factory = factory.clone();
-            BrowserView::open_with_factory(workspace, window, cx, move || {
-                factory.create_backend()
-            });
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
         });
         cx.run_until_parked();
 
@@ -1919,5 +2245,438 @@ mod tests {
                 "the newest closed tab is on top of the stack"
             );
         });
+    }
+
+    /// Write a session blob to the KV store, as a previous run would have.
+    async fn write_saved_session(session: session::SerializedBrowserTabs, cx: &mut TestAppContext) {
+        let json = serde_json::to_string(&session).unwrap();
+        cx.update(|cx| {
+            let store = KeyValueStore::global(cx);
+            cx.background_spawn(async move { session::save(store, json).await })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_session_round_trips_through_the_kv_store(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let factory = StubBackendFactory::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let factory = factory.clone();
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
+        });
+        cx.run_until_parked();
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+
+        // With nothing saved, opening falls back to a fresh default tab and
+        // this view becomes the session owner.
+        view.update(cx, |view, cx| {
+            assert!(BrowserView::is_session_owner(cx));
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.url(), DEFAULT_URL);
+        });
+
+        // Build a session: the default tab gets a title and favicon and is
+        // pinned; a second tab is opened, navigated, and titled.
+        factory.controller(0).script_events([
+            TabBackendEvent::TitleChanged("Zed".into()),
+            TabBackendEvent::FaviconUrlsChanged(vec!["https://zed.dev/favicon.ico".into()]),
+        ]);
+        pump(cx);
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(PinTab);
+        cx.dispatch_action(NewTab);
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://example.com".to_string(), window, cx);
+        });
+        factory
+            .controller(1)
+            .script_events([TabBackendEvent::TitleChanged("Example".into())]);
+        pump(cx);
+
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.active_index, 1);
+
+        // Close the pane item; the released view frees the owner slot.
+        let pane = workspace.update(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&Default::default(), window, cx)
+        })
+        .await
+        .unwrap();
+        drop(view);
+        cx.run_until_parked();
+
+        // Reopening restores the whole session: tabs, titles, favicons,
+        // pinned state, and the active index.
+        let factory_after_restart = StubBackendFactory::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let factory = factory_after_restart.clone();
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
+        });
+        cx.run_until_parked();
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+
+        view.update(cx, |view, cx| {
+            assert!(BrowserView::is_session_owner(cx));
+            assert_eq!(view.tabs.len(), 2);
+            assert!(view.tabs[0].is_pinned());
+            assert_eq!(view.tabs[0].url(), DEFAULT_URL);
+            assert_eq!(view.tabs[0].title(), "Zed");
+            assert_eq!(
+                view.tabs[0].favicon_url().map(|url| url.to_string()),
+                Some("https://zed.dev/favicon.ico".to_string())
+            );
+            assert!(!view.tabs[1].is_pinned());
+            assert_eq!(view.active_tab_index, 1);
+            assert_eq!(view.url(), "https://example.com");
+            assert_eq!(view.title(), "Example");
+        });
+
+        // Restoration is lazy: only the active tab started its engine.
+        assert_eq!(
+            factory_after_restart
+                .controller(1)
+                .started_with()
+                .as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            factory_after_restart.controller(0).started_with(),
+            None,
+            "inactive restored tabs wait for activation to start their engines"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_session_saves_are_debounced(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, _factory) = stub_view(true, "https://one.example", cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://two.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| session::restore(cx)).is_none(),
+            "no write lands before the debounce elapses"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(300));
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://three.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| session::restore(cx)).is_none(),
+            "a new mutation restarts the debounce window"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert_eq!(saved.tabs.len(), 1);
+        assert_eq!(
+            saved.tabs[0].url, "https://three.example",
+            "one write captures the batched mutations"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_quit_flushes_the_pending_session_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        {
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                BrowserView::new(
+                    backend_factory(&factory),
+                    "https://one.example".to_string(),
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            view.update_in(cx, |view, window, cx| {
+                view.navigate_to("https://two.example".to_string(), window, cx);
+            });
+            cx.run_until_parked();
+            assert!(
+                cx.update(|_, cx| session::restore(cx)).is_none(),
+                "the debounced write is still pending at quit"
+            );
+        }
+
+        cx.update(|cx| cx.shutdown());
+
+        let saved = cx.update(|cx| session::restore(cx)).unwrap();
+        assert_eq!(
+            saved.tabs[0].url, "https://two.example",
+            "quit flushes the session without waiting for the debounce"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_deserialize_restores_the_view_through_the_item_mechanism(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        write_saved_session(
+            session::SerializedBrowserTabs {
+                tabs: vec![
+                    session::SerializedTab {
+                        url: "https://pinned.example".to_string(),
+                        title: "Pinned".to_string(),
+                        is_pinned: true,
+                        favicon_url: None,
+                    },
+                    session::SerializedTab {
+                        url: "https://active.example".to_string(),
+                        title: "Active".to_string(),
+                        is_pinned: false,
+                        favicon_url: Some("https://active.example/icon.png".to_string()),
+                    },
+                ],
+                active_index: 1,
+            },
+            cx,
+        )
+        .await;
+
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Without an installed engine backend factory (init never ran), the
+        // item cannot be restored.
+        let restored = workspace.update_in(cx, |workspace, window, cx| {
+            BrowserView::deserialize(
+                workspace.project().clone(),
+                workspace.weak_handle(),
+                WorkspaceId::from_i64(1),
+                1,
+                window,
+                cx,
+            )
+        });
+        assert!(restored.await.is_err());
+
+        let factory = StubBackendFactory::new(true);
+        cx.update(|_, cx| {
+            let factory = factory.clone();
+            cx.set_global(TabBackendFactory::new(move || factory.create_backend()));
+            workspace::register_serializable_item::<BrowserView>(cx);
+        });
+
+        let view = workspace
+            .update_in(cx, |workspace, window, cx| {
+                BrowserView::deserialize(
+                    workspace.project().clone(),
+                    workspace.weak_handle(),
+                    WorkspaceId::from_i64(1),
+                    1,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert!(view.tabs[0].is_pinned());
+            assert_eq!(view.tabs[0].url(), "https://pinned.example");
+            assert_eq!(view.active_tab_index, 1);
+            assert_eq!(view.url(), "https://active.example");
+            assert_eq!(view.title(), "Active");
+            assert_eq!(
+                view.active_tab().favicon_url().map(|url| url.to_string()),
+                Some("https://active.example/icon.png".to_string())
+            );
+        });
+        assert_eq!(
+            factory.controller(1).started_with().as_deref(),
+            Some("https://active.example"),
+            "the active restored tab starts on the first draw"
+        );
+
+        // The registered mechanism recognizes the view as a serializable
+        // item under the kind deserialize is dispatched on.
+        let kind = cx.update(|_, cx| {
+            use workspace::item::ItemHandle as _;
+            view.to_serializable_item_handle(cx)
+                .map(|handle| handle.serialized_item_kind())
+        });
+        assert_eq!(kind, Some("Browser"));
+    }
+
+    #[gpui::test]
+    async fn test_only_the_session_owner_writes_the_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        let (first, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(
+                backend_factory(&factory),
+                "https://one.example".to_string(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let second_factory = StubBackendFactory::new(true);
+        let second = cx.update(|window, cx| {
+            cx.new(|cx| {
+                BrowserView::new(
+                    backend_factory(&second_factory),
+                    "https://two.example".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        first.update(cx, |_, cx| assert!(BrowserView::is_session_owner(cx)));
+        second.update(cx, |_, cx| {
+            assert!(
+                !BrowserView::is_session_owner(cx),
+                "the owner slot is taken by the first view"
+            )
+        });
+
+        second.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://second.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| session::restore(cx)).is_none(),
+            "a non-owner view never writes the session"
+        );
+
+        first.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://first.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert_eq!(saved.tabs[0].url, "https://first.example");
+    }
+
+    #[gpui::test]
+    async fn test_moving_the_view_between_panes_keeps_session_ownership(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let factory = StubBackendFactory::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let factory = factory.clone();
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
+        });
+        cx.run_until_parked();
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let source = workspace.active_pane().clone();
+            let destination =
+                workspace.split_pane(source.clone(), workspace::SplitDirection::Right, window, cx);
+            workspace::move_item(&source, &destination, view.entity_id(), 0, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Removal from the source pane released the owner slot, but adding to
+        // the destination pane re-claimed it within the same move.
+        view.update(cx, |_, cx| assert!(BrowserView::is_session_owner(cx)));
+
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://moved.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert_eq!(
+            saved.tabs[0].url, "https://moved.example",
+            "the moved view still writes the session"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_incognito_views_are_excluded_from_persistence(cx: &mut TestAppContext) {
+        init_test(cx);
+        write_saved_session(
+            session::SerializedBrowserTabs {
+                tabs: vec![session::SerializedTab {
+                    url: "https://saved.example".to_string(),
+                    title: String::new(),
+                    is_pinned: false,
+                    favicon_url: None,
+                }],
+                active_index: 0,
+            },
+            cx,
+        )
+        .await;
+
+        let factory = StubBackendFactory::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new_incognito(
+                backend_factory(&factory),
+                "https://incognito.example".to_string(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            assert!(view.is_incognito);
+            assert!(
+                !BrowserView::is_session_owner(cx),
+                "incognito views never claim the owner slot"
+            );
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.url(), "https://incognito.example");
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://secret.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert_eq!(
+            saved.tabs[0].url, "https://saved.example",
+            "incognito browsing never touches the saved session"
+        );
     }
 }

@@ -15,6 +15,7 @@ mod browser_tab;
 mod browser_view;
 mod frame_presenter;
 mod omnibox;
+mod session;
 #[cfg(any(test, feature = "test-support"))]
 mod stub_tab_backend;
 mod tab_backend;
@@ -44,7 +45,7 @@ mod tab;
 ))]
 compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows");
 
-pub use browser_view::{BrowserView, OpenBrowser};
+pub use browser_view::{BrowserView, OpenBrowser, TabBackendFactory};
 #[cfg(feature = "cef")]
 pub use cef_instance::CefInstance;
 pub use frame_presenter::{FramePresenter, SoftwarePresenter};

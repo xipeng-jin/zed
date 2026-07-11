@@ -403,7 +403,10 @@ mod tests {
             ],
         );
         assert_eq!(controller.commands(), vec![], "take_commands drains");
-        assert_eq!(controller.started_with().as_deref(), Some("https://example.com"));
+        assert_eq!(
+            controller.started_with().as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]
@@ -433,7 +436,11 @@ mod tests {
         let output = backend.take_paint_output();
         assert!(matches!(
             output,
-            Some(PaintOutput::Software(SoftwareFrame { width: 2, height: 2, .. }))
+            Some(PaintOutput::Software(SoftwareFrame {
+                width: 2,
+                height: 2,
+                ..
+            }))
         ));
         assert!(!controller.has_staged_frame());
         assert!(

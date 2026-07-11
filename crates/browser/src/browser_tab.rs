@@ -163,7 +163,10 @@ impl BrowserTab {
             match self.backend.start(&self.url) {
                 Ok(()) => self.backend.set_focus(true),
                 Err(error) => {
-                    log::error!("[browser] failed to start engine for {}: {error:#}", self.url);
+                    log::error!(
+                        "[browser] failed to start engine for {}: {error:#}",
+                        self.url
+                    );
                     self.engine_error = Some(format!("{error:#}"));
                 }
             }

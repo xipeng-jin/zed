@@ -12,9 +12,7 @@ use crate::cef_instance::CefInstance;
 use crate::client::{ClientBuilder, MANUAL_KEY_EVENT};
 use crate::input;
 use crate::render_handler::RenderState;
-use crate::tab_backend::{
-    EventReceiver, PaintOutput, TabBackend, TabBackendEvent, event_channel,
-};
+use crate::tab_backend::{EventReceiver, PaintOutput, TabBackend, TabBackendEvent, event_channel};
 use anyhow::{Context as _, Result};
 use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};

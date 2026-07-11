@@ -2454,6 +2454,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cef",
+ "db",
  "editor",
  "gpui",
  "image",
@@ -2462,6 +2463,8 @@ dependencies = [
  "parking_lot",
  "paths",
  "project",
+ "serde",
+ "serde_json",
  "smallvec",
  "ui",
  "url",
