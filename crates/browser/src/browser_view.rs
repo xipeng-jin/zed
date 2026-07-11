@@ -1,10 +1,11 @@
 //! The browser view: the single per-workspace pane item that owns browser
-//! tabs and their chrome (ADR-0004). M2 scope (ticket #9): full browser-tab
-//! management inside the view — an internal tab strip, open/close/switch,
-//! pin/unpin with pinned-first ordering, reopen-closed-tab, next/previous
-//! tab, per-tab favicons and titles. Switching browser tabs swaps the
-//! presented engine surface: each tab owns its backend and presenter
-//! (`browser_tab.rs`).
+//! tabs and their chrome (ADR-0004). M2 scope: full browser-tab management
+//! inside the view — an internal tab strip, open/close/switch, pin/unpin with
+//! pinned-first ordering, reopen-closed-tab, next/previous tab, per-tab
+//! favicons and titles (ticket #9); visit recording into browsing history and
+//! the app-rendered new-tab page for fresh tabs (ticket #11). Switching
+//! browser tabs swaps the presented engine surface: each tab owns its backend
+//! and presenter (`browser_tab.rs`).
 //!
 //! Everything here sits above the two seams: engine communication flows
 //! through the tab-backend trait and frame presentation through the frame
@@ -12,6 +13,7 @@
 //! stub backend.
 
 use crate::browser_tab::{BrowserTab, ClosedTab};
+use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
 use crate::tab_backend::TabBackend;
@@ -60,8 +62,6 @@ actions!(
         UnpinTab,
     ]
 );
-
-pub const DEFAULT_URL: &str = "https://zed.dev";
 
 /// How many closed browser tabs the reopen stack remembers
 /// (`Glass:crates/browser/src/browser_view.rs:41`).
@@ -124,6 +124,9 @@ pub struct BrowserView {
     closed_tabs: Vec<ClosedTab>,
     next_tab_id: usize,
     omnibox: Entity<Omnibox>,
+    /// The app-wide shared browsing history; this view records visits into it
+    /// (unless incognito) and the omnibox suggests from it.
+    history: Entity<BrowserHistory>,
     /// Window-relative bounds of the page content area, captured at draw time;
     /// pointer events are translated into content-relative coordinates with
     /// its origin before crossing the tab-backend seam.
@@ -170,7 +173,7 @@ impl BrowserView {
 
     /// A browser view that restores the persisted session if it becomes the
     /// session owner and one is saved; otherwise it starts with a fresh
-    /// default tab. Used when the view opens organically (`OpenBrowser`) and
+    /// new-tab page. Used when the view opens organically (`OpenBrowser`) and
     /// when the workspace restores the item.
     fn restore_or_new(
         backend_factory: TabBackendFactory,
@@ -217,7 +220,8 @@ impl BrowserView {
         })
         .detach();
 
-        let omnibox = cx.new(|cx| Omnibox::new(window, cx));
+        let history = BrowserHistory::global(cx);
+        let omnibox = cx.new(|cx| Omnibox::new(history.clone(), window, cx));
         cx.subscribe_in(&omnibox, window, |this, _, event, window, cx| {
             let OmniboxEvent::Navigate(url) = event;
             this.navigate_to(url.clone(), window, cx);
@@ -232,6 +236,7 @@ impl BrowserView {
             closed_tabs: Vec::new(),
             next_tab_id: 0,
             omnibox,
+            history,
             content_bounds: Bounds::default(),
             is_incognito,
             pending_session_save: None,
@@ -246,8 +251,10 @@ impl BrowserView {
         match saved {
             Some(saved) => this.restore_session(saved),
             None => {
-                let url = initial_url.unwrap_or_else(|| DEFAULT_URL.to_string());
-                let tab = this.create_tab(url);
+                let tab = match initial_url {
+                    Some(url) => this.create_tab(url),
+                    None => this.create_new_tab_page(),
+                };
                 this.tabs.push(tab);
             }
         }
@@ -263,16 +270,20 @@ impl BrowserView {
         }
         for serialized in saved.tabs {
             let id = self.allocate_tab_id();
-            let tab = BrowserTab::restore(
-                id,
-                self.backend_factory.create_backend(),
-                ClosedTab {
-                    url: serialized.url,
-                    title: serialized.title,
-                    favicon_url: serialized.favicon_url.map(SharedUri::from),
-                    is_pinned: serialized.is_pinned,
-                },
-            );
+            let tab = if serialized.is_new_tab_page {
+                BrowserTab::new_tab_page(id, self.backend_factory.create_backend())
+            } else {
+                BrowserTab::restore(
+                    id,
+                    self.backend_factory.create_backend(),
+                    ClosedTab {
+                        url: serialized.url,
+                        title: serialized.title,
+                        favicon_url: serialized.favicon_url.map(SharedUri::from),
+                        is_pinned: serialized.is_pinned,
+                    },
+                )
+            };
             self.tabs.push(tab);
         }
         self.active_tab_index = saved.active_index.min(self.tabs.len() - 1);
@@ -332,6 +343,11 @@ impl BrowserView {
         BrowserTab::new(id, self.backend_factory.create_backend(), url)
     }
 
+    fn create_new_tab_page(&mut self) -> BrowserTab {
+        let id = self.allocate_tab_id();
+        BrowserTab::new_tab_page(id, self.backend_factory.create_backend())
+    }
+
     /// Whether this view holds the session-owner slot: the single designated
     /// writer of the persisted session.
     fn is_session_owner(cx: &Context<Self>) -> bool {
@@ -372,6 +388,7 @@ impl BrowserView {
             .map(|tab| session::SerializedTab {
                 url: tab.url().to_string(),
                 title: tab.title().to_string(),
+                is_new_tab_page: tab.is_new_tab_page(),
                 is_pinned: tab.is_pinned(),
                 favicon_url: tab.favicon_url().map(|url| url.to_string()),
             })
@@ -425,6 +442,17 @@ impl BrowserView {
         &mut self.tabs[self.active_tab_index]
     }
 
+    /// The active tab, if it has an engine page to receive input — a new-tab
+    /// page has none, so user input aimed at the content area goes nowhere.
+    fn active_engine_tab_mut(&mut self) -> Option<&mut BrowserTab> {
+        let tab = &mut self.tabs[self.active_tab_index];
+        if tab.is_new_tab_page() {
+            None
+        } else {
+            Some(tab)
+        }
+    }
+
     pub fn url(&self) -> &str {
         self.active_tab().url()
     }
@@ -458,6 +486,7 @@ impl BrowserView {
 
         let mut active_identity_changed = false;
         let mut session_changed = false;
+        let mut visits = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let changes = tab.drain_events();
             if changes.identity_changed || changes.needs_notify {
@@ -471,8 +500,20 @@ impl BrowserView {
                     active_identity_changed = true;
                 }
             }
+            if changes.visited {
+                // One visit per drain, however many address/title events the
+                // batch held: the entry ends up with the batch's final state.
+                visits.push((tab.url().to_string(), tab.title().to_string()));
+            }
         }
 
+        if !self.is_incognito {
+            for (url, title) in visits {
+                self.history.update(cx, |history, cx| {
+                    history.record_visit(&url, &title, cx);
+                });
+            }
+        }
         if session_changed {
             self.schedule_session_save(cx);
         }
@@ -533,6 +574,14 @@ impl BrowserView {
         });
     }
 
+    /// Put the caret in an emptied omnibox, for a freshly created new-tab
+    /// page.
+    fn focus_omnibox_blank(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.omnibox.update(cx, |omnibox, cx| {
+            omnibox.start_blank_entry(window, cx);
+        });
+    }
+
     /// Switch the presented engine surface to the tab at `index`: the old tab
     /// is blurred and hidden (its engine stops painting; its last frame stays
     /// with its presenter), the new tab is shown and focused. Its engine
@@ -558,12 +607,12 @@ impl BrowserView {
     }
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = self.create_tab(DEFAULT_URL.to_string());
+        let tab = self.create_new_tab_page();
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
-        // A fresh tab has no meaningful page yet; the user's next step is
-        // typing a destination. The new-tab page arrives with ticket #10.
-        self.focus_omnibox(window, cx);
+        // A fresh tab shows the new-tab page; the user's next step is typing
+        // a destination.
+        self.focus_omnibox_blank(window, cx);
     }
 
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -578,12 +627,12 @@ impl BrowserView {
 
         if self.tabs.is_empty() {
             // The view always shows at least one tab; closing the last one
-            // resets to a fresh tab, like Glass
+            // resets to a fresh new-tab page, like Glass
             // (`Glass:crates/browser/src/browser_view/tabs.rs:455`).
-            let tab = self.create_tab(DEFAULT_URL.to_string());
+            let tab = self.create_new_tab_page();
             self.tabs.push(tab);
             self.active_tab_index = 0;
-            self.focus_omnibox(window, cx);
+            self.focus_omnibox_blank(window, cx);
         } else if index < self.active_tab_index {
             self.active_tab_index -= 1;
         } else if was_active {
@@ -677,7 +726,9 @@ impl BrowserView {
         // carets and selection).
         window.focus(&self.focus_handle, cx);
         let position = event.position - self.content_bounds.origin;
-        let tab = self.active_tab_mut();
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
         tab.set_focus(true);
         tab.send_mouse_down(position, event.button, event.click_count, event.modifiers);
     }
@@ -689,8 +740,10 @@ impl BrowserView {
         _cx: &mut Context<Self>,
     ) {
         let position = event.position - self.content_bounds.origin;
-        self.active_tab_mut()
-            .send_mouse_up(position, event.button, event.modifiers);
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
+        tab.send_mouse_up(position, event.button, event.modifiers);
     }
 
     fn handle_mouse_move(
@@ -700,8 +753,10 @@ impl BrowserView {
         _cx: &mut Context<Self>,
     ) {
         let position = event.position - self.content_bounds.origin;
-        self.active_tab_mut()
-            .send_mouse_move(position, event.pressed_button, event.modifiers);
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
+        tab.send_mouse_move(position, event.pressed_button, event.modifiers);
     }
 
     fn handle_scroll_wheel(
@@ -711,8 +766,10 @@ impl BrowserView {
         _cx: &mut Context<Self>,
     ) {
         let position = event.position - self.content_bounds.origin;
-        self.active_tab_mut()
-            .send_scroll_wheel(position, event.delta, event.modifiers);
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
+        tab.send_scroll_wheel(position, event.delta, event.modifiers);
     }
 
     /// Key listeners run only for keystrokes no Zed binding consumed (GPUI
@@ -735,8 +792,10 @@ impl BrowserView {
         if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
             return;
         }
-        self.active_tab_mut()
-            .send_key_down(&event.keystroke, event.is_held);
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
+        tab.send_key_down(&event.keystroke, event.is_held);
         cx.stop_propagation();
     }
 
@@ -744,8 +803,36 @@ impl BrowserView {
         if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
             return;
         }
-        self.active_tab_mut().send_key_up(&event.keystroke);
+        let Some(tab) = self.active_engine_tab_mut() else {
+            return;
+        };
+        tab.send_key_up(&event.keystroke);
         cx.stop_propagation();
+    }
+
+    /// The app-rendered page a fresh tab shows before its first navigation
+    /// (ticket #11). Input lives in the omnibox, which `new_tab` focuses.
+    fn render_new_tab_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Icon::new(IconName::ToolWeb)
+                    .size(IconSize::XLarge)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("New Tab")
+                    .size(LabelSize::Large)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Search or enter an address in the omnibox")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
     }
 
     fn render_placeholder(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -966,7 +1053,10 @@ impl BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let frame = {
+        let is_new_tab_page = self.active_tab().is_new_tab_page();
+        let frame = if is_new_tab_page {
+            None
+        } else {
             let tab = self.active_tab_mut();
             tab.present_pending_frame();
             tab.render_frame(window)
@@ -1017,7 +1107,12 @@ impl Render for BrowserView {
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .child(bounds_tracker)
             .when_some(frame, |this, frame| this.child(frame))
-            .when(!has_frame, |this| this.child(self.render_placeholder(cx)));
+            .when(is_new_tab_page, |this| {
+                this.child(self.render_new_tab_page(cx))
+            })
+            .when(!has_frame && !is_new_tab_page, |this| {
+                this.child(self.render_placeholder(cx))
+            });
 
         div()
             .id("browser-view")
@@ -1202,6 +1297,7 @@ impl SerializableItem for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::omnibox::OmniboxSuggestion;
     use crate::stub_tab_backend::{RecordedCommand, StubBackendFactory, StubTabController};
     use crate::tab_backend::{SoftwareFrame, TabBackendEvent};
     use gpui::{
@@ -1210,6 +1306,8 @@ mod tests {
     use project::Project;
     use std::sync::Arc;
     use workspace::AppState;
+
+    const DEFAULT_URL: &str = "https://zed.dev";
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
@@ -1479,6 +1577,12 @@ mod tests {
                 workspace.items_of_type::<BrowserView>(cx).next()
             })
             .unwrap();
+        // Leave the fresh view's new-tab page: pointer events only forward to
+        // tabs with an engine page.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://one.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
         let content_origin = view.update(cx, |view, _| view.content_bounds.origin);
         assert!(
             content_origin.y > px(0.),
@@ -1767,7 +1871,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_tab_opens_activates_and_starts_a_fresh_engine_tab(cx: &mut TestAppContext) {
+    async fn test_new_tab_shows_the_new_tab_page_and_navigates_from_the_omnibox(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let (view, cx, factory) = stub_view(true, "https://example.com", cx);
         view.update_in(cx, |view, window, cx| {
@@ -1779,16 +1885,23 @@ mod tests {
 
         assert_eq!(factory.created_count(), 2);
         assert_eq!(
-            factory.controller(1).started_with().as_deref(),
-            Some(DEFAULT_URL),
-            "the new tab's engine browser starts on the next draw"
+            factory.controller(1).started_with(),
+            None,
+            "a new-tab page starts no engine browser"
         );
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.tabs.len(), 2);
             assert_eq!(view.active_tab_index, 1);
+            assert!(view.active_tab().is_new_tab_page());
+            assert_eq!(view.url(), "");
             assert!(
                 view.omnibox.focus_handle(cx).is_focused(window),
                 "a fresh tab puts the caret in the omnibox"
+            );
+            assert_eq!(
+                view.omnibox.read(cx).editor_text(cx),
+                "",
+                "the previous page's URL does not linger in the omnibox"
             );
         });
 
@@ -1801,6 +1914,26 @@ mod tests {
                     RecordedCommand::SetHidden { hidden: true },
                 ]),
             "switching away blurs and hides the previous tab, got {old_commands:?}"
+        );
+
+        // Committing the omnibox leaves the new-tab page and starts the
+        // engine at the resolved URL.
+        view.update_in(cx, |view, window, cx| {
+            view.omnibox.update(cx, |omnibox, cx| {
+                omnibox.set_editor_text("example.org", window, cx);
+            });
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        view.update(cx, |view, _| {
+            assert!(!view.active_tab().is_new_tab_page());
+            assert_eq!(view.url(), "https://example.org");
+        });
+        assert_eq!(
+            factory.controller(1).started_with().as_deref(),
+            Some("https://example.org"),
+            "the first navigation creates the engine browser at the resolved URL"
         );
     }
 
@@ -1851,7 +1984,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_closing_the_last_tab_replaces_it_with_a_fresh_tab(cx: &mut TestAppContext) {
+    async fn test_closing_the_last_tab_replaces_it_with_a_new_tab_page(cx: &mut TestAppContext) {
         init_test(cx);
         let (view, cx, factory) = stub_view(true, "https://example.com", cx);
         view.update_in(cx, |view, window, cx| {
@@ -1867,12 +2000,15 @@ mod tests {
         );
         view.update(cx, |view, _| {
             assert_eq!(view.tabs.len(), 1, "the view never shows zero tabs");
-            assert_eq!(view.url(), DEFAULT_URL);
+            assert!(
+                view.active_tab().is_new_tab_page(),
+                "the replacement tab is a fresh new-tab page"
+            );
         });
         assert_eq!(
-            factory.controller(1).started_with().as_deref(),
-            Some(DEFAULT_URL),
-            "the replacement tab starts its own engine browser"
+            factory.controller(1).started_with(),
+            None,
+            "the replacement new-tab page starts no engine browser"
         );
     }
 
@@ -2075,8 +2211,12 @@ mod tests {
             );
         });
 
-        // The new tab paints; switching back and forth presents each tab's
-        // own last frame.
+        // The new tab navigates (starting its engine), paints; switching back
+        // and forth presents each tab's own last frame.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://two.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
         factory.controller(1).script_frame(SoftwareFrame {
             width: 4,
             height: 4,
@@ -2165,6 +2305,10 @@ mod tests {
         cx.dispatch_action(NewTab);
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://two.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
             window.focus(&view.focus_handle, cx);
         });
         factory.controller(0).take_commands();
@@ -2195,6 +2339,12 @@ mod tests {
         });
         cx.dispatch_action(NewTab);
         cx.run_until_parked();
+        // The new tab leaves its new-tab page for a real URL while the engine
+        // is still down; the navigation is only recorded.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://two.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
 
         // Engine comes up while tab 1 is active: only the active tab starts.
         factory.controller(0).set_engine_ready(true);
@@ -2202,7 +2352,7 @@ mod tests {
         pump(cx);
         assert_eq!(
             factory.controller(1).started_with().as_deref(),
-            Some(DEFAULT_URL)
+            Some("https://two.example")
         );
         assert_eq!(
             factory.controller(0).started_with(),
@@ -2277,16 +2427,21 @@ mod tests {
             })
             .unwrap();
 
-        // With nothing saved, opening falls back to a fresh default tab and
+        // With nothing saved, opening falls back to a fresh new-tab page and
         // this view becomes the session owner.
         view.update(cx, |view, cx| {
             assert!(BrowserView::is_session_owner(cx));
             assert_eq!(view.tabs.len(), 1);
-            assert_eq!(view.url(), DEFAULT_URL);
+            assert!(view.active_tab().is_new_tab_page());
         });
 
-        // Build a session: the default tab gets a title and favicon and is
-        // pinned; a second tab is opened, navigated, and titled.
+        // Build a session: the first tab navigates to a page that gets a
+        // title and favicon and is pinned; a second tab is opened, navigated,
+        // and titled.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to(DEFAULT_URL.to_string(), window, cx);
+        });
+        cx.run_until_parked();
         factory.controller(0).script_events([
             TabBackendEvent::TitleChanged("Zed".into()),
             TabBackendEvent::FaviconUrlsChanged(vec!["https://zed.dev/favicon.ico".into()]),
@@ -2446,12 +2601,14 @@ mod tests {
                     session::SerializedTab {
                         url: "https://pinned.example".to_string(),
                         title: "Pinned".to_string(),
+                        is_new_tab_page: false,
                         is_pinned: true,
                         favicon_url: None,
                     },
                     session::SerializedTab {
                         url: "https://active.example".to_string(),
                         title: "Active".to_string(),
+                        is_new_tab_page: false,
                         is_pinned: false,
                         favicon_url: Some("https://active.example/icon.png".to_string()),
                     },
@@ -2637,6 +2794,7 @@ mod tests {
                 tabs: vec![session::SerializedTab {
                     url: "https://saved.example".to_string(),
                     title: String::new(),
+                    is_new_tab_page: false,
                     is_pinned: false,
                     favicon_url: None,
                 }],
@@ -2677,6 +2835,316 @@ mod tests {
         assert_eq!(
             saved.tabs[0].url, "https://saved.example",
             "incognito browsing never touches the saved session"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_new_tab_pages_round_trip_through_the_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        write_saved_session(
+            session::SerializedBrowserTabs {
+                tabs: vec![
+                    session::SerializedTab {
+                        url: "https://a.example".to_string(),
+                        title: "A".to_string(),
+                        is_new_tab_page: false,
+                        is_pinned: false,
+                        favicon_url: None,
+                    },
+                    session::SerializedTab {
+                        url: String::new(),
+                        title: String::new(),
+                        is_new_tab_page: true,
+                        is_pinned: false,
+                        favicon_url: None,
+                    },
+                ],
+                active_index: 1,
+            },
+            cx,
+        )
+        .await;
+
+        let factory = StubBackendFactory::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::restore_or_new(backend_factory(&factory), window, cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert!(!view.tabs[0].is_new_tab_page());
+            assert!(view.tabs[1].is_new_tab_page());
+            assert_eq!(view.active_tab_index, 1);
+        });
+        assert_eq!(
+            factory.controller(1).started_with(),
+            None,
+            "a restored new-tab page still starts no engine browser"
+        );
+
+        // The restored new-tab page saves back as one.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://b.example".to_string(), window, cx);
+        });
+        cx.executor().advance_clock(SESSION_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore(cx)).unwrap();
+        assert!(!saved.tabs[1].is_new_tab_page);
+        assert_eq!(saved.tabs[1].url, "https://b.example");
+    }
+
+    #[gpui::test]
+    async fn test_engine_page_loads_are_recorded_in_history(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://one.example", cx);
+        let controller = factory.controller(0);
+
+        controller.script_events([
+            TabBackendEvent::AddressChanged("https://one.example/docs".into()),
+            TabBackendEvent::TitleChanged("One Docs".into()),
+            TabBackendEvent::FaviconUrlsChanged(vec!["https://one.example/icon.png".into()]),
+        ]);
+        pump(cx);
+
+        view.update(cx, |view, cx| {
+            let entries = view.history.read(cx).entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].url, "https://one.example/docs");
+            assert_eq!(entries[0].title, "One Docs");
+            assert_eq!(
+                entries[0].visit_count, 1,
+                "one drained load records one visit, favicon updates none"
+            );
+        });
+
+        // Returning to the page later bumps its visit count.
+        controller.script_events([TabBackendEvent::AddressChanged(
+            "https://one.example/docs".into(),
+        )]);
+        pump(cx);
+        view.update(cx, |view, cx| {
+            assert_eq!(view.history.read(cx).entries()[0].visit_count, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_incognito_views_do_not_record_history(cx: &mut TestAppContext) {
+        init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new_incognito(
+                backend_factory(&factory),
+                "https://incognito.example".to_string(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        factory.controller(0).script_events([
+            TabBackendEvent::AddressChanged("https://secret.example".into()),
+            TabBackendEvent::TitleChanged("Secret".into()),
+        ]);
+        pump(cx);
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.history.read(cx).entries().is_empty(),
+                "incognito page loads never reach browsing history"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_persists_across_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+        let history = cx.update(BrowserHistory::global);
+        history.update(cx, |history, cx| {
+            history.record_visit("https://example.com", "Example", cx);
+        });
+        cx.executor()
+            .advance_clock(crate::history::HISTORY_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+
+        // A fresh entity — as a restarted app would create — restores the
+        // persisted entries.
+        let restored = cx.update(|cx| cx.new(BrowserHistory::new));
+        restored.update(cx, |history, _| {
+            assert_eq!(history.entries().len(), 1);
+            assert_eq!(history.entries()[0].url, "https://example.com");
+            assert_eq!(history.entries()[0].title, "Example");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_quit_flushes_the_pending_history_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let history = cx.update(BrowserHistory::global);
+        history.update(cx, |history, cx| {
+            history.record_visit("https://example.com", "Example", cx);
+        });
+        assert!(
+            cx.update(|cx| session::restore_history(cx)).is_none(),
+            "the debounced write is still pending at quit"
+        );
+
+        cx.update(|cx| cx.shutdown());
+
+        let entries = cx.update(|cx| session::restore_history(cx)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "https://example.com");
+    }
+
+    #[gpui::test]
+    async fn test_omnibox_suggests_from_history_and_navigates(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://start.example", cx);
+        let controller = factory.controller(0);
+
+        view.update(cx, |view, cx| {
+            view.history.update(cx, |history, cx| {
+                history.record_visit("https://example.com/docs", "Example Docs", cx);
+                history.record_visit("https://unrelated.example", "Unrelated", cx);
+            });
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(FocusOmnibox);
+        cx.simulate_input("docs");
+        view.update(cx, |view, cx| {
+            assert!(
+                !view.omnibox.read(cx).is_dropdown_open(),
+                "the search is debounced; nothing opens mid-typing"
+            );
+        });
+        cx.executor().advance_clock(crate::omnibox::SEARCH_DEBOUNCE);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let omnibox = view.omnibox.read(cx);
+            assert!(omnibox.is_dropdown_open());
+            let suggestions = omnibox.suggestions();
+            assert_eq!(suggestions.len(), 2, "search row plus the one match");
+            assert!(
+                matches!(&suggestions[0], OmniboxSuggestion::Search(query) if query == "docs"),
+                "non-URL text defaults to the search row"
+            );
+            assert!(matches!(
+                &suggestions[1],
+                OmniboxSuggestion::History { url, .. } if url == "https://example.com/docs"
+            ));
+            assert_eq!(omnibox.selected_index(), 0);
+        });
+
+        // Arrow down onto the history row and commit: the omnibox navigates
+        // to the remembered page, not to a search.
+        cx.dispatch_action(zed_actions::editor::MoveDown);
+        view.update(cx, |view, cx| {
+            assert_eq!(view.omnibox.read(cx).selected_index(), 1);
+        });
+        controller.take_commands();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.url(), "https://example.com/docs");
+            assert!(
+                !view.omnibox.read(cx).is_dropdown_open(),
+                "navigating closes the dropdown"
+            );
+        });
+        assert!(
+            controller
+                .take_commands()
+                .contains(&RecordedCommand::Navigate {
+                    url: "https://example.com/docs".into(),
+                }),
+            "the selected suggestion drives the engine navigation"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_omnibox_url_like_text_keeps_enter_on_the_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://start.example", cx);
+        let controller = factory.controller(0);
+
+        view.update(cx, |view, cx| {
+            view.history.update(cx, |history, cx| {
+                history.record_visit("https://example.com", "Example", cx);
+            });
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(FocusOmnibox);
+        cx.simulate_input("example.com");
+        cx.executor().advance_clock(crate::omnibox::SEARCH_DEBOUNCE);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let omnibox = view.omnibox.read(cx);
+            assert!(omnibox.is_dropdown_open());
+            let suggestions = omnibox.suggestions();
+            assert!(
+                matches!(&suggestions[0], OmniboxSuggestion::Url(text) if text == "example.com"),
+                "URL-like text keeps the URL row first, where enter has always gone"
+            );
+            assert!(matches!(&suggestions[1], OmniboxSuggestion::Search(_)));
+        });
+
+        controller.take_commands();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert!(
+            controller
+                .take_commands()
+                .contains(&RecordedCommand::Navigate {
+                    url: "https://example.com".into(),
+                }),
+            "enter with the dropdown open still resolves URL-like text as a URL"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_omnibox_escape_closes_the_dropdown_and_restores_the_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://start.example", cx);
+        let controller = factory.controller(0);
+
+        view.update(cx, |view, cx| {
+            view.history.update(cx, |history, cx| {
+                history.record_visit("https://example.com/docs", "Example Docs", cx);
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(FocusOmnibox);
+        cx.simulate_input("docs");
+        cx.executor().advance_clock(crate::omnibox::SEARCH_DEBOUNCE);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.omnibox.read(cx).is_dropdown_open());
+        });
+
+        controller.take_commands();
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let omnibox = view.omnibox.read(cx);
+            assert!(!omnibox.is_dropdown_open());
+            assert_eq!(omnibox.editor_text(cx), "https://start.example");
+        });
+        assert_eq!(
+            controller.take_commands(),
+            vec![],
+            "cancelling never navigates"
         );
     }
 }

@@ -2456,6 +2456,7 @@ dependencies = [
  "cef",
  "db",
  "editor",
+ "fuzzy",
  "gpui",
  "image",
  "log",
@@ -2470,6 +2471,7 @@ dependencies = [
  "url",
  "util",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]

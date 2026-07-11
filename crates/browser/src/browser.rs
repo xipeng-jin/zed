@@ -14,6 +14,7 @@
 mod browser_tab;
 mod browser_view;
 mod frame_presenter;
+mod history;
 mod omnibox;
 mod session;
 #[cfg(any(test, feature = "test-support"))]

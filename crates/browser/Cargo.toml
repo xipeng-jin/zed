@@ -25,6 +25,7 @@ test-support = []
 anyhow.workspace = true
 db.workspace = true
 editor.workspace = true
+fuzzy.workspace = true
 gpui.workspace = true
 image.workspace = true
 log.workspace = true
@@ -39,6 +40,7 @@ ui.workspace = true
 url.workspace = true
 util.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 cef = { workspace = true, optional = true }

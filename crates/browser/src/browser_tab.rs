@@ -30,6 +30,10 @@ pub(crate) struct DrainedChanges {
     pub identity_changed: bool,
     /// Anything else the UI reflects changed: loading state, a new frame.
     pub needs_notify: bool,
+    /// The page's address or title changed, so the visit should be recorded
+    /// in browsing history (`Glass:crates/browser/src/browser_view.rs:863`).
+    /// Favicon changes deliberately do not count as visits.
+    pub visited: bool,
 }
 
 pub(crate) struct BrowserTab {
@@ -45,6 +49,10 @@ pub(crate) struct BrowserTab {
     can_go_back: bool,
     can_go_forward: bool,
     is_pinned: bool,
+    /// Whether this tab shows the app-rendered new-tab page instead of an
+    /// engine page. While set, no engine browser is created; the first
+    /// navigation clears it and starts the engine.
+    is_new_tab_page: bool,
     engine_error: Option<String>,
     /// Last viewport pushed to the engine: logical width and height, plus the
     /// scale factor in thousandths (to keep the key comparable).
@@ -64,9 +72,18 @@ impl BrowserTab {
             can_go_back: false,
             can_go_forward: false,
             is_pinned: false,
+            is_new_tab_page: false,
             engine_error: None,
             last_viewport: None,
         }
+    }
+
+    /// A fresh tab showing the app-rendered new-tab page (ticket #11). It has
+    /// no URL and starts no engine browser until the first navigation.
+    pub fn new_tab_page(id: usize, backend: Box<dyn TabBackend>) -> Self {
+        let mut tab = Self::new(id, backend, String::new());
+        tab.is_new_tab_page = true;
+        tab
     }
 
     /// Rebuild a tab from the reopen stack. The engine browser is created
@@ -107,6 +124,10 @@ impl BrowserTab {
         self.is_pinned
     }
 
+    pub fn is_new_tab_page(&self) -> bool {
+        self.is_new_tab_page
+    }
+
     pub fn set_pinned(&mut self, pinned: bool) {
         self.is_pinned = pinned;
     }
@@ -141,7 +162,10 @@ impl BrowserTab {
     /// ready but the tab has not started (typically because real bounds have
     /// not been seen yet).
     pub fn wants_start(&self) -> bool {
-        !self.backend.is_started() && self.engine_error.is_none() && self.backend.engine_ready()
+        !self.is_new_tab_page
+            && !self.backend.is_started()
+            && self.engine_error.is_none()
+            && self.backend.engine_ready()
     }
 
     /// Push the content size and display scale factor into the engine,
@@ -150,7 +174,7 @@ impl BrowserTab {
     /// browser view, so it always sees the laid-out bounds — including the
     /// final frame of a resize and the first draw after a tab switch.
     pub fn sync_viewport(&mut self, width: u32, height: u32, scale_factor: f32) {
-        if width == 0 || height == 0 {
+        if self.is_new_tab_page || width == 0 || height == 0 {
             return;
         }
         let viewport_key = (width, height, (scale_factor * 1000.0) as u32);
@@ -192,10 +216,12 @@ impl BrowserTab {
                     }
                     self.url = url;
                     changes.identity_changed = true;
+                    changes.visited = true;
                 }
                 TabBackendEvent::TitleChanged(title) => {
                     self.title = title;
                     changes.identity_changed = true;
+                    changes.visited = true;
                 }
                 TabBackendEvent::LoadingStateChanged {
                     is_loading,
@@ -211,7 +237,8 @@ impl BrowserTab {
                 TabBackendEvent::FaviconUrlsChanged(urls) => {
                     // Minimal favicon display: hand the first candidate URL to
                     // gpui's image loader. The cached pipeline with sizing
-                    // preferences is M2 (ticket #11).
+                    // preferences arrives with the M2 favicon-pipeline work
+                    // (plan §7 M2 step 5).
                     self.favicon_url = urls.first().map(|url| SharedUri::from(url.clone()));
                     changes.identity_changed = true;
                 }
@@ -226,11 +253,16 @@ impl BrowserTab {
 
     /// Navigate the engine to `url` (already heuristic-resolved). The address
     /// is reflected optimistically; the engine's `AddressChanged` confirms or
-    /// corrects it.
+    /// corrects it. On a tab whose engine browser does not exist yet (a
+    /// new-tab page, or a restored tab that was never activated) only the URL
+    /// is recorded — the engine starts with it on the next draw.
     pub fn navigate(&mut self, url: String) {
+        self.is_new_tab_page = false;
         self.url = url;
         self.favicon_url = None;
-        self.backend.navigate(&self.url);
+        if self.backend.is_started() {
+            self.backend.navigate(&self.url);
+        }
     }
 
     pub fn reload(&mut self) {
