@@ -179,6 +179,10 @@ impl TabBackend for CefTab {
         self.with_browser(|browser| browser.reload());
     }
 
+    fn stop(&mut self) {
+        self.with_browser(|browser| browser.stop_load());
+    }
+
     fn go_back(&mut self) {
         self.with_browser(|browser| browser.go_back());
     }

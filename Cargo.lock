@@ -2454,14 +2454,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cef",
+ "editor",
  "gpui",
  "image",
  "log",
+ "menu",
  "parking_lot",
  "paths",
  "project",
  "smallvec",
  "ui",
+ "url",
  "util",
  "workspace",
 ]

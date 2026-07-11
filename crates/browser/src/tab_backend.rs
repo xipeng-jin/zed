@@ -77,6 +77,9 @@ pub trait TabBackend: 'static {
 
     fn reload(&mut self);
 
+    /// Stop loading the current page.
+    fn stop(&mut self);
+
     fn go_back(&mut self);
 
     fn go_forward(&mut self);

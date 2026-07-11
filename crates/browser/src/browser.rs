@@ -8,6 +8,7 @@
 
 mod browser_view;
 mod frame_presenter;
+mod omnibox;
 mod tab_backend;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

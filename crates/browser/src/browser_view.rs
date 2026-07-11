@@ -1,7 +1,8 @@
 //! The browser view: the single per-workspace pane item that owns browser
-//! tabs and their chrome (ADR-0004). M1 scope: one browser tab, no chrome —
-//! the internal tab strip arrives with ticket #9 and the navigation chrome
-//! (omnibox, back/forward/reload buttons) with ticket #7.
+//! tabs and their chrome (ADR-0004). M1 scope: one browser tab plus the
+//! navigation chrome — omnibox, back/forward/reload, loading indicator, and
+//! title/favicon in the chrome and the pane tab. The internal browser tab
+//! strip arrives with ticket #9.
 //!
 //! Everything here sits above the two seams: engine communication flows
 //! through the tab-backend trait and frame presentation through the frame
@@ -9,31 +10,34 @@
 //! stub backend.
 
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
+use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::tab_backend::{TabBackend, TabBackendEvent};
 use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent,
-    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollWheelEvent, SharedString, Window, actions, canvas, div,
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Render, ScrollWheelEvent, SharedString, SharedUri, Window, actions, canvas, div, img,
 };
-use ui::prelude::*;
+use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::Workspace;
-use workspace::item::{Item, ItemEvent, TabTooltipContent};
+use workspace::item::{Item, ItemEvent, TabContentParams, TabTooltipContent};
 
 actions!(
     browser,
     [
         /// Opens the browser view in the workspace.
-        OpenBrowser
+        OpenBrowser,
+        /// Navigates back in the browser history.
+        GoBack,
+        /// Navigates forward in the browser history.
+        GoForward,
+        /// Reloads the current page.
+        Reload,
+        /// Focuses the browser's URL and search entry.
+        FocusOmnibox,
     ]
 );
 
 pub const DEFAULT_URL: &str = "https://zed.dev";
-
-fn default_url() -> String {
-    // Interim escape hatch: until the omnibox lands (ticket #7) this env var
-    // is the only way to point the browser at a different page.
-    std::env::var("ZED_BROWSER_URL").unwrap_or_else(|_| DEFAULT_URL.to_string())
-}
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn init(cx: &mut App) {
@@ -49,8 +53,10 @@ pub struct BrowserView {
     focus_handle: FocusHandle,
     backend: Box<dyn TabBackend>,
     presenter: Box<dyn FramePresenter>,
+    omnibox: Entity<Omnibox>,
     url: String,
     title: String,
+    favicon_url: Option<SharedUri>,
     is_loading: bool,
     can_go_back: bool,
     can_go_forward: bool,
@@ -96,12 +102,21 @@ impl BrowserView {
         })
         .detach();
 
+        let omnibox = cx.new(|cx| Omnibox::new(window, cx));
+        cx.subscribe_in(&omnibox, window, |this, _, event, window, cx| {
+            let OmniboxEvent::Navigate(url) = event;
+            this.navigate_to(url.clone(), window, cx);
+        })
+        .detach();
+
         Self {
             focus_handle: cx.focus_handle(),
             backend,
             presenter: Box::new(SoftwarePresenter::new()),
+            omnibox,
             url: initial_url,
             title: String::new(),
+            favicon_url: None,
             is_loading: false,
             can_go_back: false,
             can_go_forward: false,
@@ -130,7 +145,7 @@ impl BrowserView {
             workspace.activate_item(&existing, true, true, window, cx);
             return;
         }
-        let view = cx.new(|cx| BrowserView::new(backend(), default_url(), window, cx));
+        let view = cx.new(|cx| BrowserView::new(backend(), DEFAULT_URL.to_string(), window, cx));
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
@@ -171,6 +186,13 @@ impl BrowserView {
             match event {
                 TabBackendEvent::Created => {}
                 TabBackendEvent::AddressChanged(url) => {
+                    if self.url != url {
+                        // The engine does not always re-announce favicons when
+                        // returning to a page (e.g. history traversal); drop
+                        // the old page's icon rather than show it for the new
+                        // one.
+                        self.favicon_url = None;
+                    }
                     self.url = url;
                     item_changed = true;
                 }
@@ -189,8 +211,12 @@ impl BrowserView {
                     needs_notify = true;
                 }
                 TabBackendEvent::LoadingProgress(_) => {}
-                TabBackendEvent::FaviconUrlsChanged(_) => {
-                    // Favicon pipeline is M2 (ticket #11).
+                TabBackendEvent::FaviconUrlsChanged(urls) => {
+                    // Minimal favicon display: hand the first candidate URL to
+                    // gpui's image loader. The cached pipeline with sizing
+                    // preferences is M2 (ticket #11).
+                    self.favicon_url = urls.first().map(|url| SharedUri::from(url.clone()));
+                    item_changed = true;
                 }
                 TabBackendEvent::FrameReady => needs_notify = true,
                 TabBackendEvent::LoadError { url, error_text } => {
@@ -238,6 +264,45 @@ impl BrowserView {
             self.last_viewport = Some(viewport_key);
             self.backend.set_viewport(width, height, scale_factor);
         }
+    }
+
+    /// Navigate the engine to `url` (already heuristic-resolved) and hand
+    /// focus back to the page. The address is reflected optimistically; the
+    /// engine's `AddressChanged` confirms or corrects it.
+    fn navigate_to(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.url = url;
+        self.favicon_url = None;
+        self.backend.navigate(&self.url);
+        window.focus(&self.focus_handle, cx);
+        self.backend.set_focus(true);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.backend.go_back();
+        cx.notify();
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        self.backend.go_forward();
+        cx.notify();
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.backend.reload();
+        cx.notify();
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        self.backend.stop();
+        cx.notify();
+    }
+
+    fn focus_omnibox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.omnibox.update(cx, |omnibox, cx| {
+            omnibox.focus_and_select_all(window, cx);
+        });
     }
 
     fn handle_mouse_down(
@@ -309,18 +374,21 @@ impl BrowserView {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if is_app_keystroke(&event.keystroke) {
+        // Key listeners fire along the whole focus path, so a keystroke aimed
+        // at the omnibox editor also reaches this ancestor; only forward to
+        // the page when the page content itself has focus.
+        if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
             return;
         }
         self.backend.send_key_down(&event.keystroke, event.is_held);
         cx.stop_propagation();
     }
 
-    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if is_app_keystroke(&event.keystroke) {
+    fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
             return;
         }
         self.backend.send_key_up(&event.keystroke);
@@ -343,6 +411,83 @@ impl BrowserView {
                     .child(message),
             )
     }
+
+    /// Whether `tab_content` renders its own identity glyph (spinner or
+    /// favicon) in place of the pane's `tab_icon` slot.
+    fn shows_custom_tab_glyph(&self) -> bool {
+        self.is_loading || self.favicon_url.is_some()
+    }
+
+    fn globe_icon() -> AnyElement {
+        Icon::new(IconName::ToolWeb)
+            .size(IconSize::Small)
+            .color(Color::Muted)
+            .into_any_element()
+    }
+
+    /// The page's identity glyph: a spinner while loading, else the favicon,
+    /// else a generic globe. Shared by the chrome and the pane tab.
+    fn favicon_element(&self) -> AnyElement {
+        if self.is_loading {
+            Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else if let Some(favicon_url) = self.favicon_url.clone() {
+            img(favicon_url)
+                .size_4()
+                .with_fallback(Self::globe_icon)
+                .into_any_element()
+        } else {
+            Self::globe_icon()
+        }
+    }
+
+    fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.title.trim().to_string();
+        h_flex()
+            .w_full()
+            .flex_none()
+            .gap_1()
+            .px_1p5()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().tab_bar_background)
+            .child(
+                IconButton::new("browser-back", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .disabled(!self.can_go_back)
+                    .tooltip(Tooltip::text("Go Back"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.go_back(cx))),
+            )
+            .child(
+                IconButton::new("browser-forward", IconName::ArrowRight)
+                    .icon_size(IconSize::Small)
+                    .disabled(!self.can_go_forward)
+                    .tooltip(Tooltip::text("Go Forward"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.go_forward(cx))),
+            )
+            .child(if self.is_loading {
+                IconButton::new("browser-stop", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Stop Loading"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
+            } else {
+                IconButton::new("browser-reload", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Reload"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reload(cx)))
+            })
+            .child(div().flex_none().px_0p5().child(self.favicon_element()))
+            .child(self.omnibox.clone())
+            .when(!title.is_empty(), |this| {
+                this.child(div().flex_none().max_w_64().child(
+                    Label::new(title).size(LabelSize::Small).color(Color::Muted).truncate(),
+                ))
+            })
+    }
 }
 
 impl Render for BrowserView {
@@ -352,6 +497,14 @@ impl Render for BrowserView {
         }
         let frame = self.presenter.render_frame(window);
         let has_frame = frame.is_some();
+
+        // The omnibox editor mirror is synced here rather than where `url`
+        // changes because `drain_engine_events` runs from the pump observer,
+        // which has no `Window` (required to set editor text).
+        let url = self.url.clone();
+        self.omnibox.update(cx, |omnibox, cx| {
+            omnibox.set_current_url(&url, window, cx);
+        });
 
         let this = cx.entity();
         let bounds_tracker = canvas(
@@ -367,12 +520,12 @@ impl Render for BrowserView {
         .absolute()
         .size_full();
 
-        div()
-            .id("browser-view")
-            .key_context("BrowserView")
-            .track_focus(&self.focus_handle)
-            .size_full()
+        let content = div()
+            .id("browser-content")
             .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .overflow_hidden()
             .bg(cx.theme().colors().editor_background)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
@@ -383,11 +536,27 @@ impl Render for BrowserView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-            .on_key_down(cx.listener(Self::handle_key_down))
-            .on_key_up(cx.listener(Self::handle_key_up))
             .child(bounds_tracker)
             .when_some(frame, |this, frame| this.child(frame))
-            .when(!has_frame, |this| this.child(self.render_placeholder(cx)))
+            .when(!has_frame, |this| this.child(self.render_placeholder(cx)));
+
+        div()
+            .id("browser-view")
+            .key_context("BrowserView")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
+            .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
+            .on_action(cx.listener(|this, _: &Reload, _, cx| this.reload(cx)))
+            .on_action(
+                cx.listener(|this, _: &FocusOmnibox, window, cx| this.focus_omnibox(window, cx)),
+            )
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .on_key_up(cx.listener(Self::handle_key_up))
+            .child(self.render_chrome(cx))
+            .child(content)
     }
 }
 
@@ -406,6 +575,20 @@ impl Item for BrowserView {
         f(*event);
     }
 
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        let text = self.tab_content_text(params.detail.unwrap_or_default(), cx);
+        let label = Label::new(text).color(params.text_color());
+        if self.shows_custom_tab_glyph() {
+            h_flex()
+                .gap_1()
+                .child(self.favicon_element())
+                .child(label)
+                .into_any_element()
+        } else {
+            label.into_any_element()
+        }
+    }
+
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         let title = self.title.trim();
         if !title.is_empty() {
@@ -418,8 +601,15 @@ impl Item for BrowserView {
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        // Upstream's globe glyph; the icon set has no dedicated Globe variant.
-        Some(Icon::new(IconName::ToolWeb))
+        // The pane renders this icon slot in addition to `tab_content`, so
+        // yield it whenever `tab_content` is already showing a spinner or
+        // favicon. ToolWeb is upstream's globe glyph; the icon set has no
+        // dedicated Globe variant.
+        if self.shows_custom_tab_glyph() {
+            None
+        } else {
+            Some(Icon::new(IconName::ToolWeb))
+        }
     }
 
     fn tab_tooltip_content(&self, _cx: &App) -> Option<TabTooltipContent> {
@@ -481,6 +671,9 @@ mod tests {
         events: VecDeque<TabBackendEvent>,
         paint_output: Option<PaintOutput>,
         inputs: Vec<RecordedInput>,
+        /// Navigation commands: "navigate:<url>", "reload", "stop",
+        /// "go_back", "go_forward".
+        navigations: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -510,10 +703,25 @@ mod tests {
             self.0.lock().started_with.is_some()
         }
 
-        fn navigate(&mut self, _url: &str) {}
-        fn reload(&mut self) {}
-        fn go_back(&mut self) {}
-        fn go_forward(&mut self) {}
+        fn navigate(&mut self, url: &str) {
+            self.0.lock().navigations.push(format!("navigate:{url}"));
+        }
+
+        fn reload(&mut self) {
+            self.0.lock().navigations.push("reload".to_string());
+        }
+
+        fn stop(&mut self) {
+            self.0.lock().navigations.push("stop".to_string());
+        }
+
+        fn go_back(&mut self) {
+            self.0.lock().navigations.push("go_back".to_string());
+        }
+
+        fn go_forward(&mut self) {
+            self.0.lock().navigations.push("go_forward".to_string());
+        }
 
         fn set_viewport(&mut self, width: u32, height: u32, scale_factor: f32) {
             self.0
@@ -605,7 +813,11 @@ mod tests {
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
-        cx.update(AppState::test)
+        cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            editor::init(cx);
+            app_state
+        })
     }
 
     #[gpui::test]
@@ -703,9 +915,12 @@ mod tests {
         assert!(state.viewports.len() > viewports_before);
         let (width, height, scale_key) = *state.viewports.last().unwrap();
         assert_eq!(
-            (width, height),
-            (500, 400),
+            width, 500,
             "engine viewport tracks the resized logical bounds"
+        );
+        assert!(
+            height > 0 && height < 400,
+            "engine viewport height excludes the navigation chrome, got {height}"
         );
         assert_eq!(scale_key, window_scale_key);
     }
@@ -817,6 +1032,177 @@ mod tests {
             }],
             "scroll coordinates are translated by the pane offset"
         );
+    }
+
+    #[gpui::test]
+    async fn test_navigation_actions_drive_the_backend(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(GoBack);
+        cx.dispatch_action(GoForward);
+        cx.dispatch_action(Reload);
+        assert_eq!(
+            state.lock().navigations,
+            vec!["go_back", "go_forward", "reload"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_omnibox_confirm_resolves_text_and_navigates(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(FocusOmnibox);
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.omnibox.focus_handle(cx).is_focused(window),
+                "FocusOmnibox moves focus into the omnibox editor"
+            );
+            view.omnibox.update(cx, |omnibox, cx| {
+                omnibox.set_editor_text("example.com", window, cx);
+            });
+        });
+
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        assert_eq!(
+            state.lock().navigations,
+            vec!["navigate:https://example.com"],
+            "confirmed text is resolved through the URL heuristic"
+        );
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.url(), "https://example.com");
+            assert!(
+                view.focus_handle.is_focused(window),
+                "focus returns to the page content after navigating"
+            );
+            assert_eq!(
+                view.omnibox.read(cx).editor_text(cx),
+                "https://example.com",
+                "the omnibox mirrors the new address"
+            );
+        });
+        assert_eq!(
+            state.lock().focus_calls.last(),
+            Some(&true),
+            "the engine browser is refocused after navigating"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_omnibox_cancel_reverts_to_the_current_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), "https://example.com".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(FocusOmnibox);
+        view.update_in(cx, |view, window, cx| {
+            view.omnibox.update(cx, |omnibox, cx| {
+                omnibox.set_editor_text("half-typed query", window, cx);
+            });
+        });
+
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.omnibox.read(cx).editor_text(cx), "https://example.com");
+        });
+        assert_eq!(
+            state.lock().navigations,
+            Vec::<String>::new(),
+            "cancelling never navigates"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_typing_in_the_omnibox_does_not_reach_the_page(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(FocusOmnibox);
+        cx.simulate_input("zed");
+
+        assert_eq!(
+            state.lock().inputs,
+            vec![],
+            "keystrokes aimed at the omnibox editor are not forwarded to the page"
+        );
+        view.update(cx, |view, cx| {
+            assert_eq!(view.omnibox.read(cx).editor_text(cx), "zed");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_favicon_updates_tab_and_chrome_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.tab_icon(window, cx).is_some(),
+                "without a favicon the tab shows the generic globe icon"
+            );
+        });
+
+        state.lock().events.push_back(TabBackendEvent::FaviconUrlsChanged(vec![
+            "https://example.com/favicon.ico".to_string(),
+        ]));
+        view.update(cx, |view, cx| view.drain_engine_events(cx));
+
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.favicon_url.as_ref().map(|url| url.to_string()),
+                Some("https://example.com/favicon.ico".to_string())
+            );
+            assert!(
+                view.tab_icon(window, cx).is_none(),
+                "the favicon replaces the icon slot in the pane tab"
+            );
+        });
+
+        state
+            .lock()
+            .events
+            .push_back(TabBackendEvent::FaviconUrlsChanged(Vec::new()));
+        view.update(cx, |view, cx| view.drain_engine_events(cx));
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.favicon_url.is_none());
+            assert!(view.tab_icon(window, cx).is_some());
+        });
     }
 
     #[gpui::test]
