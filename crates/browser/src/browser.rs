@@ -23,6 +23,7 @@ mod session;
 #[cfg(any(test, feature = "test-support"))]
 mod stub_tab_backend;
 mod tab_backend;
+mod text_input;
 
 #[cfg(feature = "cef")]
 mod cef_instance;
@@ -73,6 +74,7 @@ pub use tab_backend::{
     BrowserTabOpenTarget, OpenDisposition, OpenTargetRequest, PaintOutput, SoftwareFrame,
     TabBackend, TabBackendEvent,
 };
+pub use text_input::BrowserTextInputState;
 
 use gpui::App;
 

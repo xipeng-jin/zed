@@ -120,6 +120,7 @@ wrap_browser_process_handler! {
 #[derive(Clone)]
 struct ZedCefApp {
     browser_process_handler: cef::BrowserProcessHandler,
+    render_process_handler: cef::RenderProcessHandler,
 }
 
 impl ZedCefApp {
@@ -127,6 +128,8 @@ impl ZedCefApp {
         Self {
             browser_process_handler: ZedBrowserProcessHandlerBuilder::new(
                 ZedBrowserProcessHandler {},
+            ),
+            render_process_handler: crate::text_input::TextInputRenderProcessHandlerBuilder::build(
             ),
         }
     }
@@ -213,6 +216,13 @@ wrap_app! {
 
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             Some(self.app.browser_process_handler.clone())
+        }
+
+        // Runs in the render subprocess (the same App is passed to
+        // `execute_process`): reports focused-node editability for keystroke
+        // routing (ticket #16).
+        fn render_process_handler(&self) -> Option<cef::RenderProcessHandler> {
+            Some(self.app.render_process_handler.clone())
         }
     }
 }

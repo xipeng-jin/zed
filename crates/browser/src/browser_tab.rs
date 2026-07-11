@@ -11,10 +11,12 @@ use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
 use crate::tab_backend::{OpenTargetRequest, TabBackend, TabBackendEvent};
+use crate::text_input::{BrowserTextInputState, CommittedTextAction, committed_text_action};
 use gpui::{
     AnyElement, Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta, SharedString,
     SharedUri, Window,
 };
+use std::ops::Range;
 
 /// A closed browser tab, remembered on the browser view's reopen stack.
 pub(crate) struct ClosedTab {
@@ -50,6 +52,10 @@ pub(crate) struct DrainedChanges {
     /// Page-initiated requests to open URLs in new browser tabs (redirected
     /// popups and link-opens targeting tabs), in arrival order.
     pub open_targets: Vec<OpenTargetRequest>,
+    /// The page's focused-node editability changed (including the reset on
+    /// navigation); the view re-checks keystroke routing and drops any
+    /// composition aimed at a field that no longer accepts it.
+    pub text_input_changed: bool,
 }
 
 pub(crate) struct BrowserTab {
@@ -73,6 +79,9 @@ pub(crate) struct BrowserTab {
     /// Last viewport pushed to the engine: logical width and height, plus the
     /// scale factor in thousandths (to keep the key comparable).
     last_viewport: Option<(u32, u32, u32)>,
+    /// Latest focused-node editability reported by this tab's render process;
+    /// reset on navigation until the new page reports.
+    text_input_state: BrowserTextInputState,
 }
 
 impl BrowserTab {
@@ -91,6 +100,7 @@ impl BrowserTab {
             is_new_tab_page: false,
             engine_error: None,
             last_viewport: None,
+            text_input_state: BrowserTextInputState::default(),
         }
     }
 
@@ -233,6 +243,13 @@ impl BrowserTab {
                     self.url = url;
                     changes.identity_changed = true;
                     changes.visited = true;
+                    // The new page's focused node is unknown until its render
+                    // process reports; treat it as non-editable meanwhile
+                    // (`Glass:crates/browser/src/tab.rs:198`).
+                    if self.text_input_state != BrowserTextInputState::default() {
+                        self.text_input_state = BrowserTextInputState::default();
+                        changes.text_input_changed = true;
+                    }
                 }
                 TabBackendEvent::TitleChanged(title) => {
                     self.title = title;
@@ -276,6 +293,12 @@ impl BrowserTab {
                 }
                 TabBackendEvent::OpenTargetRequested(request) => {
                     changes.open_targets.push(request);
+                }
+                TabBackendEvent::TextInputStateChanged(state) => {
+                    if self.text_input_state != state {
+                        self.text_input_state = state;
+                        changes.text_input_changed = true;
+                    }
                 }
             }
         }
@@ -365,6 +388,36 @@ impl BrowserTab {
 
     pub fn send_key_up(&mut self, keystroke: &Keystroke) {
         self.backend.send_key_up(keystroke);
+    }
+
+    pub fn text_input_state(&self) -> BrowserTextInputState {
+        self.text_input_state
+    }
+
+    pub fn ime_set_composition(&mut self, text: &str, selected_range: Option<Range<usize>>) {
+        self.backend.ime_set_composition(text, selected_range);
+    }
+
+    /// Insert text the input handler committed. A committed bare newline is
+    /// the IME confirm key; the page expects an Enter keypress (submit), not
+    /// an inserted character.
+    pub fn commit_text(&mut self, text: &str) {
+        match committed_text_action(text) {
+            CommittedTextAction::PressEnter => {
+                let enter = Keystroke {
+                    key: "enter".into(),
+                    key_char: None,
+                    modifiers: Modifiers::default(),
+                };
+                self.backend.send_key_down(&enter, false);
+                self.backend.send_key_up(&enter);
+            }
+            CommittedTextAction::InsertText => self.backend.ime_commit_text(text),
+        }
+    }
+
+    pub fn ime_cancel_composition(&mut self) {
+        self.backend.ime_cancel_composition();
     }
 
     pub fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {

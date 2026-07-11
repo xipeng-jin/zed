@@ -1,7 +1,7 @@
 //! CEF client, ported (M2 subset) from `Glass:crates/browser/src/client.rs`.
 //! Ties together the render, load, display, life-span, keyboard, download,
-//! find, context-menu, request, and permission handlers. The render-process
-//! message bridge (text-input state) joins with ticket #16.
+//! find, context-menu, request, and permission handlers, and receives the
+//! render process's text-input state messages.
 
 use crate::context_menu_handler::{ContextMenuHandlerBuilder, OsrContextMenuHandler};
 use crate::display_handler::{DisplayHandlerBuilder, OsrDisplayHandler};
@@ -14,7 +14,8 @@ use crate::load_handler::{LoadHandlerBuilder, OsrLoadHandler};
 use crate::permission_handler::{OsrPermissionHandler, PermissionHandlerBuilder};
 use crate::render_handler::{OsrRenderHandler, RenderHandlerBuilder, RenderState};
 use crate::request_handler::{OsrRequestHandler, RequestHandlerBuilder};
-use crate::tab_backend::EventSender;
+use crate::tab_backend::{EventSender, TabBackendEvent, send_event};
+use crate::text_input::extract_text_input_state_from_message;
 #[cfg(target_os = "windows")]
 use cef::sys::tagMSG;
 use cef::{
@@ -110,6 +111,7 @@ wrap_client! {
         context_menu_handler: ContextMenuHandler,
         request_handler: RequestHandler,
         permission_handler: PermissionHandler,
+        event_sender: EventSender,
     }
 
     impl Client {
@@ -151,6 +153,28 @@ wrap_client! {
 
         fn permission_handler(&self) -> Option<cef::PermissionHandler> {
             Some(self.permission_handler.clone())
+        }
+
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _source_process: cef::ProcessId,
+            message: Option<&mut cef::ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            let Some(message) = message else {
+                return 0;
+            };
+
+            let Some(text_input_state) = extract_text_input_state_from_message(message) else {
+                return 0;
+            };
+
+            send_event(
+                &self.event_sender,
+                TabBackendEvent::TextInputStateChanged(text_input_state),
+            );
+            1
         }
     }
 }
@@ -196,7 +220,7 @@ impl ClientBuilder {
         let download_handler = OsrDownloadHandler::new(event_sender.clone());
         let find_handler = OsrFindHandler::new(event_sender.clone());
         let request_handler = OsrRequestHandler::new(event_sender.clone());
-        let context_menu_handler = OsrContextMenuHandler::new(event_sender);
+        let context_menu_handler = OsrContextMenuHandler::new(event_sender.clone());
         let permission_handler = OsrPermissionHandler::new();
         Self::new(
             RenderHandlerBuilder::build(render_handler),
@@ -209,6 +233,7 @@ impl ClientBuilder {
             ContextMenuHandlerBuilder::build(context_menu_handler),
             RequestHandlerBuilder::build(request_handler),
             PermissionHandlerBuilder::build(permission_handler),
+            event_sender,
         )
     }
 }

@@ -313,6 +313,59 @@ impl TabBackend for CefTab {
         self.send_key_event(&input::convert_key_event(keystroke, false));
     }
 
+    fn ime_set_composition(&mut self, text: &str, selected_range: Option<std::ops::Range<usize>>) {
+        let utf16_len = text.encode_utf16().count() as u32;
+        self.with_host(|host| {
+            let text = cef::CefString::from(text);
+            // CEF's C-API shim rejects null range pointers, so "no
+            // replacement" is Chromium's invalid range and a missing
+            // selection defaults to a caret after the composition.
+            let replacement_range = cef::Range {
+                from: u32::MAX,
+                to: u32::MAX,
+            };
+            let selected_range = selected_range
+                .map(|range| cef::Range {
+                    from: range.start as u32,
+                    to: range.end as u32,
+                })
+                .unwrap_or(cef::Range {
+                    from: utf16_len,
+                    to: utf16_len,
+                });
+            host.ime_set_composition(
+                Some(&text),
+                None,
+                Some(&replacement_range),
+                Some(&selected_range),
+            );
+        });
+    }
+
+    // Committed text is delivered as CHAR key events rather than
+    // `ime_commit_text`: commits often arrive with no composition in flight
+    // (e.g. plain insertText), and CEF drops commit calls outside one
+    // (`Glass:crates/browser/src/tab.rs:598`).
+    fn ime_commit_text(&mut self, text: &str) {
+        for character in text.encode_utf16() {
+            self.send_key_event(&cef::KeyEvent {
+                type_: cef::KeyEventType::CHAR,
+                modifiers: 0,
+                windows_key_code: character as i32,
+                character,
+                unmodified_character: character,
+                focus_on_editable_field: 1,
+                ..Default::default()
+            });
+        }
+    }
+
+    fn ime_cancel_composition(&mut self) {
+        self.with_host(|host| {
+            host.ime_cancel_composition();
+        });
+    }
+
     fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
         self.with_host(|host| {
             let query = cef::CefString::from(query);

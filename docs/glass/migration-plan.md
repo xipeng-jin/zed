@@ -285,6 +285,8 @@ Verified conclusion: **no gpui changes are required to start, and possibly none 
   against stock dispatch; adopt (and ideally upstream) this patch only if key/IME
   routing over the CEF content element demonstrably misroutes.** If adopted, it goes
   on the touch-list with a dedicated evaluation note.
+  *Gate outcome (2026-07-11, ticket #16): stock dispatch passed the evaluation; the
+  patch was **not** adopted (evidence in §7 M2 step 7, risk R7).*
 - The fork-only `Keystroke.native_key_code` field is *not* ported; the Linux keycode
   mapping (M1) works from gpui key names/scancodes instead.
 
@@ -446,6 +448,20 @@ Gate: **usable as a daily browser on Linux; Gmail and GitHub login flows work
    (`text_input.rs` has 9 unit tests — port them). **Evaluation gate for `d14fb11`**:
    exercise keystrokes while CEF content is focused with editor splits present; adopt
    the gpui patch only on demonstrated misrouting, and record the evidence in this doc.
+   *Evaluated (2026-07-11, ticket #16): no misrouting; patch NOT adopted.* On the
+   nested-Xwayland harness with ibus (XIM) + libpinyin: with the browser view and an
+   editor split side by side, plain typing, CJK composition (visible preedit), and
+   commits landed in the web form with the browser focused and in the editor buffer
+   with the editor focused — never in the other; app chords (command palette) kept
+   working with CEF content focused. Stock dispatch routed everything correctly, so
+   the touch list is unchanged.
+   *Deviation from Glass found during validation:* Glass passes null
+   `replacement_range`/`selection_range` to `CefBrowserHost::ime_set_composition`
+   (`Glass:crates/browser/src/tab.rs:594`); CEF's C-API argument validation silently
+   drops the call for null range pointers, so no preedit ever reached the page
+   (confirmed by contrast with CDP `Input.imeSetComposition`, which drew the preedit).
+   The port passes Chromium's invalid-range sentinel (`u32::MAX..u32::MAX`) for "no
+   replacement" and a caret-at-end default selection instead (`tab.rs`).
 8. Keymap (context `BrowserView`, shadowing set: `ctrl-t`, `ctrl-w`, `ctrl-shift-t`,
    `ctrl-l`, `ctrl-r`, `ctrl-f`, `ctrl-tab`/`ctrl-shift-tab`, `alt-left`/`alt-right`)
    + `browser` settings section (search engine, new-tab behavior, download dir).
@@ -542,6 +558,11 @@ Gate: soft — items are independent.
   as its own change set.
 - **R7 — Key dispatch/IME correctness.** The one place a gpui patch might be forced
   (`d14fb11`). Contained by the M2 evaluation gate.
+  **Resolved (2026-07-11, ticket #16): gate passed, patch not adopted.** Stock
+  dispatch routed keystrokes, text input, and IME composition correctly with the
+  browser focused alongside editor splits (evidence in §7 M2 step 7). The real
+  IME defect was elsewhere: null range pointers to CEF's `ime_set_composition`
+  (see the step-7 deviation note).
 - **R8 — Upstream drift during the build.** Zed main moves daily; merge upstream into
   `glass` at least weekly during M1/M2 so conflicts stay small (ADR-0003 workflow).
 

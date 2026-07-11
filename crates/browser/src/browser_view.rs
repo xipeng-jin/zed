@@ -20,16 +20,19 @@ use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
 use crate::tab_backend::{BrowserTabOpenTarget, OpenTargetRequest, TabBackend};
+use crate::text_input::{BrowserKeyDispatch, BrowserTextInputState, key_down_dispatch, key_up_dispatch};
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, actions::SelectAll as EditorSelectAll};
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, actions,
-    anchored, canvas, deferred, div, img,
+    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent,
+    ElementInputHandler, Entity, EntityId, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Global, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, SharedUri, Subscription,
+    Task, UTF16Selection, WeakEntity, Window, actions, anchored, canvas, deferred, div, img, point,
+    size,
 };
+use std::ops::Range;
 use notifications::status_toast::StatusToast;
 use project::Project;
 use std::path::Path;
@@ -193,6 +196,13 @@ pub struct BrowserView {
     /// incognito UI arrives with its own ticket; only the persistence
     /// exclusion is modeled here.
     is_incognito: bool,
+    /// In-flight IME composition (preedit) text aimed at the page, mirrored
+    /// here because the engine owns the real field content: GPUI's input
+    /// handler needs the marked text and selection reported back to the
+    /// platform IME (`Glass:crates/browser/src/browser_view.rs:198`).
+    ime_marked_text: Option<String>,
+    /// UTF-16 selection within the marked text.
+    ime_selected_range: Option<Range<usize>>,
     /// Debounced session write; replacing it pushes the deadline out.
     pending_session_save: Option<Task<()>>,
     _quit_flush: Subscription,
@@ -202,15 +212,6 @@ pub struct BrowserView {
     /// Download progress re-renders this view's download center, whichever
     /// browser view's tab is downloading.
     _downloads_observation: Subscription,
-}
-
-/// M1 subset of Glass's three-way key dispatch
-/// (`Glass:crates/browser/src/text_input.rs:61`): app-first classification
-/// only — ctrl/platform-modified chords belong to Zed even when no binding
-/// matched them, so pages cannot shadow app shortcuts. The text-input route
-/// (editable-field state + IME) joins with ticket #16.
-fn is_app_keystroke(keystroke: &Keystroke) -> bool {
-    keystroke.modifiers.platform || keystroke.modifiers.control
 }
 
 impl BrowserView {
@@ -320,6 +321,8 @@ impl BrowserView {
             workspace: None,
             content_bounds: Bounds::default(),
             is_incognito,
+            ime_marked_text: None,
+            ime_selected_range: None,
             pending_session_save: None,
             _quit_flush: cx.on_app_quit(Self::flush_session_on_quit),
             _bookmarks_observation: bookmarks_observation,
@@ -574,6 +577,7 @@ impl BrowserView {
         let mut active_find_result = None;
         let mut active_context_menu = None;
         let mut open_targets = Vec::new();
+        let mut active_text_input_lost = false;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let mut changes = tab.drain_events();
             download_updates.append(&mut changes.downloads);
@@ -583,6 +587,12 @@ impl BrowserView {
                 // are stale by definition: their overlays are not on screen.
                 active_find_result = changes.find_result;
                 active_context_menu = changes.context_menu;
+                if changes.text_input_changed {
+                    // Keystroke routing consults the new state; repaint so the
+                    // input handler registration matches it.
+                    needs_notify = true;
+                    active_text_input_lost = !tab.text_input_state().editable;
+                }
             }
             if changes.identity_changed || changes.needs_notify {
                 // Any tab's title or favicon shows in the tab strip.
@@ -619,6 +629,12 @@ impl BrowserView {
             self.find_match_count = count;
             self.find_active_match_ordinal = active_match_ordinal;
             needs_notify = true;
+        }
+        if active_text_input_lost {
+            // The composition's target field is gone (blur or navigation);
+            // drop the mirrored preedit so stale marked text is not reported
+            // to the platform IME.
+            self.clear_ime_state();
         }
         if let Some(context) = active_context_menu {
             self.pending_context_menu = Some(context);
@@ -1234,9 +1250,36 @@ impl BrowserView {
         tab.send_scroll_wheel(position, event.delta, event.modifiers);
     }
 
+    /// The active tab's focused-node editability, as last reported by its
+    /// render process.
+    fn active_tab_text_input_state(&self) -> BrowserTextInputState {
+        self.active_tab().text_input_state()
+    }
+
+    /// Whether the app should accept platform text input for the page —
+    /// gates [`EntityInputHandler::accepts_text_input`], which controls
+    /// whether the platform enables IME for this view's focus.
+    fn text_input_enabled(&self) -> bool {
+        self.active_tab_text_input_state()
+            .is_active(self.ime_marked_text.is_some())
+    }
+
+    fn text_input_composing(&self) -> bool {
+        self.ime_marked_text.is_some()
+    }
+
+    fn clear_ime_state(&mut self) {
+        self.ime_marked_text = None;
+        self.ime_selected_range = None;
+    }
+
     /// Key listeners run only for keystrokes no Zed binding consumed (GPUI
     /// matches bindings before key listeners), so anything arriving here is
-    /// either page input or an unbound app chord.
+    /// either page input or an unbound app chord. Routing is Glass's
+    /// three-way classification (`text_input.rs`): `App` chords fall through
+    /// untouched, `TextInput` keys are left to GPUI's input-handler path
+    /// (which commits or composes through the IME seam methods), and only
+    /// `Browser` keys forward as raw engine key events.
     ///
     /// Unlike Glass, the engine send is not deferred: Glass's tab was a GPUI
     /// entity it could not update re-entrantly mid-dispatch, while this
@@ -1251,7 +1294,15 @@ impl BrowserView {
         // Key listeners fire along the whole focus path, so a keystroke aimed
         // at the omnibox editor also reaches this ancestor; only forward to
         // the page when the page content itself has focus.
-        if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let route = key_down_dispatch(
+            &event.keystroke,
+            self.active_tab_text_input_state().editable,
+            self.text_input_composing(),
+        );
+        if route != BrowserKeyDispatch::Browser {
             return;
         }
         let Some(tab) = self.active_engine_tab_mut() else {
@@ -1262,7 +1313,15 @@ impl BrowserView {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus_handle.is_focused(window) || is_app_keystroke(&event.keystroke) {
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let route = key_up_dispatch(
+            &event.keystroke,
+            self.active_tab_text_input_state().editable,
+            self.text_input_composing(),
+        );
+        if route != BrowserKeyDispatch::Browser {
             return;
         }
         let Some(tab) = self.active_engine_tab_mut() else {
@@ -1868,8 +1927,12 @@ impl Render for BrowserView {
 
         // Weak: the window retains the last frame's element tree, so a strong
         // handle here would keep a closed view (and its session ownership)
-        // alive until an unrelated redraw.
+        // alive until an unrelated redraw. The paint closure upgrades at call
+        // time for the same reason — `ElementInputHandler` holds a strong
+        // entity, but only inside the window's per-frame handler slot.
         let this = cx.weak_entity();
+        let input_target = this.clone();
+        let focus_handle = self.focus_handle.clone();
         let bounds_tracker = canvas(
             move |bounds, window, cx| {
                 let scale_factor = window.scale_factor();
@@ -1879,7 +1942,14 @@ impl Render for BrowserView {
                 .ok();
                 bounds
             },
-            |_, _, _, _| {},
+            move |bounds, _, window, cx| {
+                // Routes platform text input (typing into editable fields,
+                // IME composition) to this view's `EntityInputHandler` while
+                // the page content has focus.
+                if let Some(view) = input_target.upgrade() {
+                    window.handle_input(&focus_handle, ElementInputHandler::new(bounds, view), cx);
+                }
+            },
         )
         .absolute()
         .size_full();
@@ -1982,6 +2052,127 @@ impl Render for BrowserView {
 impl Focusable for BrowserView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Platform text input for the page, ported from
+/// `Glass:crates/browser/src/browser_view.rs:1106`. The engine owns the real
+/// field content, so unlike an editor this handler is write-mostly: it
+/// mirrors only the in-flight composition, and reports no document text
+/// beyond it.
+impl EntityInputHandler for BrowserView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text = self.ime_marked_text.as_ref()?;
+        let utf16_len = text.encode_utf16().count();
+        if range.end > utf16_len {
+            adjusted_range.replace(0..utf16_len);
+        }
+        Some(text.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.ime_selected_range.clone().unwrap_or(0..0),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime_marked_text
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        let had_marked_text = self.ime_marked_text.is_some();
+        self.clear_ime_state();
+
+        if had_marked_text && let Some(tab) = self.active_engine_tab_mut() {
+            tab.ime_cancel_composition();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let had_marked_text = self.ime_marked_text.is_some();
+        self.clear_ime_state();
+
+        if let Some(tab) = self.active_engine_tab_mut() {
+            // The engine still shows the preedit; committed text is inserted
+            // as separate character events, so drop the composition first or
+            // the field briefly holds both (or, for an empty commit, keeps a
+            // preedit this view no longer mirrors).
+            if had_marked_text {
+                tab.ime_cancel_composition();
+            }
+            if !text.is_empty() {
+                tab.commit_text(text);
+            }
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.ime_marked_text = Some(new_text.to_string());
+        self.ime_selected_range = new_selected_range.clone();
+
+        if let Some(tab) = self.active_engine_tab_mut() {
+            tab.ime_set_composition(new_text, new_selected_range);
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // The engine does not report the page caret's position, so anchor the
+        // IME candidate window to the content area's top-left corner.
+        Some(Bounds {
+            origin: element_bounds.origin + point(px(8.0), px(8.0)),
+            size: size(px(1.0), px(20.0)),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.text_input_enabled()
     }
 }
 
@@ -2379,6 +2570,188 @@ mod tests {
             controller.take_commands(),
             vec![],
             "ctrl-modified chords are app-classified and never reach the page"
+        );
+    }
+
+    /// Focus the view's page content and report `editable` from the stub's
+    /// render process.
+    fn focus_page_with_editability(
+        view: &Entity<BrowserView>,
+        controller: &StubTabController,
+        editable: bool,
+        cx: &mut VisualTestContext,
+    ) {
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        controller.script_events([TabBackendEvent::TextInputStateChanged(
+            BrowserTextInputState { editable },
+        )]);
+        pump(cx);
+        controller.take_commands();
+    }
+
+    #[gpui::test]
+    async fn test_editable_focus_reroutes_printable_keys_to_text_input(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        focus_page_with_editability(&view, &controller, true, cx);
+
+        // The printable key leaves the key listeners to GPUI's text-input
+        // path, which commits it through the IME seam — no raw key event.
+        cx.simulate_keystrokes("e");
+        assert_eq!(
+            controller.take_commands(),
+            vec![RecordedCommand::ImeCommitText { text: "e".into() }],
+            "printable keys on an editable field commit as text, not raw key events"
+        );
+
+        // Keys that act on the page keep the raw route even when editable.
+        cx.simulate_keystrokes("left enter");
+        assert_eq!(
+            controller.take_commands(),
+            vec![
+                RecordedCommand::KeyDown {
+                    key: "left".into(),
+                    is_held: false,
+                },
+                RecordedCommand::KeyDown {
+                    key: "enter".into(),
+                    is_held: false,
+                },
+            ],
+            "navigation and enter still reach the page as raw key events"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ime_composition_flows_through_the_seam(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        focus_page_with_editability(&view, &controller, true, cx);
+
+        // Preedit updates mirror into the view and forward to the engine.
+        view.update_in(cx, |view, window, cx| {
+            view.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, cx);
+            assert_eq!(view.ime_marked_text.as_deref(), Some("ni"));
+            assert!(view.text_input_composing());
+            view.replace_and_mark_text_in_range(None, "你", Some(0..1), window, cx);
+        });
+
+        // Committing replaces the composition with final text and clears the
+        // mirrored preedit.
+        view.update_in(cx, |view, window, cx| {
+            view.replace_text_in_range(None, "你好", window, cx);
+            assert_eq!(view.ime_marked_text, None);
+            assert!(!view.text_input_composing());
+        });
+
+        assert_eq!(
+            controller.take_commands(),
+            vec![
+                RecordedCommand::ImeSetComposition {
+                    text: "ni".into(),
+                    selected_range: Some(0..2),
+                },
+                RecordedCommand::ImeSetComposition {
+                    text: "你".into(),
+                    selected_range: Some(0..1),
+                },
+                RecordedCommand::ImeCancelComposition,
+                RecordedCommand::ImeCommitText { text: "你好".into() },
+            ],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_committed_newline_presses_enter(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        focus_page_with_editability(&view, &controller, true, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.replace_text_in_range(None, "\n", window, cx);
+        });
+        assert_eq!(
+            controller.take_commands(),
+            vec![
+                RecordedCommand::KeyDown {
+                    key: "enter".into(),
+                    is_held: false,
+                },
+                RecordedCommand::KeyUp { key: "enter".into() },
+            ],
+            "an IME-committed newline acts as an Enter keypress, not inserted text"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unmark_cancels_the_engine_composition(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        focus_page_with_editability(&view, &controller, true, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, cx);
+            view.unmark_text(window, cx);
+            assert_eq!(view.ime_marked_text, None);
+        });
+        assert_eq!(
+            controller.take_commands(),
+            vec![
+                RecordedCommand::ImeSetComposition {
+                    text: "ni".into(),
+                    selected_range: Some(0..2),
+                },
+                RecordedCommand::ImeCancelComposition,
+            ],
+        );
+
+        // Without marked text, unmark is a no-op and sends nothing.
+        view.update_in(cx, |view, window, cx| view.unmark_text(window, cx));
+        assert_eq!(controller.take_commands(), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_navigation_resets_editability_and_drops_the_composition(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        focus_page_with_editability(&view, &controller, true, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, cx);
+            assert!(view.text_input_enabled());
+        });
+
+        // The page navigates away mid-composition; the new page's focus is
+        // unknown, so keystrokes return to the raw route and the stale
+        // preedit mirror is dropped.
+        controller.script_events([TabBackendEvent::AddressChanged(
+            "https://two.example".into(),
+        )]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert!(!view.active_tab_text_input_state().editable);
+            assert_eq!(view.ime_marked_text, None);
+            assert!(!view.text_input_enabled());
+        });
+
+        controller.take_commands();
+        cx.simulate_keystrokes("e");
+        assert_eq!(
+            controller.take_commands(),
+            vec![RecordedCommand::KeyDown {
+                key: "e".into(),
+                is_held: false,
+            }],
+            "after navigation the printable key is raw-routed again"
         );
     }
 

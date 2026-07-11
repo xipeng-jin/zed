@@ -64,6 +64,14 @@ pub enum RecordedCommand {
     KeyUp {
         key: String,
     },
+    ImeSetComposition {
+        text: String,
+        selected_range: Option<std::ops::Range<usize>>,
+    },
+    ImeCommitText {
+        text: String,
+    },
+    ImeCancelComposition,
     Find {
         query: String,
         forward: bool,
@@ -350,6 +358,23 @@ impl TabBackend for StubTabBackend {
         self.record(RecordedCommand::KeyUp {
             key: keystroke.key.clone(),
         });
+    }
+
+    fn ime_set_composition(&mut self, text: &str, selected_range: Option<std::ops::Range<usize>>) {
+        self.record(RecordedCommand::ImeSetComposition {
+            text: text.to_string(),
+            selected_range,
+        });
+    }
+
+    fn ime_commit_text(&mut self, text: &str) {
+        self.record(RecordedCommand::ImeCommitText {
+            text: text.to_string(),
+        });
+    }
+
+    fn ime_cancel_composition(&mut self) {
+        self.record(RecordedCommand::ImeCancelComposition);
     }
 
     fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {

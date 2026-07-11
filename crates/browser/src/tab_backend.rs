@@ -9,8 +9,10 @@
 
 use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
+use crate::text_input::BrowserTextInputState;
 use anyhow::Result;
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
+use std::ops::Range;
 #[cfg(feature = "cef")]
 use std::sync::mpsc;
 
@@ -124,6 +126,9 @@ pub enum TabBackendEvent {
     /// The page asked to open a URL outside the current browser tab (a
     /// tab-like popup or link-open the engine handlers redirected here).
     OpenTargetRequested(OpenTargetRequest),
+    /// The render process reported whether the page's focused node is
+    /// editable, which drives keystroke routing (ticket #16).
+    TextInputStateChanged(BrowserTextInputState),
 }
 
 /// One software-OSR frame: a tightly-packed premultiplied BGRA buffer at
@@ -145,8 +150,7 @@ pub enum PaintOutput {
 ///
 /// Lifecycle: construct, then [`set_viewport`](Self::set_viewport) with real
 /// dimensions, then [`start`](Self::start) once
-/// [`engine_ready`](Self::engine_ready) reports true. IME composition methods
-/// join with ticket #16.
+/// [`engine_ready`](Self::engine_ready) reports true.
 ///
 /// Input positions are logical pixels relative to the tab's content origin;
 /// the engine converts to device pixels via the viewport scale factor.
@@ -215,6 +219,17 @@ pub trait TabBackend: 'static {
     fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool);
 
     fn send_key_up(&mut self, keystroke: &Keystroke);
+
+    /// Show `text` as the in-progress IME composition (preedit) in the page's
+    /// focused editable field, with `selected_range` as the UTF-16 selection
+    /// within it. Repeated calls replace the composition.
+    fn ime_set_composition(&mut self, text: &str, selected_range: Option<Range<usize>>);
+
+    /// Insert `text` into the focused editable field as committed input.
+    fn ime_commit_text(&mut self, text: &str);
+
+    /// Abandon the in-progress composition, removing the preedit text.
+    fn ime_cancel_composition(&mut self);
 
     /// Start or continue an in-page find. `find_next` distinguishes stepping
     /// through the current query's matches from starting a fresh search;
