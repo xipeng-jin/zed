@@ -50,6 +50,28 @@ pub(crate) fn close_all_browsers() -> usize {
     count
 }
 
+/// Track a browser created outside `CefTab::start` — a native popup window —
+/// so shutdown force-closes it and the message pump keeps its tight sleep cap
+/// while it lives.
+pub(crate) fn register_browser(browser: &cef::Browser) {
+    let browser_id = browser.identifier();
+    log::info!("[browser::tab] registering popup browser id={browser_id}");
+    BROWSER_HANDLES
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(browser_id, browser.clone());
+}
+
+/// Release a tracked browser when its native window closes on its own.
+pub(crate) fn unregister_browser(browser: &cef::Browser) {
+    let browser_id = browser.identifier();
+    if let Some(handles) = BROWSER_HANDLES.lock().as_mut()
+        && handles.remove(&browser_id).is_some()
+    {
+        log::info!("[browser::tab] unregistered popup browser id={browser_id}");
+    }
+}
+
 /// Whether any engine browser is alive. The message pump tightens its sleep
 /// cap while this holds, to keep frame and input latency low.
 pub(crate) fn has_live_browsers() -> bool {

@@ -170,6 +170,21 @@ wrap_app! {
                     Some(&"metal".into()),
                 );
             }
+            #[cfg(target_os = "linux")]
+            {
+                // Pin Chromium's windowing to X11 (risk R1: "accept
+                // XWayland"). Left to auto-detection, ozone picks Wayland
+                // from the session environment even when GPUI runs on X11,
+                // and native popup windows (ticket #15) then open on the
+                // Wayland session half-broken: GPU compositing fails
+                // ("--ozone-platform=wayland is not compatible with Vulkan")
+                // and the window cannot be closed. Under a Wayland session
+                // the X11 path runs via XWayland, which popups handle fine.
+                command_line.append_switch_with_value(
+                    Some(&"ozone-platform".into()),
+                    Some(&"x11".into()),
+                );
+            }
             command_line.append_switch(Some(&"ignore-gpu-blocklist".into()));
             command_line.append_switch(Some(&"enable-gpu-rasterization".into()));
             command_line.append_switch(Some(&"enable-zero-copy".into()));

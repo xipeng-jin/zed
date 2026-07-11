@@ -450,6 +450,15 @@ Gate: **usable as a daily browser on Linux; Gmail and GitHub login flows work
    `ctrl-l`, `ctrl-r`, `ctrl-f`, `ctrl-tab`/`ctrl-shift-tab`, `alt-left`/`alt-right`)
    + `browser` settings section (search engine, new-tab behavior, download dir).
 9. UA spoofing carried over (Google sign-in); re-verify it is still needed.
+   *Re-verified (2026-07-11, ticket #15):* with the spoofed UA, Google's
+   sign-in form renders with no "browser not secure" interstitial, both on
+   direct navigation and inside a third-party `signInWithPopup` window.
+   Whether the spoof is *still required* is inconclusive without a
+   credentialed sign-in: with the spoof disabled, the page also renders at
+   load — Glass's documented rejection (400 on the browserinfo fingerprint)
+   fires at credential submission, which validation could not exercise. The
+   spoof is kept (harmless, and the failure it guards against is
+   post-submission).
 
 ### M3 — Platform breadth + extras
 
@@ -489,6 +498,16 @@ Gate: soft — items are independent.
   session it runs via XWayland, and native popup windows (OAuth) may behave oddly.
   Ozone/Wayland flags exist but are not part of the plan. Mitigation: validate on
   both; accept XWayland. *(inferred from Chromium platform status; verify in M1)*
+  **Validated (2026-07-11, ticket #15): materialized, fixed.** Left to
+  auto-detection, Chromium's ozone picked Wayland from the session environment
+  even with `WAYLAND_DISPLAY` unset for GPUI (it sniffs `XDG_SESSION_TYPE`/the
+  runtime dir socket), and popup windows opened on the Wayland session
+  half-broken: GPU compositing failed (`--ozone-platform=wayland is not
+  compatible with Vulkan`), the window took no input, ignored close requests,
+  and hung `cef::shutdown()`. Fix: `cef_instance.rs` pins
+  `ozone-platform=x11`, exactly the "accept XWayland" mitigation — under a
+  Wayland session CEF windows are XWayland windows, which behaved correctly in
+  validation.
 - **R2 — Sandbox disabled.** Glass runs `no_sandbox=1` everywhere. On Linux the
   Chromium sandbox needs user namespaces or a SUID helper; keeping `no_sandbox` is
   the pragmatic M1 choice but is a real security tradeoff for a daily-driver browser.
@@ -496,6 +515,23 @@ Gate: soft — items are independent.
   documented deliberately).
 - **R3 — Native popup windows on Linux.** The OAuth path creates non-OSR CEF windows;
   unowned by GPUI. Focus/stacking behavior needs empirical validation (M2 step 6).
+  **Validated (2026-07-11, ticket #15): works, with two required fixes.**
+  (a) The ozone pin from R1. (b) With `external_message_pump=1` on Linux,
+  Chromium's X11 event source attaches to the default GMainContext, which CEF's
+  `do_message_loop_work` does *not* iterate — the embedder is expected to run a
+  GLib loop (cefclient gets this from GTK). Without it, popup windows render
+  and run JS but never receive input and ignore `WM_DELETE_WINDOW`. Fix: the
+  message pump (`browser.rs`) iterates the default GMainContext, non-blocking,
+  every pump cycle (Linux only, via `glib-sys`, already in the tree through
+  libwebrtc). After both fixes, a full `signInWithPopup`-style flow was driven
+  end to end on Xwayland: native 520×640 popup, WM focus, native typing,
+  `window.opener.postMessage` back into the OSR opener tab, `window.close()`.
+  Popup browsers are registered in the browser-handle registry (deviation from
+  Glass, which leaves them untracked) so quit-with-popup-open force-closes them
+  — validated twice, including once against a deliberately wedged popup.
+  Residual: popups need a window manager for focus (any real session has one);
+  focus/stacking against a *native-Wayland* zed window is compositor-mediated
+  and was not separately exercised.
 - **R4 — Software-OSR performance.** Full-pane 60fps repaints (video, heavy
   animation) may tax the CPU copy + upload. The presenter seam exists precisely so a
   dmabuf path can be added; do not pre-build it.

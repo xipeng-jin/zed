@@ -10,7 +10,7 @@
 use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
-use crate::tab_backend::{TabBackend, TabBackendEvent};
+use crate::tab_backend::{OpenTargetRequest, TabBackend, TabBackendEvent};
 use gpui::{
     AnyElement, Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta, SharedString,
     SharedUri, Window,
@@ -47,6 +47,9 @@ pub(crate) struct DrainedChanges {
     /// The page requested a context menu; the view renders it. Only the last
     /// request in a drain survives (they cannot stack).
     pub context_menu: Option<ContextMenuContext>,
+    /// Page-initiated requests to open URLs in new browser tabs (redirected
+    /// popups and link-opens targeting tabs), in arrival order.
+    pub open_targets: Vec<OpenTargetRequest>,
 }
 
 pub(crate) struct BrowserTab {
@@ -270,6 +273,9 @@ impl BrowserTab {
                 }
                 TabBackendEvent::ContextMenuRequested(context) => {
                     changes.context_menu = Some(context);
+                }
+                TabBackendEvent::OpenTargetRequested(request) => {
+                    changes.open_targets.push(request);
                 }
             }
         }

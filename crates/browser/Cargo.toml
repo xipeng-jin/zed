@@ -16,7 +16,7 @@ doctest = false
 # The real CEF engine. Off by default so the crate's deterministic tests build
 # and run with no CEF distribution present (ticket #8); `crates/zed` turns it
 # on for the shipped binary.
-cef = ["dep:cef"]
+cef = ["dep:cef", "dep:glib-sys"]
 # Exposes the scripted stub tab backend and the message-pump simulation for
 # tests in dependent crates.
 test-support = []
@@ -45,6 +45,13 @@ zed_actions.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 cef = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The message pump must iterate the default GMainContext on Linux: Chromium's
+# X11 event source attaches there, and native popup windows go input-dead
+# without it (see `start_message_pump`). Already in the dependency tree via
+# libwebrtc.
+glib-sys = { version = "0.21", optional = true }
 
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }

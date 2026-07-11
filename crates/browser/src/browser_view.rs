@@ -19,7 +19,7 @@ use crate::downloads::BrowserDownloads;
 use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
-use crate::tab_backend::TabBackend;
+use crate::tab_backend::{BrowserTabOpenTarget, OpenTargetRequest, TabBackend};
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, actions::SelectAll as EditorSelectAll};
@@ -178,6 +178,11 @@ pub struct BrowserView {
     /// A context-menu request drained from the engine, which happens off the
     /// window (in the pump observer); the next render opens it.
     pending_context_menu: Option<ContextMenuContext>,
+    /// Page-initiated open-target requests (redirected popups and link-opens
+    /// targeting tabs) drained from the engine; the next render opens them as
+    /// browser tabs, where a window is available
+    /// (`Glass:crates/browser/src/browser_view/tabs.rs:74`).
+    pending_tab_opens: Vec<OpenTargetRequest>,
     /// The workspace this view was added to, for showing status toasts.
     workspace: Option<WeakEntity<Workspace>>,
     /// Window-relative bounds of the page content area, captured at draw time;
@@ -311,6 +316,7 @@ impl BrowserView {
             _find_editor_subscription: None,
             context_menu: None,
             pending_context_menu: None,
+            pending_tab_opens: Vec::new(),
             workspace: None,
             content_bounds: Bounds::default(),
             is_incognito,
@@ -567,9 +573,11 @@ impl BrowserView {
         let mut download_updates = Vec::new();
         let mut active_find_result = None;
         let mut active_context_menu = None;
+        let mut open_targets = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let mut changes = tab.drain_events();
             download_updates.append(&mut changes.downloads);
+            open_targets.append(&mut changes.open_targets);
             if index == self.active_tab_index {
                 // Find results and context-menu requests from inactive tabs
                 // are stale by definition: their overlays are not on screen.
@@ -614,6 +622,12 @@ impl BrowserView {
         }
         if let Some(context) = active_context_menu {
             self.pending_context_menu = Some(context);
+            needs_notify = true;
+        }
+        if !open_targets.is_empty() {
+            // Opening a foreground tab needs a window; queue for the next
+            // render, like context-menu requests.
+            self.pending_tab_opens.append(&mut open_targets);
             needs_notify = true;
         }
         if session_changed {
@@ -875,6 +889,30 @@ impl BrowserView {
         self.tabs.push(tab);
         self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    /// Open the queued page-initiated open-target requests as browser tabs
+    /// (`Glass:crates/browser/src/browser_view/tabs.rs:85`). A foreground
+    /// request activates its tab immediately — the user just clicked the link
+    /// that asked for it; a background request only joins the strip.
+    fn process_pending_tab_opens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let requests = std::mem::take(&mut self.pending_tab_opens);
+        for request in requests {
+            let Some(target) = request.disposition.app_tab_target() else {
+                continue;
+            };
+            match target {
+                BrowserTabOpenTarget::Foreground => {
+                    let tab = self.create_tab(request.url);
+                    self.tabs.push(tab);
+                    self.activate_tab(self.tabs.len() - 1, window, cx);
+                    self.schedule_session_save(cx);
+                }
+                BrowserTabOpenTarget::Background => {
+                    self.open_in_new_background_tab(request.url, cx);
+                }
+            }
+        }
     }
 
     /// Copy the active tab's URL and confirm with a status toast.
@@ -1806,6 +1844,9 @@ impl Render for BrowserView {
         if let Some(context) = self.pending_context_menu.take() {
             self.open_context_menu(context, window, cx);
         }
+        if !self.pending_tab_opens.is_empty() {
+            self.process_pending_tab_opens(window, cx);
+        }
 
         let is_new_tab_page = self.active_tab().is_new_tab_page();
         let frame = if is_new_tab_page {
@@ -2083,7 +2124,7 @@ mod tests {
     use crate::downloads::DownloadUpdate;
     use crate::omnibox::OmniboxSuggestion;
     use crate::stub_tab_backend::{RecordedCommand, StubBackendFactory, StubTabController};
-    use crate::tab_backend::{SoftwareFrame, TabBackendEvent};
+    use crate::tab_backend::{OpenDisposition, SoftwareFrame, TabBackendEvent};
     use gpui::{
         Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext, point, size,
     };
@@ -4099,6 +4140,51 @@ mod tests {
             Some("https://example.com/docs".to_string()),
             "CopyUrl puts the active tab's address on the clipboard"
         );
+    }
+
+    #[gpui::test]
+    async fn test_engine_open_target_requests_open_browser_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://opener.example", cx);
+        let controller = factory.controller(0);
+
+        // A redirected popup with a foreground disposition (e.g. a
+        // `window.open` targeting a tab, or a link resolved to NEW_WINDOW)
+        // opens and activates a new browser tab.
+        controller.script_events([TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
+            url: "https://foreground.example".into(),
+            disposition: OpenDisposition::NewForegroundTab,
+            user_gesture: true,
+            is_popup_request: true,
+        })]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active_tab_index, 1);
+            assert_eq!(view.active_tab().url(), "https://foreground.example");
+        });
+        // The activated tab's engine starts at the requested URL on the draw
+        // that followed activation.
+        assert_eq!(
+            factory.controller(1).started_with().as_deref(),
+            Some("https://foreground.example")
+        );
+
+        // A background disposition (middle-click, ctrl-click) adds the tab
+        // without stealing activation; its engine waits until activated.
+        controller.script_events([TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
+            url: "https://background.example".into(),
+            disposition: OpenDisposition::NewBackgroundTab,
+            user_gesture: true,
+            is_popup_request: false,
+        })]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 3);
+            assert_eq!(view.active_tab_index, 1);
+            assert_eq!(view.tabs[2].url(), "https://background.example");
+        });
+        assert_eq!(factory.controller(2).started_with(), None);
     }
 
     fn download_update(id: u32) -> DownloadUpdate {

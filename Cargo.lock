@@ -2457,6 +2457,7 @@ dependencies = [
  "db",
  "editor",
  "fuzzy",
+ "glib-sys",
  "gpui",
  "image",
  "log",

@@ -45,7 +45,11 @@ mod life_span_handler;
 #[cfg(feature = "cef")]
 mod load_handler;
 #[cfg(feature = "cef")]
+mod permission_handler;
+#[cfg(feature = "cef")]
 mod render_handler;
+#[cfg(feature = "cef")]
+mod request_handler;
 #[cfg(feature = "cef")]
 mod tab;
 
@@ -65,7 +69,10 @@ pub use frame_presenter::{FramePresenter, SoftwarePresenter};
 pub use stub_tab_backend::{
     RecordedCommand, StubBackendFactory, StubTabBackend, StubTabController,
 };
-pub use tab_backend::{PaintOutput, SoftwareFrame, TabBackend, TabBackendEvent};
+pub use tab_backend::{
+    BrowserTabOpenTarget, OpenDisposition, OpenTargetRequest, PaintOutput, SoftwareFrame,
+    TabBackend, TabBackendEvent,
+};
 
 use gpui::App;
 
@@ -160,6 +167,14 @@ fn start_message_pump(cx: &mut App) {
 
     cx.spawn(async move |cx| {
         while CefInstance::is_initialized() {
+            // Chromium's X11 event source attaches to the thread's default
+            // GMainContext, which nothing else iterates — CEF's external pump
+            // expects the embedder to run a GLib loop on Linux (cefclient
+            // does, via GTK). Without this, native popup windows (ticket #15)
+            // render but never receive input or close events.
+            #[cfg(target_os = "linux")]
+            pump_glib_main_context();
+
             if CefInstance::should_pump() {
                 CefInstance::pump_messages();
                 cx.update(run_pump_observers);
@@ -178,4 +193,22 @@ fn start_message_pump(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Dispatch any ready GLib sources on the default main context without
+/// blocking, bounded in case a dispatched source keeps re-arming.
+#[cfg(all(feature = "cef", target_os = "linux"))]
+fn pump_glib_main_context() {
+    for _ in 0..16 {
+        // SAFETY: null means the default context; FALSE means do not block.
+        // Called only from the thread that initialized CEF (the foreground
+        // thread), matching GLib's ownership expectations for the default
+        // context.
+        let dispatched = unsafe {
+            glib_sys::g_main_context_iteration(std::ptr::null_mut(), glib_sys::GFALSE)
+        };
+        if dispatched == glib_sys::GFALSE {
+            break;
+        }
+    }
 }

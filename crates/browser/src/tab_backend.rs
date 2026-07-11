@@ -14,6 +14,78 @@ use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
 #[cfg(feature = "cef")]
 use std::sync::mpsc;
 
+/// Where an engine-initiated open lands in the browser view's tab strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserTabOpenTarget {
+    /// The new browser tab is activated immediately.
+    Foreground,
+    /// The new browser tab joins the strip without taking over.
+    Background,
+}
+
+/// How a page asked for a navigation target to be opened, mapped from the
+/// engine's window-open disposition
+/// (`Glass:crates/browser/src/events.rs:41-108`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDisposition {
+    Unknown,
+    CurrentTab,
+    SingletonTab,
+    NewForegroundTab,
+    NewBackgroundTab,
+    NewPopup,
+    NewWindow,
+    SaveToDisk,
+    OffTheRecord,
+    IgnoreAction,
+    SwitchToTab,
+    NewPictureInPicture,
+}
+
+impl OpenDisposition {
+    /// Dispositions the app redirects into its own browser tab flow instead of
+    /// letting the engine create a window. The browser view has no separate
+    /// windows, so window-like dispositions land as foreground tabs.
+    pub fn app_tab_target(self) -> Option<BrowserTabOpenTarget> {
+        match self {
+            Self::NewForegroundTab | Self::NewWindow | Self::OffTheRecord | Self::SwitchToTab => {
+                Some(BrowserTabOpenTarget::Foreground)
+            }
+            Self::NewBackgroundTab => Some(BrowserTabOpenTarget::Background),
+            Self::Unknown
+            | Self::CurrentTab
+            | Self::SingletonTab
+            | Self::NewPopup
+            | Self::SaveToDisk
+            | Self::IgnoreAction
+            | Self::NewPictureInPicture => None,
+        }
+    }
+
+    /// Whether the engine may host this open as a real native window. Only
+    /// genuine popups (OAuth/login windows) qualify; they need native opener
+    /// semantics (`window.opener`, postMessage) to complete their flows.
+    pub fn allow_native_popup(self) -> bool {
+        matches!(self, Self::NewPopup)
+    }
+}
+
+/// A page-initiated request to open `url` somewhere other than the current
+/// browser tab, surfaced to the browser view for routing.
+///
+/// `user_gesture` and `is_popup_request` are not consulted yet; they are
+/// carried from Glass's `OpenTargetRequest` so a future popup-blocking policy
+/// (gate non-gestured opens) has the signal it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTargetRequest {
+    pub url: String,
+    pub disposition: OpenDisposition,
+    pub user_gesture: bool,
+    /// True when the request came from popup creation (`on_before_popup`)
+    /// rather than a link-open (`on_open_urlfrom_tab`).
+    pub is_popup_request: bool,
+}
+
 /// Events flowing from the engine to the app, drained on the foreground thread
 /// after each message-pump iteration.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +121,9 @@ pub enum TabBackendEvent {
     /// The user right-clicked the page; the app renders the menu (OSR
     /// suppresses the engine's own).
     ContextMenuRequested(ContextMenuContext),
+    /// The page asked to open a URL outside the current browser tab (a
+    /// tab-like popup or link-open the engine handlers redirected here).
+    OpenTargetRequested(OpenTargetRequest),
 }
 
 /// One software-OSR frame: a tightly-packed premultiplied BGRA buffer at
@@ -197,5 +272,113 @@ pub(crate) fn event_channel() -> (EventSender, EventReceiver) {
 pub(crate) fn send_event(sender: &EventSender, event: TabBackendEvent) {
     if sender.send(event).is_err() {
         log::trace!("[browser] dropped engine event: tab backend receiver closed");
+    }
+}
+
+/// Shared gate for the life-span and request handlers: if `disposition` is
+/// tab-like and the target URL is real, emit an
+/// [`TabBackendEvent::OpenTargetRequested`] and report true so the caller
+/// takes over the open from the engine.
+#[cfg(feature = "cef")]
+pub(crate) fn redirect_open_target_to_tab(
+    sender: &EventSender,
+    target_url: Option<String>,
+    disposition: OpenDisposition,
+    user_gesture: bool,
+    is_popup_request: bool,
+) -> bool {
+    if disposition.app_tab_target().is_none() {
+        return false;
+    }
+    let Some(url) = target_url.filter(|url| !url.is_empty()) else {
+        return false;
+    };
+    send_event(
+        sender,
+        TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
+            url,
+            disposition,
+            user_gesture,
+            is_popup_request,
+        }),
+    );
+    true
+}
+
+#[cfg(feature = "cef")]
+impl From<cef::WindowOpenDisposition> for OpenDisposition {
+    fn from(value: cef::WindowOpenDisposition) -> Self {
+        use cef::WindowOpenDisposition;
+        if value == WindowOpenDisposition::CURRENT_TAB {
+            Self::CurrentTab
+        } else if value == WindowOpenDisposition::SINGLETON_TAB {
+            Self::SingletonTab
+        } else if value == WindowOpenDisposition::NEW_FOREGROUND_TAB {
+            Self::NewForegroundTab
+        } else if value == WindowOpenDisposition::NEW_BACKGROUND_TAB {
+            Self::NewBackgroundTab
+        } else if value == WindowOpenDisposition::NEW_POPUP {
+            Self::NewPopup
+        } else if value == WindowOpenDisposition::NEW_WINDOW {
+            Self::NewWindow
+        } else if value == WindowOpenDisposition::SAVE_TO_DISK {
+            Self::SaveToDisk
+        } else if value == WindowOpenDisposition::OFF_THE_RECORD {
+            Self::OffTheRecord
+        } else if value == WindowOpenDisposition::IGNORE_ACTION {
+            Self::IgnoreAction
+        } else if value == WindowOpenDisposition::SWITCH_TO_TAB {
+            Self::SwitchToTab
+        } else if value == WindowOpenDisposition::NEW_PICTURE_IN_PICTURE {
+            Self::NewPictureInPicture
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrowserTabOpenTarget, OpenDisposition};
+
+    #[test]
+    fn tab_like_dispositions_are_app_managed() {
+        assert_eq!(
+            OpenDisposition::NewForegroundTab.app_tab_target(),
+            Some(BrowserTabOpenTarget::Foreground),
+        );
+        assert_eq!(
+            OpenDisposition::NewBackgroundTab.app_tab_target(),
+            Some(BrowserTabOpenTarget::Background),
+        );
+        assert_eq!(
+            OpenDisposition::NewWindow.app_tab_target(),
+            Some(BrowserTabOpenTarget::Foreground),
+        );
+        assert_eq!(
+            OpenDisposition::SwitchToTab.app_tab_target(),
+            Some(BrowserTabOpenTarget::Foreground),
+        );
+    }
+
+    #[test]
+    fn popup_disposition_is_left_to_native_popup_handling() {
+        assert_eq!(OpenDisposition::NewPopup.app_tab_target(), None);
+        assert!(OpenDisposition::NewPopup.allow_native_popup());
+    }
+
+    #[test]
+    fn non_navigation_dispositions_are_neither_tab_nor_popup() {
+        for disposition in [
+            OpenDisposition::Unknown,
+            OpenDisposition::CurrentTab,
+            OpenDisposition::SingletonTab,
+            OpenDisposition::SaveToDisk,
+            OpenDisposition::IgnoreAction,
+            OpenDisposition::NewPictureInPicture,
+        ] {
+            assert_eq!(disposition.app_tab_target(), None);
+            assert!(!disposition.allow_native_popup());
+        }
     }
 }
