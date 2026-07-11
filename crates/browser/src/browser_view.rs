@@ -12,6 +12,7 @@
 //! presenter, so this file is platform-neutral and testable with a scripted
 //! stub backend.
 
+use crate::bookmarks::{Bookmark, BrowserBookmarks};
 use crate::browser_tab::{BrowserTab, ClosedTab};
 use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
@@ -20,15 +21,19 @@ use crate::tab_backend::TabBackend;
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString, SharedUri,
-    Subscription, Task, WeakEntity, Window, actions, canvas, div, img,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString,
+    SharedUri, Subscription, Task, WeakEntity, Window, actions, canvas, div, img,
 };
+use notifications::status_toast::StatusToast;
 use project::Project;
 use std::sync::Arc;
 use std::time::Duration;
-use ui::{CommonAnimationExt, IconButtonShape, Tab, TabPosition, Tooltip, prelude::*};
+use ui::{
+    CommonAnimationExt, ContextMenu, IconButtonShape, Tab, TabPosition, Tooltip, prelude::*,
+    right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent};
 use workspace::{ItemId, Workspace, WorkspaceId};
@@ -60,6 +65,10 @@ actions!(
         PinTab,
         /// Unpins the active browser tab.
         UnpinTab,
+        /// Bookmarks the current page, or removes the existing bookmark.
+        BookmarkCurrentPage,
+        /// Copies the current page's URL to the clipboard.
+        CopyUrl,
     ]
 );
 
@@ -127,6 +136,10 @@ pub struct BrowserView {
     /// The app-wide shared browsing history; this view records visits into it
     /// (unless incognito) and the omnibox suggests from it.
     history: Entity<BrowserHistory>,
+    /// The app-wide shared bookmarks, shown as the bookmark bar.
+    bookmarks: Entity<BrowserBookmarks>,
+    /// The workspace this view was added to, for showing status toasts.
+    workspace: Option<WeakEntity<Workspace>>,
     /// Window-relative bounds of the page content area, captured at draw time;
     /// pointer events are translated into content-relative coordinates with
     /// its origin before crossing the tab-backend seam.
@@ -138,6 +151,9 @@ pub struct BrowserView {
     /// Debounced session write; replacing it pushes the deadline out.
     pending_session_save: Option<Task<()>>,
     _quit_flush: Subscription,
+    /// Bookmark mutations re-render this view's bookmark bar and chrome,
+    /// whichever browser view made them.
+    _bookmarks_observation: Subscription,
 }
 
 /// M1 subset of Glass's three-way key dispatch
@@ -221,6 +237,8 @@ impl BrowserView {
         .detach();
 
         let history = BrowserHistory::global(cx);
+        let bookmarks = BrowserBookmarks::global(cx);
+        let bookmarks_observation = cx.observe(&bookmarks, |_, _, cx| cx.notify());
         let omnibox = cx.new(|cx| Omnibox::new(history.clone(), window, cx));
         cx.subscribe_in(&omnibox, window, |this, _, event, window, cx| {
             let OmniboxEvent::Navigate(url) = event;
@@ -237,10 +255,13 @@ impl BrowserView {
             next_tab_id: 0,
             omnibox,
             history,
+            bookmarks,
+            workspace: None,
             content_bounds: Bounds::default(),
             is_incognito,
             pending_session_save: None,
             _quit_flush: cx.on_app_quit(Self::flush_session_on_quit),
+            _bookmarks_observation: bookmarks_observation,
         };
 
         let saved = if initial_url.is_none() && Self::is_session_owner(cx) {
@@ -715,6 +736,82 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// Bookmark the active tab's page, or drop the existing bookmark. A page
+    /// with no address (a new-tab page) cannot be bookmarked.
+    fn toggle_bookmark_for_active_tab(&mut self, cx: &mut Context<Self>) {
+        let tab = self.active_tab();
+        let url = tab.url().to_string();
+        if tab.is_new_tab_page() || url.is_empty() {
+            return;
+        }
+        let title = tab.title().to_string();
+        let title = if title.is_empty() || title == "New Tab" {
+            Self::bookmark_fallback_title(&url).to_string()
+        } else {
+            title
+        };
+        let favicon_url = tab.favicon_url().map(|favicon_url| favicon_url.to_string());
+        self.bookmarks.update(cx, |bookmarks, cx| {
+            if bookmarks.is_bookmarked(&url) {
+                bookmarks.remove(&url, cx);
+            } else {
+                bookmarks.add(url, title, favicon_url, cx);
+            }
+        });
+    }
+
+    /// An untitled page's bookmark reads as its address without the scheme
+    /// and `www.` noise (`Glass:crates/browser/src/browser_view/bookmarks.rs:57`).
+    fn bookmark_fallback_title(url: &str) -> &str {
+        let stripped = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        stripped.strip_prefix("www.").unwrap_or(stripped)
+    }
+
+    fn remove_bookmark(&mut self, url: &str, cx: &mut Context<Self>) {
+        self.bookmarks.update(cx, |bookmarks, cx| {
+            bookmarks.remove(url, cx);
+        });
+    }
+
+    /// Open a bookmark in a new background browser tab: the strip gains the
+    /// tab but the current page keeps focus, so several bookmarks can be
+    /// opened in a row. The tab's engine starts when it is first activated,
+    /// like a restored tab's.
+    fn open_in_new_background_tab(&mut self, url: String, cx: &mut Context<Self>) {
+        let tab = self.create_tab(url);
+        self.tabs.push(tab);
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// Copy the active tab's URL and confirm with a status toast.
+    fn copy_url(&mut self, cx: &mut Context<Self>) {
+        let url = self.active_tab().url().to_string();
+        if url.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+
+        // Without a workspace (a view not yet added to one) there is nowhere
+        // to anchor the toast; the copy itself already happened.
+        let Some(workspace) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+        else {
+            return;
+        };
+        let toast = StatusToast::new("URL copied to clipboard", cx, |this, _| {
+            this.icon(Icon::new(IconName::Check).color(Color::Success))
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_status_toast(toast, cx);
+        });
+    }
+
     fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -993,10 +1090,124 @@ impl BrowserView {
             )
     }
 
+    fn render_bookmark_chip(
+        &self,
+        index: usize,
+        bookmark: Bookmark,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title: SharedString = if bookmark.title.is_empty() {
+            Self::bookmark_fallback_title(&bookmark.url)
+                .to_string()
+                .into()
+        } else {
+            bookmark.title.clone().into()
+        };
+        let glyph = match bookmark.favicon_url.clone() {
+            Some(favicon_url) => img(SharedUri::from(favicon_url))
+                .size_4()
+                .with_fallback(Self::globe_icon)
+                .into_any_element(),
+            None => Self::globe_icon(),
+        };
+        let view = cx.entity().downgrade();
+        let url = bookmark.url;
+        let hover_background = cx.theme().colors().element_hover;
+
+        let chip = div()
+            .id(("browser-bookmark-chip", index))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(20.))
+            .px_1p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_background))
+            .tooltip(Tooltip::text(SharedString::from(url.clone())))
+            .on_click(cx.listener({
+                let url = url.clone();
+                move |this, event: &ClickEvent, window, cx| {
+                    if event.modifiers().secondary() {
+                        this.open_in_new_background_tab(url.clone(), cx);
+                    } else {
+                        this.navigate_to(url.clone(), window, cx);
+                    }
+                }
+            }))
+            .child(glyph)
+            .child(
+                div()
+                    .max_w_32()
+                    .child(Label::new(title).size(LabelSize::Small).truncate()),
+            );
+
+        right_click_menu(("browser-bookmark", index))
+            .trigger(move |_, _, _| chip)
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let url = url.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Open in New Tab", None, {
+                        let view = view.clone();
+                        let url = url.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.open_in_new_background_tab(url.clone(), cx);
+                            })
+                            .ok();
+                        }
+                    })
+                    .entry("Remove Bookmark", None, {
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.remove_bookmark(&url, cx);
+                            })
+                            .ok();
+                        }
+                    })
+                })
+            })
+            .into_any_element()
+    }
+
+    /// The bookmark bar: one chip per bookmark, under the navigation chrome.
+    /// Absent while no bookmarks exist.
+    fn render_bookmark_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let bookmarks = self.bookmarks.read(cx).bookmarks().to_vec();
+        if bookmarks.is_empty() {
+            return None;
+        }
+        let chips = bookmarks
+            .into_iter()
+            .enumerate()
+            .map(|(index, bookmark)| self.render_bookmark_chip(index, bookmark, cx))
+            .collect::<Vec<_>>();
+        Some(
+            h_flex()
+                .id("browser-bookmark-bar")
+                .w_full()
+                .flex_none()
+                .h(px(26.))
+                .px_1p5()
+                .gap_1()
+                .items_center()
+                .overflow_x_scroll()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().tab_bar_background)
+                .children(chips),
+        )
+    }
+
     fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tab = self.active_tab();
         let title = active_tab.title().trim().to_string();
         let is_loading = active_tab.is_loading();
+        let can_bookmark = !active_tab.is_new_tab_page() && !active_tab.url().is_empty();
+        let is_bookmarked = can_bookmark && self.bookmarks.read(cx).is_bookmarked(active_tab.url());
         h_flex()
             .w_full()
             .flex_none()
@@ -1038,6 +1249,21 @@ impl BrowserView {
                     .child(Self::favicon_element(active_tab)),
             )
             .child(self.omnibox.clone())
+            .child(
+                IconButton::new("browser-bookmark-page", IconName::Bookmark)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(is_bookmarked)
+                    .disabled(!can_bookmark)
+                    .when(is_bookmarked, |this| this.icon_color(Color::Accent))
+                    .tooltip(Tooltip::text(if is_bookmarked {
+                        "Remove Bookmark"
+                    } else {
+                        "Bookmark This Page"
+                    }))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_bookmark_for_active_tab(cx)
+                    })),
+            )
             .when(!title.is_empty(), |this| {
                 this.child(
                     div().flex_none().max_w_64().child(
@@ -1148,10 +1374,15 @@ impl Render for BrowserView {
                     this.unpin_tab_at(this.active_tab_index, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &BookmarkCurrentPage, _, cx| {
+                this.toggle_bookmark_for_active_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyUrl, _, cx| this.copy_url(cx)))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .child(self.render_tab_strip(cx))
             .child(self.render_chrome(cx))
+            .children(self.render_bookmark_bar(cx))
             .child(content)
     }
 }
@@ -1212,10 +1443,11 @@ impl Item for BrowserView {
 
     fn added_to_workspace(
         &mut self,
-        _workspace: &mut Workspace,
+        workspace: &mut Workspace,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.workspace = Some(workspace.weak_handle());
         // Re-claim after the release in `on_removed` when the removal was a
         // move to another pane; a no-op when this view already owns the slot.
         Self::claim_session_ownership(self.is_incognito, cx);
@@ -3145,6 +3377,175 @@ mod tests {
             controller.take_commands(),
             vec![],
             "cancelling never navigates"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_bookmark_current_page_toggles_and_persists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://example.com", cx);
+        factory.controller(0).script_events([
+            TabBackendEvent::TitleChanged("Example".into()),
+            TabBackendEvent::FaviconUrlsChanged(vec!["https://example.com/favicon.ico".into()]),
+        ]);
+        pump(cx);
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(BookmarkCurrentPage);
+        view.update(cx, |view, cx| {
+            let bookmarks = view.bookmarks.read(cx);
+            assert!(bookmarks.is_bookmarked("https://example.com"));
+            assert_eq!(bookmarks.bookmarks()[0].title, "Example");
+            assert_eq!(
+                bookmarks.bookmarks()[0].favicon_url.as_deref(),
+                Some("https://example.com/favicon.ico"),
+                "the bookmark captures the page's favicon for its bar chip"
+            );
+        });
+        cx.executor()
+            .advance_clock(crate::bookmarks::BOOKMARKS_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore_bookmarks(cx)).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].url, "https://example.com");
+
+        // The same action on a bookmarked page removes the bookmark, and the
+        // removal persists too.
+        cx.dispatch_action(BookmarkCurrentPage);
+        view.update(cx, |view, cx| {
+            assert!(!view.bookmarks.read(cx).is_bookmarked("https://example.com"));
+        });
+        cx.executor()
+            .advance_clock(crate::bookmarks::BOOKMARKS_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx.update(|_, cx| session::restore_bookmarks(cx)).unwrap();
+        assert!(saved.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_a_new_tab_page_cannot_be_bookmarked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, _factory) = stub_view(true, "https://example.com", cx);
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(NewTab);
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(BookmarkCurrentPage);
+        view.update(cx, |view, cx| {
+            assert!(
+                view.bookmarks.read(cx).bookmarks().is_empty(),
+                "a page with no address cannot be bookmarked"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_restore_across_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Save a bookmark as a previous run would have.
+        let json = serde_json::to_string(&vec![crate::bookmarks::Bookmark {
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            favicon_url: None,
+        }])
+        .unwrap();
+        cx.update(|cx| {
+            let store = KeyValueStore::global(cx);
+            cx.background_spawn(async move { session::save_bookmarks(store, json).await })
+        })
+        .await
+        .unwrap();
+
+        // A fresh view — as a restarted app would create — sees the bookmark.
+        let (view, cx, _factory) = stub_view(true, "https://example.com", cx);
+        view.update(cx, |view, cx| {
+            let bookmarks = view.bookmarks.read(cx);
+            assert!(bookmarks.is_bookmarked("https://example.com"));
+            assert_eq!(bookmarks.bookmarks()[0].title, "Example");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bookmarks_open_into_the_active_tab_or_a_background_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, "https://start.example", cx);
+
+        // A plain chip click navigates the active tab.
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://one.example".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            factory
+                .controller(0)
+                .take_commands()
+                .contains(&RecordedCommand::Navigate {
+                    url: "https://one.example".into(),
+                })
+        );
+
+        // Open-in-new-tab (chip context menu, secondary-modifier click) adds
+        // a background tab: the strip grows but the active tab keeps focus,
+        // and the new tab's engine stays unstarted until activated.
+        view.update(cx, |view, cx| {
+            view.open_in_new_background_tab("https://two.example".to_string(), cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active_tab_index, 0);
+            assert_eq!(view.tabs[1].url(), "https://two.example");
+        });
+        assert_eq!(factory.controller(1).started_with(), None);
+
+        // Activating it starts its engine at the bookmarked URL.
+        view.update_in(cx, |view, window, cx| {
+            view.activate_tab(1, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            factory.controller(1).started_with().as_deref(),
+            Some("https://two.example")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_url_writes_the_clipboard(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let factory = StubBackendFactory::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let factory = factory.clone();
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
+        });
+        cx.run_until_parked();
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to("https://example.com/docs".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(CopyUrl);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("https://example.com/docs".to_string()),
+            "CopyUrl puts the active tab's address on the clipboard"
         );
     }
 }

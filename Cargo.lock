@@ -2461,6 +2461,7 @@ dependencies = [
  "image",
  "log",
  "menu",
+ "notifications",
  "parking_lot",
  "paths",
  "project",

@@ -11,6 +11,7 @@
 //! above the tab-backend seam, so its deterministic tests build and run with
 //! no CEF distribution present (ticket #8).
 
+mod bookmarks;
 mod browser_tab;
 mod browser_view;
 mod frame_presenter;
