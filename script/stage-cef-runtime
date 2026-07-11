@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Stage the CEF runtime files next to a dev binary on Linux
+# (docs/glass/developer-setup.md). CEF resolves icudtl.dat, the .pak resource
+# bundles, and locales/ relative to the directory containing libcef.so (the
+# "module directory"), so a self-contained layout needs the library and all
+# resources in the binary's directory. Day-to-day development can skip this
+# and point LD_LIBRARY_PATH at $CEF_PATH instead, which makes $CEF_PATH itself
+# the module directory.
+#
+# Usage: script/stage-cef-runtime [target-directory]
+#   target-directory defaults to target/debug
+#
+# The Windows equivalent is a port of Glass's stage-windows-cef-runtime.ps1;
+# macOS staging is bundle-based (script/bundle-mac, planned for M3).
+
+set -euo pipefail
+
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "error: this script stages the Linux CEF runtime layout;" >&2
+    echo "macOS uses app-bundle staging (M3) and Windows has its own script." >&2
+    exit 1
+fi
+
+CEF_PATH="${CEF_PATH:-$HOME/.local/share/cef}"
+target_directory="${1:-target/debug}"
+
+if [ ! -f "$CEF_PATH/libcef.so" ] || [ ! -f "$CEF_PATH/archive.json" ]; then
+    echo "error: no staged CEF distribution at $CEF_PATH" >&2
+    echo "run script/download-cef first (or set CEF_PATH)" >&2
+    exit 1
+fi
+
+mkdir -p "$target_directory"
+
+cp -R "$CEF_PATH/locales" "$target_directory/"
+
+shopt -s nullglob
+for file in "$CEF_PATH"/*.so "$CEF_PATH"/*.so.* "$CEF_PATH"/*.bin \
+    "$CEF_PATH"/*.dat "$CEF_PATH"/*.pak "$CEF_PATH"/*.json; do
+    # archive.json is the download manifest, not a CEF runtime file.
+    if [ "$(basename "$file")" = "archive.json" ]; then
+        continue
+    fi
+    cp "$file" "$target_directory/"
+done
+
+echo "CEF runtime staged in $target_directory"

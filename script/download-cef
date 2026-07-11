@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+
+# Download and stage the pinned CEF binary distribution for the integrated
+# browser (docs/glass/migration-plan.md §6.4).
+#
+# Fetches the "minimal" CEF distribution for the host platform from the Spotify
+# CDN, verifies its sha1 against the CDN's index.json, and extracts it into
+# $CEF_PATH (default ~/.local/share/cef) using the directory layout that
+# cef-dll-sys expects: the contents of Release/ and Resources/ flattened into
+# the root, plus include/, libcef_dll/, cmake/, CMakeLists.txt, and an
+# archive.json manifest that cef-dll-sys validates at build time.
+#
+# Idempotent: re-running with the staged version already in place exits
+# immediately; the downloaded archive is cached under ~/.cache and reused
+# (after sha1 re-verification) when extracting to a new CEF_PATH.
+#
+# Environment:
+#   CEF_PATH          install destination (default ~/.local/share/cef)
+#   CEF_DOWNLOAD_URL  CDN mirror (default https://cef-builds.spotifycdn.com)
+
+set -euo pipefail
+
+# The full CDN respin is pinned, not just the CEF version: the CDN can respin
+# a CEF version against a newer Chromium, and developers must all get
+# identical bits. The version component must stay in lockstep with the cef-rs
+# tag pinned in the workspace Cargo.toml (cef-v145.6.1+145.0.28):
+# cef-dll-sys refuses CEF distributions newer than the version embedded in
+# its own crate version.
+CEF_RESPIN="145.0.28+g51162e8+chromium-145.0.7632.160"
+CEF_VERSION="${CEF_RESPIN%%+*}"
+
+CEF_CDN="${CEF_DOWNLOAD_URL:-https://cef-builds.spotifycdn.com}"
+CEF_PATH="${CEF_PATH:-$HOME/.local/share/cef}"
+ARCHIVE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/zed/cef"
+
+for tool in curl jq tar bzip2; do
+    if ! command -v "$tool" >/dev/null; then
+        echo "error: required tool '$tool' not found" >&2
+        exit 1
+    fi
+done
+
+case "$(uname -sm)" in
+    "Linux x86_64") cdn_platform=linux64 ;;
+    "Linux aarch64") cdn_platform=linuxarm64 ;;
+    "Darwin arm64") cdn_platform=macosarm64 ;;
+    "Darwin x86_64") cdn_platform=macosx64 ;;
+    *)
+        echo "error: unsupported platform: $(uname -sm)" >&2
+        exit 1
+        ;;
+esac
+
+case "$cdn_platform" in
+    macos*) cef_library="Chromium Embedded Framework.framework" ;;
+    *) cef_library="libcef.so" ;;
+esac
+
+sha1_of() {
+    if command -v sha1sum >/dev/null; then
+        sha1sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 1 "$1" | cut -d' ' -f1
+    fi
+}
+
+expected_archive="cef_binary_${CEF_RESPIN}_${cdn_platform}_minimal.tar.bz2"
+
+if [ -f "$CEF_PATH/archive.json" ] && [ -e "$CEF_PATH/$cef_library" ]; then
+    staged_name="$(jq -r '.name' "$CEF_PATH/archive.json")"
+    if [ "$staged_name" = "$expected_archive" ]; then
+        echo "CEF $CEF_RESPIN already staged at $CEF_PATH"
+        exit 0
+    fi
+    echo "Replacing staged $staged_name with CEF $CEF_RESPIN"
+fi
+
+echo "Resolving CEF $CEF_RESPIN ($cdn_platform) against $CEF_CDN/index.json"
+archive_entry="$(
+    curl -sSfL "$CEF_CDN/index.json" \
+        | jq -r --arg platform "$cdn_platform" --arg respin "$CEF_RESPIN" '
+            first(
+                .[$platform].versions[]
+                | select(.cef_version == $respin)
+                | .files[]
+                | select(.type == "minimal")
+                | "\(.name)\t\(.sha1)"
+            ) // empty'
+)"
+if [ -z "$archive_entry" ]; then
+    echo "error: CEF $CEF_RESPIN minimal distribution not found for $cdn_platform;" >&2
+    echo "the CDN may have respun this version — see the pin comment at the top of this script" >&2
+    exit 1
+fi
+archive_name="${archive_entry%%$'\t'*}"
+archive_sha1="${archive_entry##*$'\t'}"
+
+archive_path="$ARCHIVE_CACHE/$archive_name"
+if [ -f "$archive_path" ] && [ "$(sha1_of "$archive_path")" = "$archive_sha1" ]; then
+    echo "Using cached archive $archive_path (sha1 verified)"
+else
+    rm -f "$archive_path"
+    mkdir -p "$ARCHIVE_CACHE"
+    echo "Downloading $CEF_CDN/$archive_name"
+    # PID-suffixed so concurrent runs don't interleave writes.
+    partial="$archive_path.partial.$$"
+    curl -fL --retry 3 -o "$partial" "$CEF_CDN/$archive_name"
+    downloaded_sha1="$(sha1_of "$partial")"
+    if [ "$downloaded_sha1" != "$archive_sha1" ]; then
+        rm -f "$partial"
+        echo "error: sha1 mismatch: expected $archive_sha1, got $downloaded_sha1" >&2
+        exit 1
+    fi
+    mv "$partial" "$archive_path"
+    echo "Downloaded and sha1-verified $archive_name"
+fi
+
+# Refuse to replace a CEF_PATH we did not stage (no archive.json manifest).
+if [ -e "$CEF_PATH" ] && [ ! -f "$CEF_PATH/archive.json" ] \
+    && [ -n "$(ls -A "$CEF_PATH" 2>/dev/null)" ]; then
+    echo "error: $CEF_PATH exists, is not empty, and has no archive.json manifest;" >&2
+    echo "refusing to replace it. Remove it or point CEF_PATH elsewhere." >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$CEF_PATH")"
+# Stage in a sibling directory so the final move stays on one filesystem.
+staging="$(mktemp -d "${CEF_PATH}.staging.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+
+echo "Extracting $archive_name"
+tar -xjf "$archive_path" -C "$staging"
+extracted="$staging/${archive_name%.tar.bz2}"
+
+# Flatten into the layout cef-dll-sys expects (mirrors cef-rs's
+# extract_target_archive): Release/ becomes the root, Resources/ merges into
+# it on non-macOS, build inputs sit alongside.
+final="$staging/cef"
+mv "$extracted/Release" "$final"
+case "$cdn_platform" in
+    macos*) ;;
+    *) mv "$extracted/Resources"/* "$final"/ ;;
+esac
+for entry in CMakeLists.txt cmake include libcef_dll CREDITS.html; do
+    mv "$extracted/$entry" "$final/$entry"
+done
+
+jq -n --arg name "$archive_name" --arg sha1 "$archive_sha1" \
+    '{type: "minimal", name: $name, sha1: $sha1}' >"$final/archive.json"
+
+if [ -e "$CEF_PATH" ]; then
+    old="$(mktemp -d "${CEF_PATH}.old.XXXXXX")"
+    mv "$CEF_PATH" "$old/cef"
+    rm -rf "$old"
+fi
+mv "$final" "$CEF_PATH"
+
+echo
+echo "CEF $CEF_RESPIN staged at $CEF_PATH"
+echo "Build and run with:"
+echo "  export CEF_PATH=\"$CEF_PATH\""
+case "$cdn_platform" in
+    macos*)
+        echo "  export DYLD_FALLBACK_LIBRARY_PATH=\"\$DYLD_FALLBACK_LIBRARY_PATH:\$CEF_PATH:\$CEF_PATH/Chromium Embedded Framework.framework/Libraries\""
+        ;;
+    *)
+        echo "  export LD_LIBRARY_PATH=\"\${LD_LIBRARY_PATH:+\$LD_LIBRARY_PATH:}\$CEF_PATH\""
+        ;;
+esac
