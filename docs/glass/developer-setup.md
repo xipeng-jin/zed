@@ -79,8 +79,9 @@ That gives two supported layouts:
   `locales/` next to the binary, mirroring Glass's Windows staging script.
   The binary must then find `libcef.so` there, e.g. via an `$ORIGIN` rpath or
   `LD_LIBRARY_PATH` pointing at the binary's directory. (An `$ORIGIN` rpath
-  link flag ships with `crates/browser` — until then this layout is exercised
-  with `LD_LIBRARY_PATH`.)
+  cannot be emitted by `crates/browser` — Cargo link flags from a library's
+  build script do not propagate to dependent binaries — so today this layout
+  is exercised with `LD_LIBRARY_PATH`; packaging work in M3 owns the rpath.)
 
 CEF subprocesses on Linux are the main binary re-invoked with `--type=…`
 arguments; they inherit the environment, so both layouts cover them. No

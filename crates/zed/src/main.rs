@@ -198,6 +198,16 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
+    // Handle CEF subprocess execution VERY early, before any other
+    // initialization. If this process is a CEF subprocess (on Linux and
+    // Windows, this executable re-invoked with `--type=...` arguments), this
+    // call does not return.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if let Err(error) = browser::handle_cef_subprocess() {
+        // Log but don't fail - CEF might not be available.
+        eprintln!("CEF subprocess handling warning: {error:#}");
+    }
+
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode
@@ -759,6 +769,7 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
+        browser::init(cx);
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);
