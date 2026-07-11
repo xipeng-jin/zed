@@ -1,10 +1,12 @@
 //! CEF client, ported (M2 subset) from `Glass:crates/browser/src/client.rs`.
-//! Ties together the render, load, display, life-span, keyboard, and download
-//! handlers. Find, request, context-menu, and permission handlers join with
+//! Ties together the render, load, display, life-span, keyboard, download,
+//! find, and context-menu handlers. Request and permission handlers join with
 //! their M2 tickets.
 
+use crate::context_menu_handler::{ContextMenuHandlerBuilder, OsrContextMenuHandler};
 use crate::display_handler::{DisplayHandlerBuilder, OsrDisplayHandler};
 use crate::download_handler::{DownloadHandlerBuilder, OsrDownloadHandler};
+use crate::find_handler::{FindHandlerBuilder, OsrFindHandler};
 use crate::life_span_handler::{LifeSpanHandlerBuilder, OsrLifeSpanHandler};
 use crate::load_handler::{LoadHandlerBuilder, OsrLoadHandler};
 use crate::render_handler::{OsrRenderHandler, RenderHandlerBuilder, RenderState};
@@ -12,9 +14,9 @@ use crate::tab_backend::EventSender;
 #[cfg(target_os = "windows")]
 use cef::sys::tagMSG;
 use cef::{
-    Browser, Client, DisplayHandler, DownloadHandler, ImplClient, ImplKeyboardHandler, KeyEvent,
-    KeyboardHandler, LifeSpanHandler, LoadHandler, RenderHandler, WrapClient, WrapKeyboardHandler,
-    rc::Rc as _, wrap_client, wrap_keyboard_handler,
+    Browser, Client, ContextMenuHandler, DisplayHandler, DownloadHandler, FindHandler, ImplClient,
+    ImplKeyboardHandler, KeyEvent, KeyboardHandler, LifeSpanHandler, LoadHandler, RenderHandler,
+    WrapClient, WrapKeyboardHandler, rc::Rc as _, wrap_client, wrap_keyboard_handler,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -70,6 +72,8 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         keyboard_handler: KeyboardHandler,
         download_handler: DownloadHandler,
+        find_handler: FindHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
@@ -96,6 +100,14 @@ wrap_client! {
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
             Some(self.download_handler.clone())
         }
+
+        fn find_handler(&self) -> Option<cef::FindHandler> {
+            Some(self.find_handler.clone())
+        }
+
+        fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
     }
 }
 
@@ -105,7 +117,9 @@ impl ClientBuilder {
         let load_handler = OsrLoadHandler::new(event_sender.clone());
         let display_handler = OsrDisplayHandler::new(event_sender.clone());
         let life_span_handler = OsrLifeSpanHandler::new(event_sender.clone());
-        let download_handler = OsrDownloadHandler::new(event_sender);
+        let download_handler = OsrDownloadHandler::new(event_sender.clone());
+        let find_handler = OsrFindHandler::new(event_sender.clone());
+        let context_menu_handler = OsrContextMenuHandler::new(event_sender);
         Self::new(
             RenderHandlerBuilder::build(render_handler),
             LoadHandlerBuilder::build(load_handler),
@@ -113,6 +127,8 @@ impl ClientBuilder {
             LifeSpanHandlerBuilder::build(life_span_handler),
             KeyboardHandlerBuilder::build(),
             DownloadHandlerBuilder::build(download_handler),
+            FindHandlerBuilder::build(find_handler),
+            ContextMenuHandlerBuilder::build(context_menu_handler),
         )
     }
 }

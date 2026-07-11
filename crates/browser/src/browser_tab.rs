@@ -7,6 +7,7 @@
 //! active tab swaps whole presenters and one tab's frames can never bleed
 //! into another's.
 
+use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
 use crate::tab_backend::{TabBackend, TabBackendEvent};
@@ -39,6 +40,13 @@ pub(crate) struct DrainedChanges {
     /// the app-global download list. No `needs_notify`: views re-render
     /// through their observation of that list instead.
     pub downloads: Vec<DownloadUpdate>,
+    /// Latest in-page find result: match count and 1-based active match
+    /// ordinal. Only the last result in a drain matters; the view shows it in
+    /// the find overlay when this tab is active.
+    pub find_result: Option<(i32, i32)>,
+    /// The page requested a context menu; the view renders it. Only the last
+    /// request in a drain survives (they cannot stack).
+    pub context_menu: Option<ContextMenuContext>,
 }
 
 pub(crate) struct BrowserTab {
@@ -254,6 +262,15 @@ impl BrowserTab {
                 TabBackendEvent::DownloadUpdated(update) => {
                     changes.downloads.push(update);
                 }
+                TabBackendEvent::FindResult {
+                    count,
+                    active_match_ordinal,
+                } => {
+                    changes.find_result = Some((count, active_match_ordinal));
+                }
+                TabBackendEvent::ContextMenuRequested(context) => {
+                    changes.context_menu = Some(context);
+                }
             }
         }
         changes
@@ -342,6 +359,46 @@ impl BrowserTab {
 
     pub fn send_key_up(&mut self, keystroke: &Keystroke) {
         self.backend.send_key_up(keystroke);
+    }
+
+    pub fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
+        self.backend.find(query, forward, match_case, find_next);
+    }
+
+    pub fn stop_finding(&mut self, clear_selection: bool) {
+        self.backend.stop_finding(clear_selection);
+    }
+
+    pub fn undo(&mut self) {
+        self.backend.undo();
+    }
+
+    pub fn redo(&mut self) {
+        self.backend.redo();
+    }
+
+    pub fn cut(&mut self) {
+        self.backend.cut();
+    }
+
+    pub fn copy(&mut self) {
+        self.backend.copy();
+    }
+
+    pub fn paste(&mut self) {
+        self.backend.paste();
+    }
+
+    pub fn delete(&mut self) {
+        self.backend.delete();
+    }
+
+    pub fn select_all(&mut self) {
+        self.backend.select_all();
+    }
+
+    pub fn start_download(&mut self, url: &str) {
+        self.backend.start_download(url);
     }
 
     /// Move the latest engine frame, if any, into this tab's presenter.

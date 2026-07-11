@@ -64,6 +64,25 @@ pub enum RecordedCommand {
     KeyUp {
         key: String,
     },
+    Find {
+        query: String,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+    },
+    StopFinding {
+        clear_selection: bool,
+    },
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
+    StartDownload {
+        url: String,
+    },
     Close,
 }
 
@@ -330,6 +349,53 @@ impl TabBackend for StubTabBackend {
     fn send_key_up(&mut self, keystroke: &Keystroke) {
         self.record(RecordedCommand::KeyUp {
             key: keystroke.key.clone(),
+        });
+    }
+
+    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
+        self.record(RecordedCommand::Find {
+            query: query.to_string(),
+            forward,
+            match_case,
+            find_next,
+        });
+    }
+
+    fn stop_finding(&mut self, clear_selection: bool) {
+        self.record(RecordedCommand::StopFinding { clear_selection });
+    }
+
+    fn undo(&mut self) {
+        self.record(RecordedCommand::Undo);
+    }
+
+    fn redo(&mut self) {
+        self.record(RecordedCommand::Redo);
+    }
+
+    fn cut(&mut self) {
+        self.record(RecordedCommand::Cut);
+    }
+
+    fn copy(&mut self) {
+        self.record(RecordedCommand::Copy);
+    }
+
+    fn paste(&mut self) {
+        self.record(RecordedCommand::Paste);
+    }
+
+    fn delete(&mut self) {
+        self.record(RecordedCommand::Delete);
+    }
+
+    fn select_all(&mut self) {
+        self.record(RecordedCommand::SelectAll);
+    }
+
+    fn start_download(&mut self, url: &str) {
+        self.record(RecordedCommand::StartDownload {
+            url: url.to_string(),
         });
     }
 

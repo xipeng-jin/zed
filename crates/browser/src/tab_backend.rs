@@ -7,6 +7,7 @@
 //! behind the `cef` feature) and the scripted stub for deterministic tests
 //! (`stub_tab_backend.rs`).
 
+use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use anyhow::Result;
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
@@ -39,6 +40,15 @@ pub enum TabBackendEvent {
     LoadError { url: String, error_text: String },
     /// A download this tab initiated started or progressed.
     DownloadUpdated(DownloadUpdate),
+    /// An in-page find reported its matches: how many, and which one is
+    /// selected (1-based; 0 while unknown).
+    FindResult {
+        count: i32,
+        active_match_ordinal: i32,
+    },
+    /// The user right-clicked the page; the app renders the menu (OSR
+    /// suppresses the engine's own).
+    ContextMenuRequested(ContextMenuContext),
 }
 
 /// One software-OSR frame: a tightly-packed premultiplied BGRA buffer at
@@ -130,6 +140,34 @@ pub trait TabBackend: 'static {
     fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool);
 
     fn send_key_up(&mut self, keystroke: &Keystroke);
+
+    /// Start or continue an in-page find. `find_next` distinguishes stepping
+    /// through the current query's matches from starting a fresh search;
+    /// results come back as [`TabBackendEvent::FindResult`]s.
+    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool);
+
+    /// End the in-page find, optionally clearing the match selection.
+    fn stop_finding(&mut self, clear_selection: bool);
+
+    /// Edit commands targeting the page's focused frame, used by the
+    /// app-rendered context menu on editable fields.
+    fn undo(&mut self);
+
+    fn redo(&mut self);
+
+    fn cut(&mut self);
+
+    fn copy(&mut self);
+
+    fn paste(&mut self);
+
+    fn delete(&mut self);
+
+    fn select_all(&mut self);
+
+    /// Download `url` through the engine's download pipeline, as if the page
+    /// had triggered it.
+    fn start_download(&mut self, url: &str);
 
     /// Close the underlying engine browser. Also invoked on drop.
     fn close(&mut self);

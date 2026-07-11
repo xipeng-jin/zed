@@ -96,6 +96,14 @@ impl CefTab {
         });
     }
 
+    fn with_focused_frame(&self, callback: impl FnOnce(&cef::Frame)) {
+        self.with_browser(|browser| {
+            if let Some(frame) = browser.focused_frame() {
+                callback(&frame);
+            }
+        });
+    }
+
     /// Send a key event flagged as app-sent, so the keyboard handler's native
     /// suppression (`client.rs`) lets it through to the page. The flag works
     /// because `send_key_event` delivers to `on_pre_key_event` synchronously
@@ -281,6 +289,59 @@ impl TabBackend for CefTab {
 
     fn send_key_up(&mut self, keystroke: &Keystroke) {
         self.send_key_event(&input::convert_key_event(keystroke, false));
+    }
+
+    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
+        self.with_host(|host| {
+            let query = cef::CefString::from(query);
+            host.find(
+                Some(&query),
+                if forward { 1 } else { 0 },
+                if match_case { 1 } else { 0 },
+                if find_next { 1 } else { 0 },
+            );
+        });
+    }
+
+    fn stop_finding(&mut self, clear_selection: bool) {
+        self.with_host(|host| {
+            host.stop_finding(if clear_selection { 1 } else { 0 });
+        });
+    }
+
+    fn undo(&mut self) {
+        self.with_focused_frame(|frame| frame.undo());
+    }
+
+    fn redo(&mut self) {
+        self.with_focused_frame(|frame| frame.redo());
+    }
+
+    fn cut(&mut self) {
+        self.with_focused_frame(|frame| frame.cut());
+    }
+
+    fn copy(&mut self) {
+        self.with_focused_frame(|frame| frame.copy());
+    }
+
+    fn paste(&mut self) {
+        self.with_focused_frame(|frame| frame.paste());
+    }
+
+    fn delete(&mut self) {
+        self.with_focused_frame(|frame| frame.del());
+    }
+
+    fn select_all(&mut self) {
+        self.with_focused_frame(|frame| frame.select_all());
+    }
+
+    fn start_download(&mut self, url: &str) {
+        self.with_host(|host| {
+            let url = cef::CefString::from(url);
+            host.start_download(Some(&url));
+        });
     }
 
     fn close(&mut self) {

@@ -14,6 +14,7 @@
 mod bookmarks;
 mod browser_tab;
 mod browser_view;
+mod context_menu;
 mod downloads;
 mod frame_presenter;
 mod history;
@@ -28,9 +29,13 @@ mod cef_instance;
 #[cfg(feature = "cef")]
 mod client;
 #[cfg(feature = "cef")]
+mod context_menu_handler;
+#[cfg(feature = "cef")]
 mod display_handler;
 #[cfg(feature = "cef")]
 mod download_handler;
+#[cfg(feature = "cef")]
+mod find_handler;
 #[cfg(feature = "cef")]
 mod input;
 #[cfg(feature = "cef")]
@@ -51,6 +56,7 @@ mod tab;
 compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows");
 
 pub use browser_view::{BrowserView, OpenBrowser, TabBackendFactory};
+pub use context_menu::ContextMenuContext;
 pub use downloads::DownloadUpdate;
 #[cfg(feature = "cef")]
 pub use cef_instance::CefInstance;

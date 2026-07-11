@@ -14,6 +14,7 @@
 
 use crate::bookmarks::{Bookmark, BrowserBookmarks};
 use crate::browser_tab::{BrowserTab, ClosedTab};
+use crate::context_menu::{ContextMenuContext, MenuCommand, MenuItem, context_menu_model};
 use crate::downloads::BrowserDownloads;
 use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
@@ -21,11 +22,13 @@ use crate::session;
 use crate::tab_backend::TabBackend;
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
+use editor::{Editor, EditorEvent, actions::SelectAll as EditorSelectAll};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollWheelEvent, SharedString,
-    SharedUri, Subscription, Task, WeakEntity, Window, actions, canvas, div, img,
+    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, KeyDownEvent, KeyUpEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, actions,
+    anchored, canvas, deferred, div, img,
 };
 use notifications::status_toast::StatusToast;
 use project::Project;
@@ -73,6 +76,14 @@ actions!(
         CopyUrl,
         /// Shows or hides the download center.
         ToggleDownloadCenter,
+        /// Opens the find-in-page overlay.
+        FindInPage,
+        /// Moves to the next find-in-page match.
+        FindNextInPage,
+        /// Moves to the previous find-in-page match.
+        FindPreviousInPage,
+        /// Closes the find-in-page overlay.
+        CloseFindInPage,
     ]
 );
 
@@ -111,6 +122,14 @@ struct SessionOwner(Option<EntityId>);
 
 impl Global for SessionOwner {}
 
+/// An open app-rendered page context menu, anchored at the click position
+/// (`Glass:crates/browser/src/browser_view/context_menu.rs:7`).
+struct BrowserContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _dismiss_subscription: Subscription,
+}
+
 #[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
     cx.set_global(TabBackendFactory::new(|| {
@@ -146,6 +165,19 @@ pub struct BrowserView {
     /// download progress into it and the download center shows it.
     downloads: Entity<BrowserDownloads>,
     download_center_visible: bool,
+    /// In-page find state, shown by the find overlay. The query editor is
+    /// created lazily on first use and kept for the view's lifetime.
+    find_editor: Option<Entity<Editor>>,
+    find_visible: bool,
+    find_query: String,
+    find_match_count: i32,
+    find_active_match_ordinal: i32,
+    _find_editor_subscription: Option<Subscription>,
+    /// The open page context menu, if any.
+    context_menu: Option<BrowserContextMenu>,
+    /// A context-menu request drained from the engine, which happens off the
+    /// window (in the pump observer); the next render opens it.
+    pending_context_menu: Option<ContextMenuContext>,
     /// The workspace this view was added to, for showing status toasts.
     workspace: Option<WeakEntity<Workspace>>,
     /// Window-relative bounds of the page content area, captured at draw time;
@@ -271,6 +303,14 @@ impl BrowserView {
             bookmarks,
             downloads,
             download_center_visible: false,
+            find_editor: None,
+            find_visible: false,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_active_match_ordinal: 0,
+            _find_editor_subscription: None,
+            context_menu: None,
+            pending_context_menu: None,
             workspace: None,
             content_bounds: Bounds::default(),
             is_incognito,
@@ -525,9 +565,17 @@ impl BrowserView {
         let mut session_changed = false;
         let mut visits = Vec::new();
         let mut download_updates = Vec::new();
+        let mut active_find_result = None;
+        let mut active_context_menu = None;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let mut changes = tab.drain_events();
             download_updates.append(&mut changes.downloads);
+            if index == self.active_tab_index {
+                // Find results and context-menu requests from inactive tabs
+                // are stale by definition: their overlays are not on screen.
+                active_find_result = changes.find_result;
+                active_context_menu = changes.context_menu;
+            }
             if changes.identity_changed || changes.needs_notify {
                 // Any tab's title or favicon shows in the tab strip.
                 needs_notify = true;
@@ -558,6 +606,15 @@ impl BrowserView {
             self.downloads.update(cx, |downloads, cx| {
                 downloads.record_update(update, is_incognito, cx);
             });
+        }
+        if let Some((count, active_match_ordinal)) = active_find_result {
+            self.find_match_count = count;
+            self.find_active_match_ordinal = active_match_ordinal;
+            needs_notify = true;
+        }
+        if let Some(context) = active_context_menu {
+            self.pending_context_menu = Some(context);
+            needs_notify = true;
         }
         if session_changed {
             self.schedule_session_save(cx);
@@ -636,6 +693,11 @@ impl BrowserView {
             return;
         }
 
+        // Find state and context menus belong to the page they were opened
+        // on; they do not follow across a tab switch.
+        self.clear_find_for_tab_switch(window, cx);
+        self.dismiss_context_menu(cx);
+
         let previous = self.active_tab_mut();
         previous.set_focus(false);
         previous.set_hidden(true);
@@ -665,6 +727,10 @@ impl BrowserView {
             return;
         }
         let was_active = index == self.active_tab_index;
+        if was_active {
+            self.clear_find_for_tab_switch(window, cx);
+            self.dismiss_context_menu(cx);
+        }
         let mut tab = self.tabs.remove(index);
         self.remember_closed_tab(&tab);
         tab.release_presenter(window);
@@ -839,6 +905,238 @@ impl BrowserView {
     fn toggle_download_center(&mut self, cx: &mut Context<Self>) {
         self.download_center_visible = !self.download_center_visible;
         cx.notify();
+    }
+
+    fn ensure_find_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        if let Some(editor) = self.find_editor.clone() {
+            return editor;
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Find in page", window, cx);
+            editor
+        });
+        self._find_editor_subscription =
+            Some(cx.subscribe(&editor, Self::handle_find_editor_event));
+        self.find_editor = Some(editor.clone());
+        editor
+    }
+
+    fn focus_find_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.ensure_find_editor(window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+        editor.update(cx, |editor, cx| {
+            editor.select_all(&EditorSelectAll, window, cx);
+        });
+    }
+
+    fn set_find_editor_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.find_editor.clone() {
+            editor.update(cx, |editor, cx| {
+                editor.set_text(text.to_string(), window, cx);
+            });
+        }
+    }
+
+    fn handle_find_editor_event(
+        &mut self,
+        _editor: Entity<Editor>,
+        event: &EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, EditorEvent::BufferEdited) {
+            return;
+        }
+        let Some(editor) = self.find_editor.clone() else {
+            return;
+        };
+        let text = editor.read(cx).text(cx);
+        // Edit events deliver deferred, so this view's own writes (query
+        // resets on close and tab switch) come back through here too; only a
+        // text that differs from the current query is a new user query.
+        if text == self.find_query {
+            return;
+        }
+        self.find_query = text;
+        self.find_match_count = 0;
+        self.find_active_match_ordinal = 0;
+        self.run_find(true, false, cx);
+        cx.notify();
+    }
+
+    /// Send the current query to the page. `find_next` steps within the
+    /// current query's matches; a fresh query restarts the search. An emptied
+    /// query ends the find instead.
+    fn run_find(&mut self, forward: bool, find_next: bool, cx: &mut Context<Self>) {
+        if self.find_query.is_empty() {
+            if let Some(tab) = self.active_engine_tab_mut() {
+                tab.stop_finding(true);
+            }
+            self.find_match_count = 0;
+            self.find_active_match_ordinal = 0;
+            return;
+        }
+        let query = self.find_query.clone();
+        if let Some(tab) = self.active_engine_tab_mut() {
+            tab.find(&query, forward, false, find_next);
+        }
+        cx.notify();
+    }
+
+    fn handle_find_in_page(
+        &mut self,
+        _: &FindInPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_visible = true;
+        self.focus_find_editor(window, cx);
+        if !self.find_query.is_empty() {
+            self.run_find(true, false, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_find_next_in_page(
+        &mut self,
+        _: &FindNextInPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find_visible {
+            self.find_visible = true;
+            self.focus_find_editor(window, cx);
+        }
+        self.run_find(true, true, cx);
+        cx.notify();
+    }
+
+    fn handle_find_previous_in_page(
+        &mut self,
+        _: &FindPreviousInPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find_visible {
+            self.find_visible = true;
+            self.focus_find_editor(window, cx);
+        }
+        self.run_find(false, true, cx);
+        cx.notify();
+    }
+
+    fn handle_close_find_in_page(
+        &mut self,
+        _: &CloseFindInPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.active_engine_tab_mut() {
+            tab.stop_finding(true);
+        }
+        self.clear_find_state(window, cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn clear_find_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_visible = false;
+        self.find_query.clear();
+        self.find_match_count = 0;
+        self.find_active_match_ordinal = 0;
+        self.set_find_editor_text("", window, cx);
+    }
+
+    /// End any find on the (still-)active tab before another tab takes its
+    /// place (`Glass:crates/browser/src/browser_view/actions.rs:119`).
+    fn clear_find_for_tab_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_visible && self.find_query.is_empty() {
+            return;
+        }
+        if let Some(tab) = self.active_engine_tab_mut() {
+            tab.stop_finding(true);
+        }
+        self.clear_find_state(window, cx);
+        cx.notify();
+    }
+
+    /// Build and show the Zed-rendered context menu for a page right-click,
+    /// anchored at the pointer. The menu content comes from the pure mapping
+    /// in `context_menu.rs`; each entry dispatches a [`MenuCommand`] back
+    /// into this view.
+    fn open_context_menu(
+        &mut self,
+        context: ContextMenuContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = window.mouse_position();
+        let model = context_menu_model(&context);
+        let view = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for item in model {
+                match item {
+                    MenuItem::Separator => menu = menu.separator(),
+                    MenuItem::Entry { label, command } => {
+                        let view = view.clone();
+                        menu = menu.entry(label, None, move |_window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.execute_menu_command(command.clone(), cx);
+                            })
+                            .ok();
+                        });
+                    }
+                }
+            }
+            menu
+        });
+
+        let dismiss_subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some(BrowserContextMenu {
+            menu,
+            position,
+            _dismiss_subscription: dismiss_subscription,
+        });
+        cx.notify();
+    }
+
+    fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+        self.pending_context_menu = None;
+    }
+
+    fn execute_menu_command(&mut self, command: MenuCommand, cx: &mut Context<Self>) {
+        let with_engine_tab = |this: &mut Self, callback: fn(&mut BrowserTab)| {
+            if let Some(tab) = this.active_engine_tab_mut() {
+                callback(tab);
+            }
+        };
+        match command {
+            MenuCommand::OpenLinkInNewTab(url) => self.open_in_new_background_tab(url, cx),
+            MenuCommand::CopyLinkAddress(url) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url));
+            }
+            MenuCommand::DownloadLink(url) => {
+                if let Some(tab) = self.active_engine_tab_mut() {
+                    tab.start_download(&url);
+                }
+            }
+            MenuCommand::Undo => with_engine_tab(self, |tab| tab.undo()),
+            MenuCommand::Redo => with_engine_tab(self, |tab| tab.redo()),
+            MenuCommand::Cut => with_engine_tab(self, |tab| tab.cut()),
+            MenuCommand::Copy => with_engine_tab(self, |tab| tab.copy()),
+            MenuCommand::Paste => with_engine_tab(self, |tab| tab.paste()),
+            MenuCommand::Delete => with_engine_tab(self, |tab| tab.delete()),
+            MenuCommand::SelectAll => with_engine_tab(self, |tab| tab.select_all()),
+            MenuCommand::GoBack => self.go_back(cx),
+            MenuCommand::GoForward => self.go_forward(cx),
+            MenuCommand::Reload => self.reload(cx),
+        }
     }
 
     fn handle_mouse_down(
@@ -1311,7 +1609,9 @@ impl BrowserView {
         v_flex()
             .id("browser-download-center")
             .absolute()
-            .top_2()
+            // Below the find overlay when both are open
+            // (`Glass:crates/browser/src/browser_view/content.rs:207`).
+            .top(if self.find_visible { px(52.) } else { px(8.) })
             .right_2()
             .w(px(360.))
             .max_h(px(360.))
@@ -1347,6 +1647,71 @@ impl BrowserView {
                 )
             })
             .children(rows)
+    }
+
+    /// The find-in-page overlay: query editor, match position, and
+    /// previous/next/close controls, floated over the top-right of the page
+    /// (`Glass:crates/browser/src/browser_view/content.rs:56`).
+    fn render_find_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.find_visible {
+            return None;
+        }
+        let match_count = self.find_match_count.max(0);
+        let active_match = self.find_active_match_ordinal.max(0);
+        let match_text = if match_count == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{active_match}/{match_count}")
+        };
+
+        let overlay = h_flex()
+            .id("browser-find-overlay")
+            .absolute()
+            .top_2()
+            .right_2()
+            .w(px(320.))
+            .occlude()
+            .p_1()
+            .gap_1()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
+            .shadow_md()
+            .when_some(self.find_editor.clone(), |this, editor| {
+                this.child(div().flex_1().min_w_0().px_1().child(editor))
+            })
+            .child(
+                Label::new(match_text)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("browser-find-previous", IconName::ChevronUp)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Previous Match"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.handle_find_previous_in_page(&FindPreviousInPage, window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new("browser-find-next", IconName::ChevronDown)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Next Match"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.handle_find_next_in_page(&FindNextInPage, window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new("browser-find-close", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Close Find"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.handle_close_find_in_page(&CloseFindInPage, window, cx)
+                    })),
+            );
+
+        Some(overlay.into_any_element())
     }
 
     fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1435,6 +1800,13 @@ impl BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Context-menu requests drain from the pump observer, which has no
+        // window; open them here, where one is available
+        // (`Glass:crates/browser/src/browser_view.rs:1399`).
+        if let Some(context) = self.pending_context_menu.take() {
+            self.open_context_menu(context, window, cx);
+        }
+
         let is_new_tab_page = self.active_tab().is_new_tab_page();
         let frame = if is_new_tab_page {
             None
@@ -1471,6 +1843,17 @@ impl Render for BrowserView {
         .absolute()
         .size_full();
 
+        let context_menu_overlay = self.context_menu.as_ref().map(|context_menu| {
+            deferred(
+                anchored()
+                    .position(context_menu.position)
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(context_menu.menu.clone()),
+            )
+            .with_priority(1)
+        });
+
         let content = div()
             .id("browser-content")
             .relative()
@@ -1497,7 +1880,9 @@ impl Render for BrowserView {
             })
             .when(self.download_center_visible, |this| {
                 this.child(self.render_download_center(cx))
-            });
+            })
+            .children(self.render_find_overlay(cx))
+            .children(context_menu_overlay);
 
         div()
             .id("browser-view")
@@ -1540,6 +1925,10 @@ impl Render for BrowserView {
             .on_action(cx.listener(|this, _: &ToggleDownloadCenter, _, cx| {
                 this.toggle_download_center(cx)
             }))
+            .on_action(cx.listener(Self::handle_find_in_page))
+            .on_action(cx.listener(Self::handle_find_next_in_page))
+            .on_action(cx.listener(Self::handle_find_previous_in_page))
+            .on_action(cx.listener(Self::handle_close_find_in_page))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .child(self.render_tab_strip(cx))
@@ -3857,5 +4246,221 @@ mod tests {
             cx.update(|_, cx| crate::session::restore_downloads(cx).is_none()),
             "incognito downloads never reach the KV store"
         );
+    }
+
+    /// Only the find-related commands the backend received, in order.
+    fn find_commands(controller: &StubTabController) -> Vec<RecordedCommand> {
+        controller
+            .commands()
+            .into_iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    RecordedCommand::Find { .. } | RecordedCommand::StopFinding { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_find_in_page_queries_and_steps_through_matches(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+
+        // Opening find shows the overlay; typing a query starts a fresh
+        // search (find_next=false).
+        view.update_in(cx, |view, window, cx| {
+            view.handle_find_in_page(&FindInPage, window, cx);
+            assert!(view.find_visible);
+            let editor = view.ensure_find_editor(window, cx);
+            editor.update(cx, |editor, cx| editor.set_text("needle", window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            find_commands(&controller),
+            vec![RecordedCommand::Find {
+                query: "needle".into(),
+                forward: true,
+                match_case: false,
+                find_next: false,
+            }],
+        );
+
+        // The engine reports matches; the overlay state mirrors them.
+        controller.script_events([TabBackendEvent::FindResult {
+            count: 5,
+            active_match_ordinal: 1,
+        }]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.find_match_count, 5);
+            assert_eq!(view.find_active_match_ordinal, 1);
+        });
+
+        // Next/previous step within the query's matches (find_next=true).
+        controller.take_commands();
+        view.update_in(cx, |view, window, cx| {
+            view.handle_find_next_in_page(&FindNextInPage, window, cx);
+            view.handle_find_previous_in_page(&FindPreviousInPage, window, cx);
+        });
+        assert_eq!(
+            find_commands(&controller),
+            vec![
+                RecordedCommand::Find {
+                    query: "needle".into(),
+                    forward: true,
+                    match_case: false,
+                    find_next: true,
+                },
+                RecordedCommand::Find {
+                    query: "needle".into(),
+                    forward: false,
+                    match_case: false,
+                    find_next: true,
+                },
+            ],
+        );
+
+        // Closing ends the engine find and resets the overlay state.
+        controller.take_commands();
+        view.update_in(cx, |view, window, cx| {
+            view.handle_close_find_in_page(&CloseFindInPage, window, cx);
+            assert!(!view.find_visible);
+            assert!(view.find_query.is_empty());
+            assert_eq!(view.find_match_count, 0);
+            assert_eq!(view.find_active_match_ordinal, 0);
+        });
+        assert_eq!(
+            find_commands(&controller),
+            vec![RecordedCommand::StopFinding {
+                clear_selection: true,
+            }],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_find_results_from_inactive_tabs_are_ignored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            let tab = view.create_tab("https://example.com/two".into());
+            view.tabs.push(tab);
+            view.activate_tab(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Tab 0 is now inactive; its find results must not clobber the
+        // overlay shown for the active tab.
+        factory.controller(0).script_events([
+            TabBackendEvent::FindResult {
+                count: 7,
+                active_match_ordinal: 3,
+            },
+        ]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.find_match_count, 0);
+            assert_eq!(view.find_active_match_ordinal, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_switching_tabs_ends_the_find(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+
+        view.update_in(cx, |view, window, cx| {
+            view.handle_find_in_page(&FindInPage, window, cx);
+            let editor = view.ensure_find_editor(window, cx);
+            editor.update(cx, |editor, cx| editor.set_text("needle", window, cx));
+        });
+        cx.run_until_parked();
+        controller.take_commands();
+
+        view.update_in(cx, |view, window, cx| {
+            let tab = view.create_tab("https://example.com/two".into());
+            view.tabs.push(tab);
+            view.activate_tab(1, window, cx);
+            assert!(!view.find_visible);
+            assert!(view.find_query.is_empty());
+        });
+        assert_eq!(
+            find_commands(&controller),
+            vec![RecordedCommand::StopFinding {
+                clear_selection: true,
+            }],
+            "the outgoing tab's engine find is stopped"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_context_menu_request_opens_an_app_rendered_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+
+        controller.script_events([TabBackendEvent::ContextMenuRequested(ContextMenuContext {
+            link_url: Some("https://example.com/link".into()),
+            ..Default::default()
+        })]);
+        pump(cx);
+
+        view.update(cx, |view, _| {
+            assert!(
+                view.context_menu.is_some(),
+                "the request drained through the pump opens the menu on the next render"
+            );
+            assert!(view.pending_context_menu.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_context_menu_commands_route_to_the_view_and_engine(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+        controller.take_commands();
+
+        view.update(cx, |view, cx| {
+            view.execute_menu_command(MenuCommand::Copy, cx);
+            view.execute_menu_command(MenuCommand::Paste, cx);
+            view.execute_menu_command(
+                MenuCommand::DownloadLink("https://example.com/file.zip".into()),
+                cx,
+            );
+            view.execute_menu_command(
+                MenuCommand::CopyLinkAddress("https://example.com/link".into()),
+                cx,
+            );
+        });
+        assert_eq!(
+            controller.take_commands(),
+            vec![
+                RecordedCommand::Copy,
+                RecordedCommand::Paste,
+                RecordedCommand::StartDownload {
+                    url: "https://example.com/file.zip".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("https://example.com/link".to_string()),
+        );
+
+        // A link opens as a background browser tab: the strip gains it, the
+        // current page stays active.
+        view.update(cx, |view, cx| {
+            view.execute_menu_command(
+                MenuCommand::OpenLinkInNewTab("https://example.com/new".into()),
+                cx,
+            );
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.active_tab_index, 0);
+            assert_eq!(view.tabs[1].url(), "https://example.com/new");
+        });
     }
 }
