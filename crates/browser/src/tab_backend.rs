@@ -8,6 +8,7 @@
 //! harness is ticket #8).
 
 use anyhow::Result;
+use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
 use std::sync::mpsc;
 
 /// Events flowing from the engine to the app, drained on the foreground thread
@@ -55,8 +56,11 @@ pub enum PaintOutput {
 ///
 /// Lifecycle: construct, then [`set_viewport`](Self::set_viewport) with real
 /// dimensions, then [`start`](Self::start) once
-/// [`engine_ready`](Self::engine_ready) reports true. Input injection methods
-/// join with tickets #6 (pointer/keys) and #16 (IME).
+/// [`engine_ready`](Self::engine_ready) reports true. IME composition methods
+/// join with ticket #16.
+///
+/// Input positions are logical pixels relative to the tab's content origin;
+/// the engine converts to device pixels via the viewport scale factor.
 pub trait TabBackend: 'static {
     /// Whether the engine is initialized enough to create browsers.
     fn engine_ready(&self) -> bool;
@@ -82,6 +86,38 @@ pub trait TabBackend: 'static {
     fn set_viewport(&mut self, width: u32, height: u32, scale_factor: f32);
 
     fn set_focus(&mut self, focused: bool);
+
+    fn send_mouse_down(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        click_count: usize,
+        modifiers: Modifiers,
+    );
+
+    fn send_mouse_up(&mut self, position: Point<Pixels>, button: MouseButton, modifiers: Modifiers);
+
+    fn send_mouse_move(
+        &mut self,
+        position: Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+        modifiers: Modifiers,
+    );
+
+    fn send_scroll_wheel(
+        &mut self,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+        modifiers: Modifiers,
+    );
+
+    /// Send a key-down to the page, including the character event for
+    /// printable keys. Only invoked for keystrokes classified as
+    /// browser-routed; the engine marks them app-sent so its native key
+    /// suppression lets them through.
+    fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool);
+
+    fn send_key_up(&mut self, keystroke: &Keystroke);
 
     /// Close the underlying engine browser. Also invoked on drop.
     fn close(&mut self);

@@ -9,16 +9,19 @@
 //! owning entities yet.
 
 use crate::cef_instance::CefInstance;
-use crate::client::ClientBuilder;
+use crate::client::{ClientBuilder, MANUAL_KEY_EVENT};
+use crate::input;
 use crate::render_handler::RenderState;
 use crate::tab_backend::{
     EventReceiver, PaintOutput, TabBackend, TabBackendEvent, event_channel,
 };
 use anyhow::{Context as _, Result};
 use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
+use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// All live CEF browser handles, keyed by browser ID.
 static BROWSER_HANDLES: Mutex<Option<HashMap<i32, cef::Browser>>> = Mutex::new(None);
@@ -92,6 +95,18 @@ impl CefTab {
             if let Some(host) = browser.host() {
                 callback(&host);
             }
+        });
+    }
+
+    /// Send a key event flagged as app-sent, so the keyboard handler's native
+    /// suppression (`client.rs`) lets it through to the page. The flag works
+    /// because `send_key_event` delivers to `on_pre_key_event` synchronously
+    /// on this same thread.
+    fn send_key_event(&self, event: &cef::KeyEvent) {
+        self.with_host(|host| {
+            MANUAL_KEY_EVENT.store(true, Ordering::Relaxed);
+            host.send_key_event(Some(event));
+            MANUAL_KEY_EVENT.store(false, Ordering::Relaxed);
         });
     }
 }
@@ -188,6 +203,76 @@ impl TabBackend for CefTab {
         self.with_host(|host| {
             host.set_focus(if focused { 1 } else { 0 });
         });
+    }
+
+    fn send_mouse_down(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        click_count: usize,
+        modifiers: Modifiers,
+    ) {
+        let event = input::mouse_event(position, input::convert_modifiers(&modifiers));
+        let button = input::convert_mouse_button(button);
+        let mouse_up = 0;
+        self.with_host(|host| {
+            host.send_mouse_click_event(Some(&event), button, mouse_up, click_count as i32);
+        });
+    }
+
+    fn send_mouse_up(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
+        let event = input::mouse_event(position, input::convert_modifiers(&modifiers));
+        let button = input::convert_mouse_button(button);
+        let (mouse_up, click_count) = (1, 1);
+        self.with_host(|host| {
+            host.send_mouse_click_event(Some(&event), button, mouse_up, click_count);
+        });
+    }
+
+    fn send_mouse_move(
+        &mut self,
+        position: Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+        modifiers: Modifiers,
+    ) {
+        let modifiers =
+            input::convert_modifiers(&modifiers) | input::pressed_button_flags(pressed_button);
+        let event = input::mouse_event(position, modifiers);
+        self.with_host(|host| {
+            host.send_mouse_move_event(Some(&event), 0);
+        });
+    }
+
+    fn send_scroll_wheel(
+        &mut self,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+        modifiers: Modifiers,
+    ) {
+        let event = input::mouse_event(position, input::convert_modifiers(&modifiers));
+        let (delta_x, delta_y) = input::scroll_delta_to_pixels(delta);
+        self.with_host(|host| {
+            host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
+        });
+    }
+
+    fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool) {
+        self.send_key_event(&input::convert_key_event(keystroke, true));
+
+        if input::should_send_char_event(keystroke, is_held)
+            && let Some(char_event) = input::create_char_event(keystroke)
+        {
+            self.send_key_event(&char_event);
+        }
+    }
+
+    fn send_key_up(&mut self, keystroke: &Keystroke) {
+        self.send_key_event(&input::convert_key_event(keystroke, false));
     }
 
     fn close(&mut self) {

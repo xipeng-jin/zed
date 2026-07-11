@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Off-screen browser views receive input through the app's routing only: raw
-// key events are forwarded explicitly for browser-owned keys and text input is
-// committed through the IME APIs. OS-delivered key events would duplicate
-// that, so they are suppressed unless flagged as app-sent (ticket #6 wires the
-// sending side).
+// key events are forwarded explicitly for browser-routed keys (and, with
+// ticket #16, text input committed through the IME APIs). OS-delivered key
+// events would duplicate that, so they are suppressed unless flagged as
+// app-sent (`CefTab::send_key_event` sets the flag around each send).
 pub(crate) static MANUAL_KEY_EVENT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]

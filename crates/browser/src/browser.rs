@@ -17,6 +17,10 @@ mod client;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod display_handler;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod input;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod keycodes;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod life_span_handler;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod load_handler;

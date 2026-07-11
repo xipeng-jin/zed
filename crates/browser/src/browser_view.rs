@@ -11,8 +11,9 @@
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
 use crate::tab_backend::{TabBackend, TabBackendEvent};
 use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, Pixels, Render, SharedString,
-    Window, actions, canvas, div,
+    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, KeyUpEvent,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollWheelEvent, SharedString, Window, actions, canvas, div,
 };
 use ui::prelude::*;
 use workspace::Workspace;
@@ -57,6 +58,19 @@ pub struct BrowserView {
     /// Last viewport pushed to the engine: logical width and height, plus the
     /// scale factor in thousandths (to keep the key comparable).
     last_viewport: Option<(u32, u32, u32)>,
+    /// Window-relative bounds of the page content area, captured at draw time;
+    /// pointer events are translated into content-relative coordinates with
+    /// its origin before crossing the tab-backend seam.
+    content_bounds: Bounds<Pixels>,
+}
+
+/// M1 subset of Glass's three-way key dispatch
+/// (`Glass:crates/browser/src/text_input.rs:61`): app-first classification
+/// only — ctrl/platform-modified chords belong to Zed even when no binding
+/// matched them, so pages cannot shadow app shortcuts. The text-input route
+/// (editable-field state + IME) joins with ticket #16.
+fn is_app_keystroke(keystroke: &Keystroke) -> bool {
+    keystroke.modifiers.platform || keystroke.modifiers.control
 }
 
 impl BrowserView {
@@ -93,6 +107,7 @@ impl BrowserView {
             can_go_forward: false,
             engine_error: None,
             last_viewport: None,
+            content_bounds: Bounds::default(),
         }
     }
 
@@ -198,6 +213,7 @@ impl BrowserView {
     /// this view, so it always sees the laid-out bounds — including the final
     /// frame of a resize.
     fn handle_content_bounds(&mut self, bounds: Bounds<Pixels>, scale_factor: f32) {
+        self.content_bounds = bounds;
         let width = f32::from(bounds.size.width) as u32;
         let height = f32::from(bounds.size.height) as u32;
         if width == 0 || height == 0 {
@@ -222,6 +238,93 @@ impl BrowserView {
             self.last_viewport = Some(viewport_key);
             self.backend.set_viewport(width, height, scale_factor);
         }
+    }
+
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Clicking the page focuses both the pane item (so browser-routed
+        // keystrokes dispatch here) and the engine browser (so the page shows
+        // carets and selection).
+        window.focus(&self.focus_handle, cx);
+        self.backend.set_focus(true);
+        self.backend.send_mouse_down(
+            event.position - self.content_bounds.origin,
+            event.button,
+            event.click_count,
+            event.modifiers,
+        );
+    }
+
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.backend.send_mouse_up(
+            event.position - self.content_bounds.origin,
+            event.button,
+            event.modifiers,
+        );
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.backend.send_mouse_move(
+            event.position - self.content_bounds.origin,
+            event.pressed_button,
+            event.modifiers,
+        );
+    }
+
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.backend.send_scroll_wheel(
+            event.position - self.content_bounds.origin,
+            event.delta,
+            event.modifiers,
+        );
+    }
+
+    /// Key listeners run only for keystrokes no Zed binding consumed (GPUI
+    /// matches bindings before key listeners), so anything arriving here is
+    /// either page input or an unbound app chord.
+    ///
+    /// Unlike Glass, the engine send is not deferred: Glass's tab was a GPUI
+    /// entity it could not update re-entrantly mid-dispatch, while this
+    /// backend is plain owned state and the engine's synchronous callbacks
+    /// touch only atomics and channels.
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if is_app_keystroke(&event.keystroke) {
+            return;
+        }
+        self.backend.send_key_down(&event.keystroke, event.is_held);
+        cx.stop_propagation();
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if is_app_keystroke(&event.keystroke) {
+            return;
+        }
+        self.backend.send_key_up(&event.keystroke);
+        cx.stop_propagation();
     }
 
     fn render_placeholder(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -266,11 +369,22 @@ impl Render for BrowserView {
 
         div()
             .id("browser-view")
+            .key_context("BrowserView")
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
             .overflow_hidden()
             .bg(cx.theme().colors().editor_background)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .on_key_up(cx.listener(Self::handle_key_up))
             .child(bounds_tracker)
             .when_some(frame, |this, frame| this.child(frame))
             .when(!has_frame, |this| this.child(self.render_placeholder(cx)))
@@ -322,12 +436,41 @@ mod tests {
     use super::*;
     use crate::tab_backend::{PaintOutput, SoftwareFrame};
     use anyhow::Result;
-    use gpui::{TestAppContext, size};
+    use gpui::{Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, point, size};
     use parking_lot::Mutex;
     use project::Project;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use workspace::AppState;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum RecordedInput {
+        MouseDown {
+            position: Point<Pixels>,
+            button: MouseButton,
+            click_count: usize,
+        },
+        MouseUp {
+            position: Point<Pixels>,
+            button: MouseButton,
+        },
+        MouseMove {
+            position: Point<Pixels>,
+        },
+        ScrollWheel {
+            position: Point<Pixels>,
+            /// x, y, and whether the delta was line-based (`ScrollDelta` has
+            /// no `PartialEq`).
+            delta: (f32, f32, bool),
+        },
+        KeyDown {
+            key: String,
+            is_held: bool,
+        },
+        KeyUp {
+            key: String,
+        },
+    }
 
     #[derive(Default)]
     struct StubState {
@@ -337,6 +480,7 @@ mod tests {
         focus_calls: Vec<bool>,
         events: VecDeque<TabBackendEvent>,
         paint_output: Option<PaintOutput>,
+        inputs: Vec<RecordedInput>,
     }
 
     #[derive(Clone)]
@@ -380,6 +524,73 @@ mod tests {
 
         fn set_focus(&mut self, focused: bool) {
             self.0.lock().focus_calls.push(focused);
+        }
+
+        fn send_mouse_down(
+            &mut self,
+            position: Point<Pixels>,
+            button: MouseButton,
+            click_count: usize,
+            _modifiers: Modifiers,
+        ) {
+            self.0.lock().inputs.push(RecordedInput::MouseDown {
+                position,
+                button,
+                click_count,
+            });
+        }
+
+        fn send_mouse_up(
+            &mut self,
+            position: Point<Pixels>,
+            button: MouseButton,
+            _modifiers: Modifiers,
+        ) {
+            self.0
+                .lock()
+                .inputs
+                .push(RecordedInput::MouseUp { position, button });
+        }
+
+        fn send_mouse_move(
+            &mut self,
+            position: Point<Pixels>,
+            _pressed_button: Option<MouseButton>,
+            _modifiers: Modifiers,
+        ) {
+            self.0
+                .lock()
+                .inputs
+                .push(RecordedInput::MouseMove { position });
+        }
+
+        fn send_scroll_wheel(
+            &mut self,
+            position: Point<Pixels>,
+            delta: ScrollDelta,
+            _modifiers: Modifiers,
+        ) {
+            let delta = match delta {
+                ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y), false),
+                ScrollDelta::Lines(delta) => (delta.x, delta.y, true),
+            };
+            self.0
+                .lock()
+                .inputs
+                .push(RecordedInput::ScrollWheel { position, delta });
+        }
+
+        fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool) {
+            self.0.lock().inputs.push(RecordedInput::KeyDown {
+                key: keystroke.key.clone(),
+                is_held,
+            });
+        }
+
+        fn send_key_up(&mut self, keystroke: &Keystroke) {
+            self.0.lock().inputs.push(RecordedInput::KeyUp {
+                key: keystroke.key.clone(),
+            });
         }
 
         fn close(&mut self) {}
@@ -515,6 +726,97 @@ mod tests {
         view.update(cx, |view, cx| view.drain_engine_events(cx));
         cx.run_until_parked();
         assert_eq!(state.lock().started_with.as_deref(), Some(DEFAULT_URL));
+    }
+
+    #[gpui::test]
+    async fn test_plain_keys_route_to_the_page_but_app_chords_do_not(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, state) = StubBackend::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.simulate_keystrokes("a");
+        assert_eq!(
+            state.lock().inputs,
+            vec![RecordedInput::KeyDown {
+                key: "a".into(),
+                is_held: false,
+            }],
+            "an unmodified printable key is forwarded to the page"
+        );
+
+        state.lock().inputs.clear();
+        cx.simulate_keystrokes("ctrl-t ctrl-shift-r");
+        assert_eq!(
+            state.lock().inputs,
+            vec![],
+            "ctrl-modified chords are app-classified and never reach the page"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_pointer_events_are_content_relative(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let (backend, state) = StubBackend::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            BrowserView::open_with_backend(workspace, window, cx, || Box::new(backend));
+        });
+        cx.run_until_parked();
+
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+        let content_origin = view.update(cx, |view, _| view.content_bounds.origin);
+        assert!(
+            content_origin.y > px(0.),
+            "inside a workspace pane the content sits below the tab bar"
+        );
+
+        state.lock().inputs.clear();
+        let click_offset = point(px(15.), px(25.));
+        cx.simulate_click(content_origin + click_offset, Modifiers::default());
+        assert_eq!(
+            state.lock().inputs,
+            vec![
+                RecordedInput::MouseDown {
+                    position: click_offset,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                },
+                RecordedInput::MouseUp {
+                    position: click_offset,
+                    button: MouseButton::Left,
+                },
+            ],
+            "click coordinates are translated by the pane offset"
+        );
+
+        state.lock().inputs.clear();
+        cx.simulate_event(ScrollWheelEvent {
+            position: content_origin + click_offset,
+            delta: ScrollDelta::Lines(point(0.0, -2.0)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        assert_eq!(
+            state.lock().inputs,
+            vec![RecordedInput::ScrollWheel {
+                position: click_offset,
+                delta: (0.0, -2.0, true),
+            }],
+            "scroll coordinates are translated by the pane offset"
+        );
     }
 
     #[gpui::test]
