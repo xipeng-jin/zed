@@ -3,12 +3,13 @@
 //!
 //! Commands go in through [`TabBackend`] methods; engine state comes back out
 //! through the [`TabBackendEvent`] stream and the paint-output frame source.
-//! Two implementations exist: the real CEF backend (`CefTab` in `tab.rs`) and a
-//! scripted stub for deterministic tests (see `browser_view.rs` tests; the full
-//! harness is ticket #8).
+//! Two implementations exist: the real CEF backend (`CefTab` in `tab.rs`,
+//! behind the `cef` feature) and the scripted stub for deterministic tests
+//! (`stub_tab_backend.rs`).
 
 use anyhow::Result;
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
+#[cfg(feature = "cef")]
 use std::sync::mpsc;
 
 /// Events flowing from the engine to the app, drained on the foreground thread
@@ -134,15 +135,19 @@ pub trait TabBackend: 'static {
     fn take_paint_output(&mut self) -> Option<PaintOutput>;
 }
 
+#[cfg(feature = "cef")]
 pub(crate) type EventSender = mpsc::Sender<TabBackendEvent>;
+#[cfg(feature = "cef")]
 pub(crate) type EventReceiver = mpsc::Receiver<TabBackendEvent>;
 
+#[cfg(feature = "cef")]
 pub(crate) fn event_channel() -> (EventSender, EventReceiver) {
     mpsc::channel()
 }
 
 /// Send an event from an engine handler thread, tolerating a receiver that was
 /// dropped mid-teardown (the tab is closing; late events are expected).
+#[cfg(feature = "cef")]
 pub(crate) fn send_event(sender: &EventSender, event: TabBackendEvent) {
     if sender.send(event).is_err() {
         log::trace!("[browser] dropped engine event: tab backend receiver closed");

@@ -88,6 +88,33 @@ arguments; they inherit the environment, so both layouts cover them. No
 separate helper binary exists on Linux (that is a macOS packaging concern,
 scheduled for M3).
 
+## Testing without CEF
+
+The real engine sits behind the browser crate's `cef` cargo feature, which is
+off by default and enabled by `crates/zed` for the shipped binary. So
+
+```sh
+cargo test -p browser
+```
+
+builds and runs the crate's deterministic tests — the browser view driven
+through the scripted stub tab backend (`crates/browser/src/stub_tab_backend.rs`)
+— with no CEF distribution present at build or run time. This is the
+invocation CI must use for the CEF-free configuration (ticket #8): it has to
+be package-scoped. A workspace-wide test build includes `crates/zed`, whose
+dependency on `browser` re-enables the `cef` feature through cargo feature
+unification, so in that configuration the browser test binary links
+`libcef.so` again (and the workspace build needs the CEF distribution anyway
+just to compile `zed`).
+
+The engine-side unit tests (input conversion, keycode mapping, pump
+scheduling) compile only with the feature enabled and, because `libcef.so` is
+dynamically linked, need the runtime on the loader path:
+
+```sh
+LD_LIBRARY_PATH="$CEF_PATH" cargo test -p browser --features cef
+```
+
 ## Version pinning and upgrades
 
 The CEF version is pinned in two places that must move together:

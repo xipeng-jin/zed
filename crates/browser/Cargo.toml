@@ -12,6 +12,15 @@ workspace = true
 path = "src/browser.rs"
 doctest = false
 
+[features]
+# The real CEF engine. Off by default so the crate's deterministic tests build
+# and run with no CEF distribution present (ticket #8); `crates/zed` turns it
+# on for the shipped binary.
+cef = ["dep:cef"]
+# Exposes the scripted stub tab backend and the message-pump simulation for
+# tests in dependent crates.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 editor.workspace = true
@@ -28,7 +37,7 @@ util.workspace = true
 workspace.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-cef.workspace = true
+cef = { workspace = true, optional = true }
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

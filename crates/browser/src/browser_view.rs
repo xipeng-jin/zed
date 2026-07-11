@@ -18,6 +18,7 @@ use gpui::{
     Pixels, Render, ScrollWheelEvent, SharedString, SharedUri, Window, actions, canvas, div, img,
 };
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
+#[cfg(any(feature = "cef", test))]
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent, TabContentParams, TabTooltipContent};
 
@@ -37,9 +38,10 @@ actions!(
     ]
 );
 
+#[cfg(any(feature = "cef", test))]
 pub const DEFAULT_URL: &str = "https://zed.dev";
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenBrowser, window, cx| {
@@ -126,13 +128,14 @@ impl BrowserView {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(feature = "cef")]
     pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         Self::open_with_backend(workspace, window, cx, || {
             Box::new(crate::tab::CefTab::new())
         });
     }
 
+    #[cfg(any(feature = "cef", test))]
     fn open_with_backend(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -170,8 +173,8 @@ impl BrowserView {
     }
 
     /// Drain pending engine events into view state. Invoked after every
-    /// message-pump iteration; tests call it directly after scripting stub
-    /// events.
+    /// message-pump iteration; tests reach it by scripting stub events and
+    /// calling `crate::simulate_message_pump`.
     fn drain_engine_events(&mut self, cx: &mut Context<Self>) {
         // The engine may have just become ready (first pumps after init);
         // kick a render so the browser gets created with real bounds.
@@ -624,193 +627,14 @@ impl Item for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tab_backend::{PaintOutput, SoftwareFrame};
-    use anyhow::Result;
-    use gpui::{Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, point, size};
-    use parking_lot::Mutex;
+    use crate::stub_tab_backend::{RecordedCommand, StubTabBackend, StubTabController};
+    use crate::tab_backend::SoftwareFrame;
+    use gpui::{
+        Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext, point, size,
+    };
     use project::Project;
-    use std::collections::VecDeque;
     use std::sync::Arc;
     use workspace::AppState;
-
-    #[derive(Debug, Clone, PartialEq)]
-    enum RecordedInput {
-        MouseDown {
-            position: Point<Pixels>,
-            button: MouseButton,
-            click_count: usize,
-        },
-        MouseUp {
-            position: Point<Pixels>,
-            button: MouseButton,
-        },
-        MouseMove {
-            position: Point<Pixels>,
-        },
-        ScrollWheel {
-            position: Point<Pixels>,
-            /// x, y, and whether the delta was line-based (`ScrollDelta` has
-            /// no `PartialEq`).
-            delta: (f32, f32, bool),
-        },
-        KeyDown {
-            key: String,
-            is_held: bool,
-        },
-        KeyUp {
-            key: String,
-        },
-    }
-
-    #[derive(Default)]
-    struct StubState {
-        engine_ready: bool,
-        started_with: Option<String>,
-        viewports: Vec<(u32, u32, u32)>,
-        focus_calls: Vec<bool>,
-        events: VecDeque<TabBackendEvent>,
-        paint_output: Option<PaintOutput>,
-        inputs: Vec<RecordedInput>,
-        /// Navigation commands: "navigate:<url>", "reload", "stop",
-        /// "go_back", "go_forward".
-        navigations: Vec<String>,
-    }
-
-    #[derive(Clone)]
-    struct StubBackend(Arc<Mutex<StubState>>);
-
-    impl StubBackend {
-        fn new(engine_ready: bool) -> (Self, Arc<Mutex<StubState>>) {
-            let state = Arc::new(Mutex::new(StubState {
-                engine_ready,
-                ..Default::default()
-            }));
-            (Self(state.clone()), state)
-        }
-    }
-
-    impl TabBackend for StubBackend {
-        fn engine_ready(&self) -> bool {
-            self.0.lock().engine_ready
-        }
-
-        fn start(&mut self, url: &str) -> Result<()> {
-            self.0.lock().started_with = Some(url.to_string());
-            Ok(())
-        }
-
-        fn is_started(&self) -> bool {
-            self.0.lock().started_with.is_some()
-        }
-
-        fn navigate(&mut self, url: &str) {
-            self.0.lock().navigations.push(format!("navigate:{url}"));
-        }
-
-        fn reload(&mut self) {
-            self.0.lock().navigations.push("reload".to_string());
-        }
-
-        fn stop(&mut self) {
-            self.0.lock().navigations.push("stop".to_string());
-        }
-
-        fn go_back(&mut self) {
-            self.0.lock().navigations.push("go_back".to_string());
-        }
-
-        fn go_forward(&mut self) {
-            self.0.lock().navigations.push("go_forward".to_string());
-        }
-
-        fn set_viewport(&mut self, width: u32, height: u32, scale_factor: f32) {
-            self.0
-                .lock()
-                .viewports
-                .push((width, height, (scale_factor * 1000.0) as u32));
-        }
-
-        fn set_focus(&mut self, focused: bool) {
-            self.0.lock().focus_calls.push(focused);
-        }
-
-        fn send_mouse_down(
-            &mut self,
-            position: Point<Pixels>,
-            button: MouseButton,
-            click_count: usize,
-            _modifiers: Modifiers,
-        ) {
-            self.0.lock().inputs.push(RecordedInput::MouseDown {
-                position,
-                button,
-                click_count,
-            });
-        }
-
-        fn send_mouse_up(
-            &mut self,
-            position: Point<Pixels>,
-            button: MouseButton,
-            _modifiers: Modifiers,
-        ) {
-            self.0
-                .lock()
-                .inputs
-                .push(RecordedInput::MouseUp { position, button });
-        }
-
-        fn send_mouse_move(
-            &mut self,
-            position: Point<Pixels>,
-            _pressed_button: Option<MouseButton>,
-            _modifiers: Modifiers,
-        ) {
-            self.0
-                .lock()
-                .inputs
-                .push(RecordedInput::MouseMove { position });
-        }
-
-        fn send_scroll_wheel(
-            &mut self,
-            position: Point<Pixels>,
-            delta: ScrollDelta,
-            _modifiers: Modifiers,
-        ) {
-            let delta = match delta {
-                ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y), false),
-                ScrollDelta::Lines(delta) => (delta.x, delta.y, true),
-            };
-            self.0
-                .lock()
-                .inputs
-                .push(RecordedInput::ScrollWheel { position, delta });
-        }
-
-        fn send_key_down(&mut self, keystroke: &Keystroke, is_held: bool) {
-            self.0.lock().inputs.push(RecordedInput::KeyDown {
-                key: keystroke.key.clone(),
-                is_held,
-            });
-        }
-
-        fn send_key_up(&mut self, keystroke: &Keystroke) {
-            self.0.lock().inputs.push(RecordedInput::KeyUp {
-                key: keystroke.key.clone(),
-            });
-        }
-
-        fn close(&mut self) {}
-
-        fn try_recv_event(&mut self) -> Option<TabBackendEvent> {
-            self.0.lock().events.pop_front()
-        }
-
-        fn take_paint_output(&mut self) -> Option<PaintOutput> {
-            self.0.lock().paint_output.take()
-        }
-    }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
@@ -820,10 +644,26 @@ mod tests {
         })
     }
 
+    /// One simulated message-pump iteration followed by settling: scripted
+    /// stub events drain into views through the same post-pump path real
+    /// engine events take.
+    fn pump(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| crate::simulate_message_pump(cx));
+        cx.run_until_parked();
+    }
+
+    fn viewport_count(controller: &StubTabController) -> usize {
+        controller
+            .commands()
+            .iter()
+            .filter(|command| matches!(command, RecordedCommand::SetViewport { .. }))
+            .count()
+    }
+
     #[gpui::test]
     async fn test_engine_events_update_item_state(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), "https://example.com".into(), window, cx)
         });
@@ -831,34 +671,50 @@ mod tests {
 
         // The first render starts the engine tab with the initial URL and a
         // real viewport.
-        let window_scale_key = (cx.update(|window, _| window.scale_factor()) * 1000.0) as u32;
-        {
-            let state = state.lock();
-            assert_eq!(state.started_with.as_deref(), Some("https://example.com"));
-            assert!(!state.viewports.is_empty());
-            let (width, height, scale_key) = state.viewports[0];
-            assert!(width > 0 && height > 0);
-            assert_eq!(scale_key, window_scale_key);
-            assert_eq!(state.focus_calls, vec![true]);
-        }
+        let window_scale = cx.update(|window, _| window.scale_factor());
+        assert_eq!(
+            controller.started_with().as_deref(),
+            Some("https://example.com")
+        );
+        let (width, height, scale_factor) = controller.last_viewport().unwrap();
+        assert!(width > 0 && height > 0);
+        assert_eq!(scale_factor, window_scale);
+        assert_eq!(controller.focus_calls(), vec![true]);
 
-        state.lock().events.extend([
+        // A page load plays out end to end: scripted engine events drain
+        // through the post-pump path into the item's state.
+        controller.script_events([
             TabBackendEvent::AddressChanged("https://example.com/docs".into()),
             TabBackendEvent::TitleChanged("Example Docs".into()),
             TabBackendEvent::LoadingStateChanged {
-                is_loading: false,
-                can_go_back: true,
+                is_loading: true,
+                can_go_back: false,
                 can_go_forward: false,
             },
         ]);
-        view.update(cx, |view, cx| view.drain_engine_events(cx));
+        pump(cx);
 
-        view.update(cx, |view, cx| {
+        view.update_in(cx, |view, window, cx| {
             assert_eq!(view.url(), "https://example.com/docs");
             assert_eq!(view.title(), "Example Docs");
+            assert!(view.is_loading());
+            assert!(
+                view.tab_icon(window, cx).is_none(),
+                "while loading, the spinner replaces the pane tab's icon slot"
+            );
+        });
+
+        controller.script_events([TabBackendEvent::LoadingStateChanged {
+            is_loading: false,
+            can_go_back: true,
+            can_go_forward: false,
+        }]);
+        pump(cx);
+
+        view.update(cx, |view, cx| {
+            assert!(!view.is_loading());
             assert!(view.can_go_back());
             assert!(!view.can_go_forward());
-            assert!(!view.is_loading());
             assert_eq!(
                 view.tab_content_text(0, cx).as_ref(),
                 "Example Docs",
@@ -870,7 +726,7 @@ mod tests {
     #[gpui::test]
     async fn test_frames_flow_through_the_presenter_seam(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -878,21 +734,19 @@ mod tests {
         assert!(!view.update(cx, |view, _| view.presenter.has_frame()));
 
         let (width, height) = (4, 4);
-        state.lock().paint_output = Some(PaintOutput::Software(SoftwareFrame {
+        controller.script_frame(SoftwareFrame {
             width,
             height,
             bgra: vec![0xff; (width * height * 4) as usize],
-        }));
-        state.lock().events.push_back(TabBackendEvent::FrameReady);
-        view.update(cx, |view, cx| view.drain_engine_events(cx));
-        cx.run_until_parked();
+        });
+        pump(cx);
 
         assert!(
             view.update(cx, |view, _| view.presenter.has_frame()),
             "presenter should hold the frame after the FrameReady render"
         );
         assert!(
-            state.lock().paint_output.is_none(),
+            !controller.has_staged_frame(),
             "render should have taken the paint output from the backend"
         );
     }
@@ -900,20 +754,19 @@ mod tests {
     #[gpui::test]
     async fn test_resize_propagates_scaled_viewport(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (_view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
         cx.run_until_parked();
-        let viewports_before = state.lock().viewports.len();
+        let viewports_before = viewport_count(&controller);
 
         cx.simulate_resize(size(px(500.), px(400.)));
         cx.run_until_parked();
 
-        let window_scale_key = (cx.update(|window, _| window.scale_factor()) * 1000.0) as u32;
-        let state = state.lock();
-        assert!(state.viewports.len() > viewports_before);
-        let (width, height, scale_key) = *state.viewports.last().unwrap();
+        let window_scale = cx.update(|window, _| window.scale_factor());
+        assert!(viewport_count(&controller) > viewports_before);
+        let (width, height, scale_factor) = controller.last_viewport().unwrap();
         assert_eq!(
             width, 500,
             "engine viewport tracks the resized logical bounds"
@@ -922,31 +775,55 @@ mod tests {
             height > 0 && height < 400,
             "engine viewport height excludes the navigation chrome, got {height}"
         );
-        assert_eq!(scale_key, window_scale_key);
+        assert_eq!(scale_factor, window_scale);
     }
 
     #[gpui::test]
     async fn test_engine_not_ready_defers_start_until_a_pump(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(false);
+        let (backend, controller) = StubTabBackend::new(false);
+        let (_view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(controller.started_with(), None);
+
+        // Engine comes up; the post-pump drain notices and triggers a render
+        // that starts the tab.
+        controller.set_engine_ready(true);
+        pump(cx);
+        assert_eq!(controller.started_with().as_deref(), Some(DEFAULT_URL));
+    }
+
+    #[gpui::test]
+    async fn test_start_failure_shows_the_error_and_is_not_retried(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (backend, controller) = StubTabBackend::new(true);
+        controller.fail_next_start("engine exploded");
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
         cx.run_until_parked();
-        assert_eq!(state.lock().started_with, None);
 
-        // Engine comes up; the post-pump drain notices and triggers a render
-        // that starts the tab.
-        state.lock().engine_ready = true;
-        view.update(cx, |view, cx| view.drain_engine_events(cx));
-        cx.run_until_parked();
-        assert_eq!(state.lock().started_with.as_deref(), Some(DEFAULT_URL));
+        assert_eq!(controller.started_with(), None);
+        view.update(cx, |view, _| {
+            assert_eq!(view.engine_error.as_deref(), Some("engine exploded"));
+        });
+
+        // Further pumps and renders must not retry the failed start.
+        pump(cx);
+        let starts = controller
+            .commands()
+            .iter()
+            .filter(|command| matches!(command, RecordedCommand::Start { .. }))
+            .count();
+        assert_eq!(starts, 1);
     }
 
     #[gpui::test]
     async fn test_plain_keys_route_to_the_page_but_app_chords_do_not(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -954,21 +831,21 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             window.focus(&view.focus_handle, cx);
         });
+        controller.take_commands();
 
         cx.simulate_keystrokes("a");
         assert_eq!(
-            state.lock().inputs,
-            vec![RecordedInput::KeyDown {
+            controller.take_commands(),
+            vec![RecordedCommand::KeyDown {
                 key: "a".into(),
                 is_held: false,
             }],
             "an unmodified printable key is forwarded to the page"
         );
 
-        state.lock().inputs.clear();
         cx.simulate_keystrokes("ctrl-t ctrl-shift-r");
         assert_eq!(
-            state.lock().inputs,
+            controller.take_commands(),
             vec![],
             "ctrl-modified chords are app-classified and never reach the page"
         );
@@ -981,7 +858,7 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         workspace.update_in(cx, |workspace, window, cx| {
             BrowserView::open_with_backend(workspace, window, cx, || Box::new(backend));
         });
@@ -998,18 +875,19 @@ mod tests {
             "inside a workspace pane the content sits below the tab bar"
         );
 
-        state.lock().inputs.clear();
+        controller.take_commands();
         let click_offset = point(px(15.), px(25.));
         cx.simulate_click(content_origin + click_offset, Modifiers::default());
         assert_eq!(
-            state.lock().inputs,
+            controller.take_commands(),
             vec![
-                RecordedInput::MouseDown {
+                RecordedCommand::SetFocus { focused: true },
+                RecordedCommand::MouseDown {
                     position: click_offset,
                     button: MouseButton::Left,
                     click_count: 1,
                 },
-                RecordedInput::MouseUp {
+                RecordedCommand::MouseUp {
                     position: click_offset,
                     button: MouseButton::Left,
                 },
@@ -1017,7 +895,6 @@ mod tests {
             "click coordinates are translated by the pane offset"
         );
 
-        state.lock().inputs.clear();
         cx.simulate_event(ScrollWheelEvent {
             position: content_origin + click_offset,
             delta: ScrollDelta::Lines(point(0.0, -2.0)),
@@ -1025,8 +902,8 @@ mod tests {
             touch_phase: TouchPhase::Moved,
         });
         assert_eq!(
-            state.lock().inputs,
-            vec![RecordedInput::ScrollWheel {
+            controller.take_commands(),
+            vec![RecordedCommand::ScrollWheel {
                 position: click_offset,
                 delta: (0.0, -2.0, true),
             }],
@@ -1037,7 +914,7 @@ mod tests {
     #[gpui::test]
     async fn test_navigation_actions_drive_the_backend(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -1045,20 +922,25 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             window.focus(&view.focus_handle, cx);
         });
+        controller.take_commands();
 
         cx.dispatch_action(GoBack);
         cx.dispatch_action(GoForward);
         cx.dispatch_action(Reload);
         assert_eq!(
-            state.lock().navigations,
-            vec!["go_back", "go_forward", "reload"]
+            controller.take_commands(),
+            vec![
+                RecordedCommand::GoBack,
+                RecordedCommand::GoForward,
+                RecordedCommand::Reload,
+            ]
         );
     }
 
     #[gpui::test]
     async fn test_omnibox_confirm_resolves_text_and_navigates(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -1078,13 +960,20 @@ mod tests {
             });
         });
 
+        controller.take_commands();
         cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
 
         assert_eq!(
-            state.lock().navigations,
-            vec!["navigate:https://example.com"],
-            "confirmed text is resolved through the URL heuristic"
+            controller.take_commands(),
+            vec![
+                RecordedCommand::Navigate {
+                    url: "https://example.com".into(),
+                },
+                RecordedCommand::SetFocus { focused: true },
+            ],
+            "confirmed text is resolved through the URL heuristic and the \
+             engine browser is refocused"
         );
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.url(), "https://example.com");
@@ -1098,17 +987,12 @@ mod tests {
                 "the omnibox mirrors the new address"
             );
         });
-        assert_eq!(
-            state.lock().focus_calls.last(),
-            Some(&true),
-            "the engine browser is refocused after navigating"
-        );
     }
 
     #[gpui::test]
     async fn test_omnibox_cancel_reverts_to_the_current_url(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), "https://example.com".into(), window, cx)
         });
@@ -1124,6 +1008,7 @@ mod tests {
             });
         });
 
+        controller.take_commands();
         cx.dispatch_action(menu::Cancel);
         cx.run_until_parked();
 
@@ -1131,8 +1016,8 @@ mod tests {
             assert_eq!(view.omnibox.read(cx).editor_text(cx), "https://example.com");
         });
         assert_eq!(
-            state.lock().navigations,
-            Vec::<String>::new(),
+            controller.take_commands(),
+            vec![],
             "cancelling never navigates"
         );
     }
@@ -1140,7 +1025,7 @@ mod tests {
     #[gpui::test]
     async fn test_typing_in_the_omnibox_does_not_reach_the_page(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -1150,10 +1035,11 @@ mod tests {
         });
 
         cx.dispatch_action(FocusOmnibox);
+        controller.take_commands();
         cx.simulate_input("zed");
 
         assert_eq!(
-            state.lock().inputs,
+            controller.take_commands(),
             vec![],
             "keystrokes aimed at the omnibox editor are not forwarded to the page"
         );
@@ -1165,7 +1051,7 @@ mod tests {
     #[gpui::test]
     async fn test_favicon_updates_tab_and_chrome_state(cx: &mut TestAppContext) {
         init_test(cx);
-        let (backend, state) = StubBackend::new(true);
+        let (backend, controller) = StubTabBackend::new(true);
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new(Box::new(backend), DEFAULT_URL.into(), window, cx)
         });
@@ -1178,10 +1064,10 @@ mod tests {
             );
         });
 
-        state.lock().events.push_back(TabBackendEvent::FaviconUrlsChanged(vec![
+        controller.script_events([TabBackendEvent::FaviconUrlsChanged(vec![
             "https://example.com/favicon.ico".to_string(),
-        ]));
-        view.update(cx, |view, cx| view.drain_engine_events(cx));
+        ])]);
+        pump(cx);
 
         view.update_in(cx, |view, window, cx| {
             assert_eq!(
@@ -1194,11 +1080,8 @@ mod tests {
             );
         });
 
-        state
-            .lock()
-            .events
-            .push_back(TabBackendEvent::FaviconUrlsChanged(Vec::new()));
-        view.update(cx, |view, cx| view.drain_engine_events(cx));
+        controller.script_events([TabBackendEvent::FaviconUrlsChanged(Vec::new())]);
+        pump(cx);
         view.update_in(cx, |view, window, cx| {
             assert!(view.favicon_url.is_none());
             assert!(view.tab_icon(window, cx).is_some());
@@ -1209,13 +1092,12 @@ mod tests {
     async fn test_open_is_a_workspace_singleton(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         let project = Project::test(app_state.fs.clone(), [], cx).await;
-        let (workspace, cx) = cx.add_window_view(|window, cx| {
-            Workspace::test_new(project.clone(), window, cx)
-        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
         workspace.update_in(cx, |workspace, window, cx| {
             BrowserView::open_with_backend(workspace, window, cx, || {
-                Box::new(StubBackend::new(false).0)
+                Box::new(StubTabBackend::new(false).0)
             });
         });
         cx.run_until_parked();
@@ -1229,7 +1111,7 @@ mod tests {
         // Opening again focuses the existing view instead of creating another.
         workspace.update_in(cx, |workspace, window, cx| {
             BrowserView::open_with_backend(workspace, window, cx, || {
-                Box::new(StubBackend::new(false).0)
+                Box::new(StubTabBackend::new(false).0)
             });
         });
         cx.run_until_parked();
@@ -1251,5 +1133,41 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<BrowserView>(cx).count(), 0);
         });
+    }
+
+    #[gpui::test]
+    async fn test_pump_observers_unregister_with_their_views(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        fn observer_count(cx: &mut VisualTestContext) -> usize {
+            cx.update(|_, cx| cx.default_global::<crate::PumpObservers>().0.len())
+        }
+
+        assert_eq!(observer_count(cx), 0);
+        workspace.update_in(cx, |workspace, window, cx| {
+            BrowserView::open_with_backend(workspace, window, cx, || {
+                Box::new(StubTabBackend::new(true).0)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(observer_count(cx), 1);
+
+        pump(cx);
+        assert_eq!(observer_count(cx), 1, "live observers survive pumps");
+
+        let pane = workspace.update(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_active_item(&Default::default(), window, cx)
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        // The released view's observer is dropped by the next pump.
+        pump(cx);
+        assert_eq!(observer_count(cx), 0);
     }
 }

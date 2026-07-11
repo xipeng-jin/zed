@@ -5,35 +5,50 @@
 //! item via software OSR. All engine communication flows through the
 //! tab-backend seam (`tab_backend.rs`) and all frame presentation through the
 //! frame-presenter seam (`frame_presenter.rs`).
+//!
+//! The real engine sits behind the `cef` cargo feature (enabled by
+//! `crates/zed` on desktop targets). Without it the crate contains everything
+//! above the tab-backend seam, so its deterministic tests build and run with
+//! no CEF distribution present (ticket #8).
 
 mod browser_view;
 mod frame_presenter;
 mod omnibox;
+#[cfg(any(test, feature = "test-support"))]
+mod stub_tab_backend;
 mod tab_backend;
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod cef_instance;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod client;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod display_handler;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod input;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod keycodes;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod life_span_handler;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod load_handler;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod render_handler;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 mod tab;
 
+#[cfg(all(
+    feature = "cef",
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
+compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows");
+
 pub use browser_view::{BrowserView, OpenBrowser};
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 pub use cef_instance::CefInstance;
 pub use frame_presenter::{FramePresenter, SoftwarePresenter};
+#[cfg(any(test, feature = "test-support"))]
+pub use stub_tab_backend::{RecordedCommand, StubTabBackend, StubTabController};
 pub use tab_backend::{PaintOutput, SoftwareFrame, TabBackend, TabBackendEvent};
 
 use gpui::App;
@@ -42,17 +57,17 @@ use gpui::App;
 /// before any other initialization: on Linux and Windows CEF subprocesses are
 /// this executable re-invoked with `--type=...` arguments, and this call never
 /// returns for them (it calls `std::process::exit`).
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 pub fn handle_cef_subprocess() -> anyhow::Result<()> {
     CefInstance::handle_subprocess()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(feature = "cef"))]
 pub fn handle_cef_subprocess() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
     match CefInstance::initialize(cx) {
         Ok(_) => {
@@ -75,7 +90,7 @@ pub fn init(cx: &mut App) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(feature = "cef"))]
 pub fn init(_cx: &mut App) {}
 
 /// Callbacks run on the foreground thread after every message-pump iteration,
@@ -92,7 +107,7 @@ pub(crate) fn observe_pumps(cx: &mut App, callback: impl FnMut(&mut App) -> bool
         .push(Box::new(callback));
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(feature = "cef", test, feature = "test-support"))]
 fn run_pump_observers(cx: &mut App) {
     // Take the observers out while running them: an observer may register new
     // observers (e.g. a drain callback opening another view), which land in
@@ -105,6 +120,14 @@ fn run_pump_observers(cx: &mut App) {
     global.0.extend(newly_registered);
 }
 
+/// Test stand-in for one message-pump iteration: runs the pump observers
+/// exactly as the real pump does after `do_message_loop_work`, so scripted
+/// stub events drain into browser views through the same path CEF events do.
+#[cfg(any(test, feature = "test-support"))]
+pub fn simulate_message_pump(cx: &mut App) {
+    run_pump_observers(cx);
+}
+
 /// Drive CEF's external message pump from a GPUI foreground task.
 ///
 /// CEF reports when it next wants `do_message_loop_work` called via
@@ -115,7 +138,7 @@ fn run_pump_observers(cx: &mut App) {
 /// mid-sleep (frame paints, input) wait at most ~1ms — keeping frame delivery
 /// latency under half a frame at 60fps
 /// (`Glass:crates/browser/src/browser_view/tabs.rs:387`).
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(feature = "cef")]
 fn start_message_pump(cx: &mut App) {
     use std::time::Duration;
 

@@ -228,6 +228,11 @@ zed_env_vars.workspace = true
 zlog.workspace = true
 zlog_settings.workspace = true
 
+# The browser crate compiles without its engine by default so its tests need
+# no CEF distribution; the shipped binary gets the real engine.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+browser = { workspace = true, features = ["cef"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 etw_tracing.workspace = true
 windows.workspace = true
