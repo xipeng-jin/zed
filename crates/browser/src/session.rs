@@ -6,6 +6,7 @@
 //! (`cef_instance.rs`, `browser_cache` + `persist_session_cookies`).
 
 use crate::bookmarks::Bookmark;
+use crate::downloads::DownloadUpdate;
 use crate::history::HistoryEntry;
 use db::kvp::KeyValueStore;
 use gpui::App;
@@ -15,6 +16,7 @@ use util::ResultExt as _;
 const BROWSER_TABS_KEY: &str = "browser_tabs";
 const BROWSER_HISTORY_KEY: &str = "browser_history";
 const BROWSER_BOOKMARKS_KEY: &str = "browser_bookmarks";
+const BROWSER_DOWNLOADS_KEY: &str = "browser_downloads";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SerializedBrowserTabs {
@@ -68,5 +70,18 @@ pub(crate) fn restore_bookmarks(cx: &App) -> Option<Vec<Bookmark>> {
 pub(crate) async fn save_bookmarks(store: KeyValueStore, bookmarks: String) -> anyhow::Result<()> {
     store
         .write_kvp(BROWSER_BOOKMARKS_KEY.to_string(), bookmarks)
+        .await
+}
+
+pub(crate) fn restore_downloads(cx: &App) -> Option<Vec<DownloadUpdate>> {
+    let json = KeyValueStore::global(cx)
+        .read_kvp(BROWSER_DOWNLOADS_KEY)
+        .log_err()??;
+    serde_json::from_str(&json).log_err()
+}
+
+pub(crate) async fn save_downloads(store: KeyValueStore, downloads: String) -> anyhow::Result<()> {
+    store
+        .write_kvp(BROWSER_DOWNLOADS_KEY.to_string(), downloads)
         .await
 }

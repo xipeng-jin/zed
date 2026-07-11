@@ -7,6 +7,7 @@
 //! active tab swaps whole presenters and one tab's frames can never bleed
 //! into another's.
 
+use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
 use crate::tab_backend::{TabBackend, TabBackendEvent};
 use gpui::{
@@ -34,6 +35,10 @@ pub(crate) struct DrainedChanges {
     /// in browsing history (`Glass:crates/browser/src/browser_view.rs:863`).
     /// Favicon changes deliberately do not count as visits.
     pub visited: bool,
+    /// Download progress reported by the engine, for the view to fold into
+    /// the app-global download list. No `needs_notify`: views re-render
+    /// through their observation of that list instead.
+    pub downloads: Vec<DownloadUpdate>,
 }
 
 pub(crate) struct BrowserTab {
@@ -245,6 +250,9 @@ impl BrowserTab {
                 TabBackendEvent::FrameReady => changes.needs_notify = true,
                 TabBackendEvent::LoadError { url, error_text } => {
                     log::warn!("[browser] load error for {url}: {error_text}");
+                }
+                TabBackendEvent::DownloadUpdated(update) => {
+                    changes.downloads.push(update);
                 }
             }
         }

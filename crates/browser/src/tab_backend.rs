@@ -7,6 +7,7 @@
 //! behind the `cef` feature) and the scripted stub for deterministic tests
 //! (`stub_tab_backend.rs`).
 
+use crate::downloads::DownloadUpdate;
 use anyhow::Result;
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
 #[cfg(feature = "cef")]
@@ -36,6 +37,8 @@ pub enum TabBackendEvent {
     FrameReady,
     /// The main frame failed to load.
     LoadError { url: String, error_text: String },
+    /// A download this tab initiated started or progressed.
+    DownloadUpdated(DownloadUpdate),
 }
 
 /// One software-OSR frame: a tightly-packed premultiplied BGRA buffer at

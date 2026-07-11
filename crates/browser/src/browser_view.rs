@@ -14,6 +14,7 @@
 
 use crate::bookmarks::{Bookmark, BrowserBookmarks};
 use crate::browser_tab::{BrowserTab, ClosedTab};
+use crate::downloads::BrowserDownloads;
 use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
@@ -28,6 +29,7 @@ use gpui::{
 };
 use notifications::status_toast::StatusToast;
 use project::Project;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use ui::{
@@ -69,6 +71,8 @@ actions!(
         BookmarkCurrentPage,
         /// Copies the current page's URL to the clipboard.
         CopyUrl,
+        /// Shows or hides the download center.
+        ToggleDownloadCenter,
     ]
 );
 
@@ -138,6 +142,10 @@ pub struct BrowserView {
     history: Entity<BrowserHistory>,
     /// The app-wide shared bookmarks, shown as the bookmark bar.
     bookmarks: Entity<BrowserBookmarks>,
+    /// The app-wide shared download list; this view records its tabs'
+    /// download progress into it and the download center shows it.
+    downloads: Entity<BrowserDownloads>,
+    download_center_visible: bool,
     /// The workspace this view was added to, for showing status toasts.
     workspace: Option<WeakEntity<Workspace>>,
     /// Window-relative bounds of the page content area, captured at draw time;
@@ -154,6 +162,9 @@ pub struct BrowserView {
     /// Bookmark mutations re-render this view's bookmark bar and chrome,
     /// whichever browser view made them.
     _bookmarks_observation: Subscription,
+    /// Download progress re-renders this view's download center, whichever
+    /// browser view's tab is downloading.
+    _downloads_observation: Subscription,
 }
 
 /// M1 subset of Glass's three-way key dispatch
@@ -239,6 +250,8 @@ impl BrowserView {
         let history = BrowserHistory::global(cx);
         let bookmarks = BrowserBookmarks::global(cx);
         let bookmarks_observation = cx.observe(&bookmarks, |_, _, cx| cx.notify());
+        let downloads = BrowserDownloads::global(cx);
+        let downloads_observation = cx.observe(&downloads, |_, _, cx| cx.notify());
         let omnibox = cx.new(|cx| Omnibox::new(history.clone(), window, cx));
         cx.subscribe_in(&omnibox, window, |this, _, event, window, cx| {
             let OmniboxEvent::Navigate(url) = event;
@@ -256,12 +269,15 @@ impl BrowserView {
             omnibox,
             history,
             bookmarks,
+            downloads,
+            download_center_visible: false,
             workspace: None,
             content_bounds: Bounds::default(),
             is_incognito,
             pending_session_save: None,
             _quit_flush: cx.on_app_quit(Self::flush_session_on_quit),
             _bookmarks_observation: bookmarks_observation,
+            _downloads_observation: downloads_observation,
         };
 
         let saved = if initial_url.is_none() && Self::is_session_owner(cx) {
@@ -508,8 +524,10 @@ impl BrowserView {
         let mut active_identity_changed = false;
         let mut session_changed = false;
         let mut visits = Vec::new();
+        let mut download_updates = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
-            let changes = tab.drain_events();
+            let mut changes = tab.drain_events();
+            download_updates.append(&mut changes.downloads);
             if changes.identity_changed || changes.needs_notify {
                 // Any tab's title or favicon shows in the tab strip.
                 needs_notify = true;
@@ -534,6 +552,12 @@ impl BrowserView {
                     history.record_visit(&url, &title, cx);
                 });
             }
+        }
+        for update in download_updates {
+            let is_incognito = self.is_incognito;
+            self.downloads.update(cx, |downloads, cx| {
+                downloads.record_update(update, is_incognito, cx);
+            });
         }
         if session_changed {
             self.schedule_session_save(cx);
@@ -810,6 +834,11 @@ impl BrowserView {
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_status_toast(toast, cx);
         });
+    }
+
+    fn toggle_download_center(&mut self, cx: &mut Context<Self>) {
+        self.download_center_visible = !self.download_center_visible;
+        cx.notify();
     }
 
     fn handle_mouse_down(
@@ -1202,6 +1231,124 @@ impl BrowserView {
         )
     }
 
+    /// The download center: a panel anchored to the content area's top-right
+    /// listing every download, newest first, with live status lines
+    /// (`Glass:crates/browser/src/browser_view/content.rs:198`).
+    fn render_download_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .downloads
+            .read(cx)
+            .downloads()
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                // Rows are keyed by list position, not engine download id:
+                // ids restart every session, so a restored record can share
+                // its id with a new download's.
+                let saved_path = record
+                    .update
+                    .is_complete
+                    .then(|| record.update.full_path.clone())
+                    .flatten();
+                v_flex()
+                    .w_full()
+                    .p_2()
+                    .gap_0p5()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div().flex_1().min_w_0().overflow_hidden().child(
+                                    Label::new(record.display_name())
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                ),
+                            )
+                            .when(record.is_incognito, |this| {
+                                this.child(
+                                    Label::new("Incognito")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            }),
+                    )
+                    .child(
+                        Label::new(record.status_text())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when_some(saved_path, |this, saved_path| {
+                        let open_path = saved_path.clone();
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new(("browser-download-open", index), "Open")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(move |_, _, cx| {
+                                            cx.open_with_system(Path::new(&open_path));
+                                        }),
+                                )
+                                .child(
+                                    Button::new(
+                                        ("browser-download-reveal", index),
+                                        "Show in Folder",
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .on_click(move |_, _, cx| {
+                                        cx.reveal_path(Path::new(&saved_path));
+                                    }),
+                                ),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let is_empty = rows.is_empty();
+
+        v_flex()
+            .id("browser-download-center")
+            .absolute()
+            .top_2()
+            .right_2()
+            .w(px(360.))
+            .max_h(px(360.))
+            .overflow_y_scroll()
+            .occlude()
+            // The content div behind this panel forwards mouse input to the
+            // page; a click meant for the panel must not also click whatever
+            // the page shows underneath it.
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
+            .shadow_md()
+            .child(
+                div()
+                    .w_full()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(Label::new("Downloads").size(LabelSize::Small)),
+            )
+            .when(is_empty, |this| {
+                this.child(
+                    div().w_full().p_3().child(
+                        Label::new("No downloads yet")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .children(rows)
+    }
+
     fn render_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tab = self.active_tab();
         let title = active_tab.title().trim().to_string();
@@ -1263,6 +1410,15 @@ impl BrowserView {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_bookmark_for_active_tab(cx)
                     })),
+            )
+            .child(
+                IconButton::new("browser-downloads", IconName::Download)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.download_center_visible)
+                    .tooltip(Tooltip::text("Downloads"))
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_download_center(cx)),
+                    ),
             )
             .when(!title.is_empty(), |this| {
                 this.child(
@@ -1338,6 +1494,9 @@ impl Render for BrowserView {
             })
             .when(!has_frame && !is_new_tab_page, |this| {
                 this.child(self.render_placeholder(cx))
+            })
+            .when(self.download_center_visible, |this| {
+                this.child(self.render_download_center(cx))
             });
 
         div()
@@ -1378,6 +1537,9 @@ impl Render for BrowserView {
                 this.toggle_bookmark_for_active_tab(cx)
             }))
             .on_action(cx.listener(|this, _: &CopyUrl, _, cx| this.copy_url(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDownloadCenter, _, cx| {
+                this.toggle_download_center(cx)
+            }))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .child(self.render_tab_strip(cx))
@@ -1529,6 +1691,7 @@ impl SerializableItem for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downloads::DownloadUpdate;
     use crate::omnibox::OmniboxSuggestion;
     use crate::stub_tab_backend::{RecordedCommand, StubBackendFactory, StubTabController};
     use crate::tab_backend::{SoftwareFrame, TabBackendEvent};
@@ -3546,6 +3709,153 @@ mod tests {
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some("https://example.com/docs".to_string()),
             "CopyUrl puts the active tab's address on the clipboard"
+        );
+    }
+
+    fn download_update(id: u32) -> DownloadUpdate {
+        DownloadUpdate {
+            id,
+            url: format!("https://example.com/files/file-{id}.zip"),
+            original_url: format!("https://example.com/files/file-{id}.zip"),
+            suggested_file_name: format!("file-{id}.zip"),
+            full_path: None,
+            current_speed: 1024,
+            percent_complete: 0,
+            total_bytes: 4096,
+            received_bytes: 0,
+            is_in_progress: true,
+            is_complete: false,
+            is_canceled: false,
+            is_interrupted: false,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_download_updates_fold_into_the_shared_download_list(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+
+        // A download progresses and completes; each engine report folds into
+        // the same record.
+        factory
+            .controller(0)
+            .script_events([TabBackendEvent::DownloadUpdated(download_update(1))]);
+        pump(cx);
+        let mut progress = download_update(1);
+        progress.percent_complete = 50;
+        progress.received_bytes = 2048;
+        let mut complete = download_update(1);
+        complete.is_in_progress = false;
+        complete.is_complete = true;
+        complete.percent_complete = 100;
+        complete.received_bytes = 4096;
+        complete.full_path = Some("/home/user/Downloads/file-1.zip".to_string());
+        factory.controller(0).script_events([
+            TabBackendEvent::DownloadUpdated(progress),
+            TabBackendEvent::DownloadUpdated(complete),
+        ]);
+        pump(cx);
+
+        view.update(cx, |view, cx| {
+            let downloads = view.downloads.read(cx);
+            assert_eq!(downloads.downloads().len(), 1);
+            let record = &downloads.downloads()[0];
+            assert_eq!(record.display_name(), "file-1.zip");
+            assert_eq!(record.status_text(), "Complete");
+            assert_eq!(
+                record.update.full_path.as_deref(),
+                Some("/home/user/Downloads/file-1.zip")
+            );
+        });
+
+        // The download center starts hidden and toggles with the action.
+        view.update(cx, |view, _| assert!(!view.download_center_visible));
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.dispatch_action(ToggleDownloadCenter);
+        view.update(cx, |view, _| assert!(view.download_center_visible));
+        cx.dispatch_action(ToggleDownloadCenter);
+        view.update(cx, |view, _| assert!(!view.download_center_visible));
+    }
+
+    #[gpui::test]
+    async fn test_download_records_persist_and_restore(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+
+        let mut complete = download_update(3);
+        complete.is_in_progress = false;
+        complete.is_complete = true;
+        complete.full_path = Some("/home/user/Downloads/file-3.zip".to_string());
+        factory
+            .controller(0)
+            .script_events([TabBackendEvent::DownloadUpdated(complete)]);
+        pump(cx);
+
+        // The blob write is debounced like the session's.
+        assert!(
+            cx.update(|_, cx| crate::session::restore_downloads(cx).is_none()),
+            "nothing is written before the debounce elapses"
+        );
+        cx.executor()
+            .advance_clock(crate::downloads::DOWNLOADS_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = cx
+            .update(|_, cx| crate::session::restore_downloads(cx))
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, 3);
+        assert!(saved[0].is_complete);
+
+        // A store built from the persisted blob (as after a restart) holds
+        // the record, and a new session's download reusing the id does not
+        // overwrite it.
+        let restored_store = cx.update(|_, cx| cx.new(BrowserDownloads::new));
+        restored_store.update(cx, |downloads, cx| {
+            assert_eq!(downloads.downloads().len(), 1);
+            assert!(downloads.downloads()[0].is_restored);
+            assert_eq!(downloads.downloads()[0].status_text(), "Complete");
+            downloads.record_update(download_update(3), false, cx);
+            assert_eq!(
+                downloads.downloads().len(),
+                2,
+                "downloads of a new session never fold into restored records"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_incognito_downloads_are_listed_but_never_persisted(cx: &mut TestAppContext) {
+        init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new_incognito(
+                backend_factory(&factory),
+                DEFAULT_URL.to_string(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        factory
+            .controller(0)
+            .script_events([TabBackendEvent::DownloadUpdated(download_update(9))]);
+        pump(cx);
+
+        view.update(cx, |view, cx| {
+            let downloads = view.downloads.read(cx);
+            assert_eq!(downloads.downloads().len(), 1);
+            assert!(downloads.downloads()[0].is_incognito);
+        });
+
+        cx.executor()
+            .advance_clock(crate::downloads::DOWNLOADS_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| crate::session::restore_downloads(cx).is_none()),
+            "incognito downloads never reach the KV store"
         );
     }
 }

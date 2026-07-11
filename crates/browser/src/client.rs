@@ -1,8 +1,10 @@
-//! CEF client, ported (M1 subset) from `Glass:crates/browser/src/client.rs`.
-//! Ties together the render, load, display, life-span, and keyboard handlers.
-//! Download, find, request, context-menu, and permission handlers join in M2.
+//! CEF client, ported (M2 subset) from `Glass:crates/browser/src/client.rs`.
+//! Ties together the render, load, display, life-span, keyboard, and download
+//! handlers. Find, request, context-menu, and permission handlers join with
+//! their M2 tickets.
 
 use crate::display_handler::{DisplayHandlerBuilder, OsrDisplayHandler};
+use crate::download_handler::{DownloadHandlerBuilder, OsrDownloadHandler};
 use crate::life_span_handler::{LifeSpanHandlerBuilder, OsrLifeSpanHandler};
 use crate::load_handler::{LoadHandlerBuilder, OsrLoadHandler};
 use crate::render_handler::{OsrRenderHandler, RenderHandlerBuilder, RenderState};
@@ -10,9 +12,9 @@ use crate::tab_backend::EventSender;
 #[cfg(target_os = "windows")]
 use cef::sys::tagMSG;
 use cef::{
-    Browser, Client, DisplayHandler, ImplClient, ImplKeyboardHandler, KeyEvent, KeyboardHandler,
-    LifeSpanHandler, LoadHandler, RenderHandler, WrapClient, WrapKeyboardHandler, rc::Rc as _,
-    wrap_client, wrap_keyboard_handler,
+    Browser, Client, DisplayHandler, DownloadHandler, ImplClient, ImplKeyboardHandler, KeyEvent,
+    KeyboardHandler, LifeSpanHandler, LoadHandler, RenderHandler, WrapClient, WrapKeyboardHandler,
+    rc::Rc as _, wrap_client, wrap_keyboard_handler,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -67,6 +69,7 @@ wrap_client! {
         display_handler: DisplayHandler,
         life_span_handler: LifeSpanHandler,
         keyboard_handler: KeyboardHandler,
+        download_handler: DownloadHandler,
     }
 
     impl Client {
@@ -89,6 +92,10 @@ wrap_client! {
         fn keyboard_handler(&self) -> Option<cef::KeyboardHandler> {
             Some(self.keyboard_handler.clone())
         }
+
+        fn download_handler(&self) -> Option<cef::DownloadHandler> {
+            Some(self.download_handler.clone())
+        }
     }
 }
 
@@ -97,13 +104,15 @@ impl ClientBuilder {
         let render_handler = OsrRenderHandler::new(render_state, event_sender.clone());
         let load_handler = OsrLoadHandler::new(event_sender.clone());
         let display_handler = OsrDisplayHandler::new(event_sender.clone());
-        let life_span_handler = OsrLifeSpanHandler::new(event_sender);
+        let life_span_handler = OsrLifeSpanHandler::new(event_sender.clone());
+        let download_handler = OsrDownloadHandler::new(event_sender);
         Self::new(
             RenderHandlerBuilder::build(render_handler),
             LoadHandlerBuilder::build(load_handler),
             DisplayHandlerBuilder::build(display_handler),
             LifeSpanHandlerBuilder::build(life_span_handler),
             KeyboardHandlerBuilder::build(),
+            DownloadHandlerBuilder::build(download_handler),
         )
     }
 }
