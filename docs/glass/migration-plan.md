@@ -354,6 +354,7 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 | `Cargo.toml` (workspace) | Add `crates/browser` member + `browser` and `cef` workspace deps | M1 |
 | `crates/zed/Cargo.toml` | Add `browser` dep | M1 |
 | `crates/zed/src/main.rs` | (a) `browser::handle_cef_subprocess()` as first statement of `main()`, cfg'd for linux+macos+windows; (b) `browser::init(cx)` in the existing init block | M1 |
+| `crates/zed/src/zed.rs` | Add `browser` to `test_action_namespaces`' expected list — the test enumerates every registered action namespace, so the browser actions (M1) break it without this one-line entry. *(Added retroactively during ticket #9, when the zed-crate suite was first run against the branch.)* | M1 |
 | `assets/keymaps/default-linux.json`, `default-macos.json` | Context-scoped `BrowserView` bindings | M2 |
 | `assets/settings/default.json` | `browser` settings section defaults | M2 |
 | `crates/settings_content/src/settings_content.rs` (+ new `browser` content module) | Register the `browser` settings schema — upstream centralizes settings-content structs in this crate (see its `terminal` module) | M2 |

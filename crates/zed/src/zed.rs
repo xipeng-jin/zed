@@ -5354,6 +5354,7 @@ mod tests {
                 "branch_picker",
                 "bedrock",
                 "branches",
+                "browser",
                 "buffer_search",
                 "channel_modal",
                 "cli",

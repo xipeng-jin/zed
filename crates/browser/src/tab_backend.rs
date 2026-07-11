@@ -91,6 +91,11 @@ pub trait TabBackend: 'static {
 
     fn set_focus(&mut self, focused: bool);
 
+    /// Tell the engine whether this tab is currently presented. Hidden tabs
+    /// stop painting until shown again; their last frame stays with their
+    /// presenter.
+    fn set_hidden(&mut self, hidden: bool);
+
     fn send_mouse_down(
         &mut self,
         position: Point<Pixels>,

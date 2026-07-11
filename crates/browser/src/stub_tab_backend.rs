@@ -36,6 +36,9 @@ pub enum RecordedCommand {
     SetFocus {
         focused: bool,
     },
+    SetHidden {
+        hidden: bool,
+    },
     MouseDown {
         position: Point<Pixels>,
         button: MouseButton,
@@ -175,6 +178,54 @@ impl StubTabController {
     }
 }
 
+/// Hands out [`StubTabBackend`]s to a multi-tab browser view while retaining
+/// every controller, so tests can script and inspect each browser tab's engine
+/// half individually — in the order the tabs were created.
+#[derive(Clone, Default)]
+pub struct StubBackendFactory {
+    engine_ready: bool,
+    controllers: Arc<Mutex<Vec<StubTabController>>>,
+}
+
+impl StubBackendFactory {
+    pub fn new(engine_ready: bool) -> Self {
+        Self {
+            engine_ready,
+            controllers: Arc::default(),
+        }
+    }
+
+    pub fn create_backend(&self) -> Box<dyn TabBackend> {
+        let (backend, controller) = StubTabBackend::new(self.engine_ready);
+        self.controllers.lock().push(controller);
+        Box::new(backend)
+    }
+
+    /// Controller for the `index`-th backend created, in creation order.
+    pub fn controller(&self, index: usize) -> StubTabController {
+        self.controllers.lock()[index].clone()
+    }
+
+    /// Number of backends created so far.
+    pub fn created_count(&self) -> usize {
+        self.controllers.lock().len()
+    }
+
+    /// Controllers whose backends received a `Close` command.
+    pub fn closed_count(&self) -> usize {
+        self.controllers
+            .lock()
+            .iter()
+            .filter(|controller| {
+                controller
+                    .commands()
+                    .iter()
+                    .any(|command| matches!(command, RecordedCommand::Close))
+            })
+            .count()
+    }
+}
+
 impl TabBackend for StubTabBackend {
     fn engine_ready(&self) -> bool {
         self.0.lock().engine_ready
@@ -228,6 +279,10 @@ impl TabBackend for StubTabBackend {
 
     fn set_focus(&mut self, focused: bool) {
         self.record(RecordedCommand::SetFocus { focused });
+    }
+
+    fn set_hidden(&mut self, hidden: bool) {
+        self.record(RecordedCommand::SetHidden { hidden });
     }
 
     fn send_mouse_down(

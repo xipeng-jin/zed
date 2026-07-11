@@ -209,6 +209,12 @@ impl TabBackend for CefTab {
         });
     }
 
+    fn set_hidden(&mut self, hidden: bool) {
+        self.with_host(|host| {
+            host.was_hidden(if hidden { 1 } else { 0 });
+        });
+    }
+
     fn send_mouse_down(
         &mut self,
         position: Point<Pixels>,

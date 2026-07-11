@@ -11,6 +11,7 @@
 //! above the tab-backend seam, so its deterministic tests build and run with
 //! no CEF distribution present (ticket #8).
 
+mod browser_tab;
 mod browser_view;
 mod frame_presenter;
 mod omnibox;
@@ -48,7 +49,9 @@ pub use browser_view::{BrowserView, OpenBrowser};
 pub use cef_instance::CefInstance;
 pub use frame_presenter::{FramePresenter, SoftwarePresenter};
 #[cfg(any(test, feature = "test-support"))]
-pub use stub_tab_backend::{RecordedCommand, StubTabBackend, StubTabController};
+pub use stub_tab_backend::{
+    RecordedCommand, StubBackendFactory, StubTabBackend, StubTabController,
+};
 pub use tab_backend::{PaintOutput, SoftwareFrame, TabBackend, TabBackendEvent};
 
 use gpui::App;
