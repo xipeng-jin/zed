@@ -408,6 +408,11 @@ Linux, split next to an editor and a terminal, quit cleanly.**
    measure before touching gpui.
 6. Port `client.rs` + the trivially-neutral handlers needed to boot: load, display,
    render, life_span (minimal: allow default, no popup redirect yet).
+   *Deviation (2026-07-11, ticket #5):* the minimal life-span handler **cancels**
+   popups instead of allowing CEF's default. The default would create the popup
+   with the opener tab's client, so its off-screen paints would corrupt the
+   opener's render state. The full popup routing (tab redirect + native windows
+   with a separate client) restores popup support in M2 step 6 (ticket #15).
 7. Input, minimal: mouse click/move/wheel with bounds offset; key events via a new
    Linux mapping (gpui `Keystroke` key names → `key_name_to_windows_vk`, which is
    already portable; add scancode fallback only if names prove insufficient).

@@ -488,10 +488,17 @@ impl CefInstance {
 
         log::info!("[browser] CEF shutdown: starting");
 
-        // When browser tabs exist (M2), all CEF browser handles must be
-        // force-closed and dropped here, before cef::shutdown(): CEF asserts
-        // that no BrowserContext instances remain, and GPUI's entity lifecycle
-        // doesn't guarantee entities drop before quit futures run.
+        // All CEF browser handles must be force-closed and dropped before
+        // cef::shutdown(): CEF asserts that no BrowserContext instances
+        // remain, and GPUI's entity lifecycle doesn't guarantee entities drop
+        // before quit futures run. Pump a few times afterwards so CEF
+        // processes the closes (Glass:crates/browser/src/cef_instance.rs:492).
+        let closed = crate::tab::close_all_browsers();
+        if closed > 0 {
+            for _ in 0..10 {
+                cef::do_message_loop_work();
+            }
+        }
 
         // Prevent regular pump scheduling from interfering.
         CEF_CONTEXT_READY.store(false, Ordering::SeqCst);

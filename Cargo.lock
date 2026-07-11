@@ -2455,9 +2455,15 @@ dependencies = [
  "anyhow",
  "cef",
  "gpui",
+ "image",
  "log",
  "parking_lot",
  "paths",
+ "project",
+ "smallvec",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

@@ -15,9 +15,19 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
+image.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
+smallvec.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 cef.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
