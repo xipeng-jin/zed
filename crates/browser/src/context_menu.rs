@@ -38,6 +38,7 @@ pub(crate) enum MenuCommand {
     GoBack,
     GoForward,
     Reload,
+    Inspect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,10 +55,10 @@ fn entry(label: &'static str, command: MenuCommand) -> MenuItem {
 }
 
 /// Map the page context to the menu shown, mirroring Glass's menu
-/// (`Glass:crates/browser/src/browser_view/context_menu.rs:30`) minus the
-/// DevTools entry (ticket #20): a link block, then either the editable-field
-/// edit actions or a plain selection's Copy, then page navigation when
-/// nothing more specific applies.
+/// (`Glass:crates/browser/src/browser_view/context_menu.rs:30`): a link
+/// block, then either the editable-field edit actions or a plain selection's
+/// Copy, then page navigation when nothing more specific applies, and always
+/// Inspect last (DevTools, ticket #20).
 pub(crate) fn context_menu_model(context: &ContextMenuContext) -> Vec<MenuItem> {
     let mut items = Vec::new();
     let has_link = context.link_url.is_some();
@@ -113,18 +114,19 @@ pub(crate) fn context_menu_model(context: &ContextMenuContext) -> Vec<MenuItem> 
         items.push(entry("Reload", MenuCommand::Reload));
     }
 
-    let items = normalize_separators(items);
+    let mut items = normalize_separators(items);
     if items.is_empty() {
         // An editable field that reports no edit capabilities would otherwise
-        // yield an empty menu, which the UI cannot show.
-        vec![
+        // yield only Inspect, which is too little to right-click for.
+        items = vec![
             entry("Back", MenuCommand::GoBack),
             entry("Forward", MenuCommand::GoForward),
             entry("Reload", MenuCommand::Reload),
-        ]
-    } else {
-        items
+        ];
     }
+    items.push(MenuItem::Separator);
+    items.push(entry("Inspect", MenuCommand::Inspect));
+    items
 }
 
 /// Drop leading, trailing, and doubled separators left by skipped optional
@@ -168,7 +170,13 @@ mod tests {
 
         assert_eq!(
             labels(&model),
-            vec!["Open Link in New Tab", "Copy Link Address", "Download Link"],
+            vec![
+                "Open Link in New Tab",
+                "Copy Link Address",
+                "Download Link",
+                "—",
+                "Inspect",
+            ],
         );
         assert_eq!(
             model[0],
@@ -194,12 +202,13 @@ mod tests {
             ..Default::default()
         });
 
+        assert_eq!(labels(&model), vec!["Copy", "—", "Inspect"]);
         assert_eq!(
-            model,
-            vec![MenuItem::Entry {
+            model[0],
+            MenuItem::Entry {
                 label: "Copy",
                 command: MenuCommand::Copy,
-            }],
+            },
         );
     }
 
@@ -217,7 +226,17 @@ mod tests {
 
         assert_eq!(
             labels(&model),
-            vec!["Undo", "—", "Cut", "Copy", "Paste", "—", "Select All"],
+            vec![
+                "Undo",
+                "—",
+                "Cut",
+                "Copy",
+                "Paste",
+                "—",
+                "Select All",
+                "—",
+                "Inspect",
+            ],
         );
         assert!(
             !model.iter().any(|item| matches!(
@@ -240,7 +259,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(labels(&model), vec!["Copy"]);
+        assert_eq!(labels(&model), vec!["Copy", "—", "Inspect"]);
         assert_eq!(
             model[0],
             MenuItem::Entry {
@@ -270,6 +289,8 @@ mod tests {
                 "Paste",
                 "—",
                 "Select All",
+                "—",
+                "Inspect",
             ],
         );
     }
@@ -278,13 +299,24 @@ mod tests {
     fn plain_page_context_offers_navigation() {
         let model = context_menu_model(&ContextMenuContext::default());
 
-        assert_eq!(labels(&model), vec!["Back", "Forward", "Reload"]);
+        assert_eq!(
+            labels(&model),
+            vec!["Back", "Forward", "Reload", "—", "Inspect"]
+        );
         assert_eq!(
             model[2],
             MenuItem::Entry {
                 label: "Reload",
                 command: MenuCommand::Reload,
             },
+        );
+        assert_eq!(
+            model.last(),
+            Some(&MenuItem::Entry {
+                label: "Inspect",
+                command: MenuCommand::Inspect,
+            }),
+            "every context ends with Inspect (ticket #20)",
         );
     }
 
@@ -295,6 +327,9 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(labels(&model), vec!["Back", "Forward", "Reload"]);
+        assert_eq!(
+            labels(&model),
+            vec!["Back", "Forward", "Reload", "—", "Inspect"]
+        );
     }
 }

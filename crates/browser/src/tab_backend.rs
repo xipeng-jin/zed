@@ -259,6 +259,10 @@ pub trait TabBackend: 'static {
     /// had triggered it.
     fn start_download(&mut self, url: &str);
 
+    /// Open the engine's developer tools attached to this tab, in a native
+    /// engine-managed window.
+    fn open_devtools(&mut self);
+
     /// Close the underlying engine browser. Also invoked on drop.
     fn close(&mut self);
 

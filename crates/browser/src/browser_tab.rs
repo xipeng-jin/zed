@@ -460,6 +460,10 @@ impl BrowserTab {
         self.backend.start_download(url);
     }
 
+    pub fn open_devtools(&mut self) {
+        self.backend.open_devtools();
+    }
+
     /// Move the latest engine frame, if any, into this tab's presenter.
     pub fn present_pending_frame(&mut self) {
         if let Some(output) = self.backend.take_paint_output() {

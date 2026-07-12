@@ -62,7 +62,7 @@ mod tab;
 compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows");
 
 pub use browser_settings::BrowserSettings;
-pub use browser_view::{BrowserView, OpenBrowser, TabBackendFactory};
+pub use browser_view::{BrowserView, NewIncognitoWindow, OpenBrowser, TabBackendFactory};
 pub use context_menu::ContextMenuContext;
 pub use downloads::DownloadUpdate;
 #[cfg(feature = "cef")]

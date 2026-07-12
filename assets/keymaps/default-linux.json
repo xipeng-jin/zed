@@ -1283,6 +1283,9 @@
       "ctrl-shift-tab": "browser::PreviousTab",
       "alt-left": "browser::GoBack",
       "alt-right": "browser::GoForward",
+      "f12": "browser::OpenDevTools",
+      "ctrl-shift-i": "browser::OpenDevTools",
+      "ctrl-shift-n": "browser::NewIncognitoWindow",
     },
   },
   {

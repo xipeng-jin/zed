@@ -91,6 +91,7 @@ pub enum RecordedCommand {
     StartDownload {
         url: String,
     },
+    OpenDevTools,
     Close,
 }
 
@@ -422,6 +423,10 @@ impl TabBackend for StubTabBackend {
         self.record(RecordedCommand::StartDownload {
             url: url.to_string(),
         });
+    }
+
+    fn open_devtools(&mut self) {
+        self.record(RecordedCommand::OpenDevTools);
     }
 
     fn close(&mut self) {

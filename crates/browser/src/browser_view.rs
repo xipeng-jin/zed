@@ -89,6 +89,11 @@ actions!(
         FindPreviousInPage,
         /// Closes the find-in-page overlay.
         CloseFindInPage,
+        /// Opens the developer tools for the active browser tab.
+        OpenDevTools,
+        /// Opens a new incognito browser window: nothing browsed there is
+        /// persisted.
+        NewIncognitoWindow,
     ]
 );
 
@@ -104,15 +109,53 @@ const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// global by `init` so workspace item deserialization can construct browser
 /// views; tests install a stub factory.
 #[derive(Clone)]
-pub struct TabBackendFactory(Arc<dyn Fn() -> Box<dyn TabBackend>>);
+pub struct TabBackendFactory {
+    create: Arc<dyn Fn() -> Box<dyn TabBackend>>,
+    /// Derives the factory for one incognito window, whose backends share a
+    /// fresh in-memory engine profile isolated from the persistent one.
+    /// `None` when the engine half installed no incognito source (stub
+    /// tests).
+    create_incognito: Option<Arc<dyn Fn() -> TabBackendFactory>>,
+}
 
 impl TabBackendFactory {
     pub fn new(create: impl Fn() -> Box<dyn TabBackend> + 'static) -> Self {
-        Self(Arc::new(create))
+        Self {
+            create: Arc::new(create),
+            create_incognito: None,
+        }
+    }
+
+    /// A factory with an incognito source: `create_incognito` is invoked once
+    /// per incognito window, and every tab in that window creates its backend
+    /// from the factory it returns.
+    pub fn with_incognito(
+        create: impl Fn() -> Box<dyn TabBackend> + 'static,
+        create_incognito: impl Fn() -> TabBackendFactory + 'static,
+    ) -> Self {
+        Self {
+            create: Arc::new(create),
+            create_incognito: Some(Arc::new(create_incognito)),
+        }
     }
 
     fn create_backend(&self) -> Box<dyn TabBackend> {
-        (self.0)()
+        (self.create)()
+    }
+
+    /// Derive the factory one incognito window's tabs draw from; each call
+    /// creates a fresh isolated engine profile.
+    fn derive_incognito_factory(&self) -> TabBackendFactory {
+        match &self.create_incognito {
+            Some(create_incognito) => create_incognito(),
+            None => {
+                log::warn!(
+                    "[browser] no incognito backend source installed; incognito tabs share \
+                     the persistent engine profile"
+                );
+                self.clone()
+            }
+        }
     }
 }
 
@@ -137,13 +180,14 @@ struct BrowserContextMenu {
 
 #[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
-    cx.set_global(TabBackendFactory::new(|| {
-        Box::new(crate::tab::CefTab::new())
-    }));
+    cx.set_global(crate::tab::backend_factory());
     workspace::register_serializable_item::<BrowserView>(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenBrowser, window, cx| {
             BrowserView::open(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &NewIncognitoWindow, _window, cx| {
+            BrowserView::open_incognito_window(workspace, cx).detach_and_log_err(cx);
         });
     })
     .detach();
@@ -226,16 +270,18 @@ impl BrowserView {
         Self::build(backend_factory, Some(initial_url), false, window, cx)
     }
 
-    /// A browser view excluded from session persistence: it never claims
-    /// session ownership, never restores, and never saves (CONTEXT.md
-    /// "incognito window"). The incognito UI arrives with its own ticket.
+    /// A browser view excluded from all persistence (CONTEXT.md "incognito
+    /// window"): it never claims session ownership, never restores, never
+    /// saves, and its tabs browse in the backend factory's isolated incognito
+    /// engine profile. With no `initial_url` it starts on a fresh new-tab
+    /// page.
     pub fn new_incognito(
         backend_factory: TabBackendFactory,
-        initial_url: String,
+        initial_url: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(backend_factory, Some(initial_url), true, window, cx)
+        Self::build(backend_factory, initial_url, true, window, cx)
     }
 
     /// A browser view that restores the persisted session if it becomes the
@@ -257,6 +303,13 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // One isolated engine profile per incognito window: every tab this
+        // view ever creates draws from the derived factory.
+        let backend_factory = if is_incognito {
+            backend_factory.derive_incognito_factory()
+        } else {
+            backend_factory
+        };
         let weak = cx.weak_entity();
         crate::observe_pumps(cx, move |cx| {
             weak.update(cx, |view, cx| view.drain_engine_events(cx))
@@ -420,6 +473,44 @@ impl BrowserView {
         }
         let view = cx.new(|cx| BrowserView::restore_or_new(backend_factory, window, cx));
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+    }
+
+    /// Open a new incognito window: a fresh workspace window holding one
+    /// incognito browser view. The workspace is excluded from persistence and
+    /// session restore, so quitting with it open leaves no trace and it does
+    /// not reopen on relaunch.
+    pub fn open_incognito_window(
+        workspace: &Workspace,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Workspace>>> {
+        let app_state = workspace.app_state().clone();
+        let task = Workspace::new_local(
+            Vec::new(),
+            app_state,
+            None,
+            None,
+            Some(Box::new(|workspace, window, cx| {
+                workspace.exclude_from_persistence();
+                // Installed by `init`; absent when the engine failed to
+                // initialize, leaving an ordinary unpersisted empty window.
+                let Some(backend_factory) = cx.try_global::<TabBackendFactory>().cloned() else {
+                    log::error!("[browser] no browser engine available for the incognito window");
+                    return;
+                };
+                let view =
+                    cx.new(|cx| BrowserView::new_incognito(backend_factory, None, window, cx));
+                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+            })),
+            workspace::OpenMode::NewWindow,
+            cx,
+        );
+        cx.spawn(async move |cx| {
+            let open_result = task.await?;
+            open_result
+                .window
+                .update(cx, |_, window, _| window.activate_window())?;
+            Ok(open_result.workspace)
+        })
     }
 
     fn allocate_tab_id(&mut self) -> usize {
@@ -715,6 +806,14 @@ impl BrowserView {
     fn stop(&mut self, cx: &mut Context<Self>) {
         self.active_tab_mut().stop();
         cx.notify();
+    }
+
+    /// Open the engine's DevTools attached to the active tab. New-tab pages
+    /// have no engine browser to inspect, so this is a no-op there.
+    fn open_devtools(&mut self) {
+        if let Some(tab) = self.active_engine_tab_mut() {
+            tab.open_devtools();
+        }
     }
 
     fn focus_omnibox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1213,6 +1312,7 @@ impl BrowserView {
             MenuCommand::GoBack => self.go_back(cx),
             MenuCommand::GoForward => self.go_forward(cx),
             MenuCommand::Reload => self.reload(cx),
+            MenuCommand::Inspect => self.open_devtools(),
         }
     }
 
@@ -1356,24 +1456,31 @@ impl BrowserView {
 
     /// The app-rendered page a fresh tab shows before its first navigation
     /// (ticket #11). Input lives in the omnibox, which `new_tab` focuses.
+    /// Incognito windows get their own variant, the second half of the
+    /// incognito visual cue (ticket #20).
     fn render_new_tab_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let (icon, title, subtitle) = if self.is_incognito {
+            (
+                IconName::EyeOff,
+                "New Incognito Tab",
+                "Pages you view here leave no history, cookies, or downloads behind",
+            )
+        } else {
+            (
+                IconName::ToolWeb,
+                "New Tab",
+                "Search or enter an address in the omnibox",
+            )
+        };
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
             .gap_2()
+            .child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted))
+            .child(Label::new(title).size(LabelSize::Large).color(Color::Muted))
             .child(
-                Icon::new(IconName::ToolWeb)
-                    .size(IconSize::XLarge)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("New Tab")
-                    .size(LabelSize::Large)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("Search or enter an address in the omnibox")
+                Label::new(subtitle)
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -1901,6 +2008,31 @@ impl BrowserView {
                     .child(Self::favicon_element(active_tab)),
             )
             .child(self.omnibox.clone())
+            .when(self.is_incognito, |this| {
+                // The always-visible incognito cue: whatever page is showing,
+                // the chrome says this window persists nothing.
+                this.child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().element_background)
+                        .child(
+                            Icon::new(IconName::EyeOff)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("Incognito")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .child(
                 IconButton::new("browser-bookmark-page", IconName::Bookmark)
                     .icon_size(IconSize::Small)
@@ -2083,6 +2215,7 @@ impl Render for BrowserView {
             .on_action(cx.listener(Self::handle_find_next_in_page))
             .on_action(cx.listener(Self::handle_find_previous_in_page))
             .on_action(cx.listener(Self::handle_close_find_in_page))
+            .on_action(cx.listener(|this, _: &OpenDevTools, _, _| this.open_devtools()))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .child(self.render_tab_strip(cx))
@@ -2243,7 +2376,11 @@ impl Item for BrowserView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        self.active_tab().display_title("Browser")
+        self.active_tab().display_title(if self.is_incognito {
+            "Incognito"
+        } else {
+            "Browser"
+        })
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -2253,6 +2390,8 @@ impl Item for BrowserView {
         // dedicated Globe variant.
         if self.shows_custom_tab_glyph() {
             None
+        } else if self.is_incognito {
+            Some(Icon::new(IconName::EyeOff))
         } else {
             Some(Icon::new(IconName::ToolWeb))
         }
@@ -2886,6 +3025,44 @@ mod tests {
                 RecordedCommand::GoForward,
                 RecordedCommand::Reload,
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_devtools_targets_the_active_engine_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        factory.controller(0).take_commands();
+
+        cx.dispatch_action(OpenDevTools);
+        assert_eq!(
+            factory.controller(0).take_commands(),
+            vec![RecordedCommand::OpenDevTools],
+            "DevTools opens against the active tab's engine browser"
+        );
+
+        // A new-tab page has no engine browser to inspect; the action must
+        // not reach any backend.
+        cx.dispatch_action(NewTab);
+        factory.controller(0).take_commands();
+        factory.controller(1).take_commands();
+        cx.dispatch_action(OpenDevTools);
+        assert!(
+            !factory
+                .controller(0)
+                .take_commands()
+                .contains(&RecordedCommand::OpenDevTools),
+            "the background tab's engine is not inspected"
+        );
+        assert!(
+            !factory
+                .controller(1)
+                .take_commands()
+                .contains(&RecordedCommand::OpenDevTools),
+            "a new-tab page has no engine browser to inspect"
         );
     }
 
@@ -4049,7 +4226,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new_incognito(
                 backend_factory(&factory),
-                "https://incognito.example".to_string(),
+                Some("https://incognito.example".to_string()),
                 window,
                 cx,
             )
@@ -4077,6 +4254,90 @@ mod tests {
             saved.tabs[0].url, "https://saved.example",
             "incognito browsing never touches the saved session"
         );
+    }
+
+    #[gpui::test]
+    async fn test_incognito_views_draw_backends_from_the_incognito_factory(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let persistent = StubBackendFactory::new(true);
+        let incognito = StubBackendFactory::new(true);
+        let factory = {
+            let persistent = persistent.clone();
+            let incognito = incognito.clone();
+            TabBackendFactory::with_incognito(
+                move || persistent.create_backend(),
+                move || {
+                    let incognito = incognito.clone();
+                    TabBackendFactory::new(move || incognito.create_backend())
+                },
+            )
+        };
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BrowserView::new_incognito(factory, Some(DEFAULT_URL.to_string()), window, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            incognito.created_count(),
+            1,
+            "the initial incognito tab's engine comes from the incognito source"
+        );
+        assert_eq!(
+            persistent.created_count(),
+            0,
+            "incognito tabs never touch the persistent engine profile"
+        );
+
+        view.update_in(cx, |view, window, cx| view.new_tab(window, cx));
+        assert_eq!(
+            incognito.created_count(),
+            2,
+            "later tabs share the window's incognito source"
+        );
+        assert_eq!(persistent.created_count(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_incognito_window_is_excluded_from_workspace_persistence(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        cx.update(|cx| {
+            let factory = factory.clone();
+            cx.set_global(TabBackendFactory::new(move || factory.create_backend()));
+        });
+
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let task = workspace.update(cx, |workspace, cx| {
+            BrowserView::open_incognito_window(workspace, cx)
+        });
+        let incognito_workspace = task.await.unwrap();
+        cx.run_until_parked();
+
+        incognito_workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace.database_id().is_none(),
+                "an incognito workspace never gets a database id, so no layout \
+                 (or the browser item) is ever written for it"
+            );
+            assert!(
+                workspace.session_id().is_none(),
+                "an incognito workspace is not part of the session, so it does \
+                 not reopen on relaunch"
+            );
+            let view = workspace
+                .items_of_type::<BrowserView>(cx)
+                .next()
+                .expect("the incognito window opens with a browser view");
+            assert!(view.read(cx).is_incognito);
+        });
     }
 
     #[gpui::test]
@@ -4176,7 +4437,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new_incognito(
                 backend_factory(&factory),
-                "https://incognito.example".to_string(),
+                Some("https://incognito.example".to_string()),
                 window,
                 cx,
             )
@@ -4723,7 +4984,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             BrowserView::new_incognito(
                 backend_factory(&factory),
-                DEFAULT_URL.to_string(),
+                Some(DEFAULT_URL.to_string()),
                 window,
                 cx,
             )

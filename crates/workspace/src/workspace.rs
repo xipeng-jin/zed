@@ -6887,6 +6887,15 @@ impl Workspace {
         self.database_id
     }
 
+    /// Detach this workspace from layout persistence and session restore:
+    /// nothing about it is written to the workspace database and it will not
+    /// reopen on relaunch. Used by windows whose contents must leave no trace,
+    /// e.g. incognito browser windows.
+    pub fn exclude_from_persistence(&mut self) {
+        self.database_id = None;
+        self.session_id = None;
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_database_id(&mut self, id: WorkspaceId) {
         self.database_id = Some(id);

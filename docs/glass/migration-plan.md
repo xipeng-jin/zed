@@ -361,7 +361,8 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 | `assets/settings/default.json` | `browser` settings section defaults | M2 |
 | `crates/settings_content/src/settings_content.rs` (+ new `browser` content module) | Register the `browser` settings schema — upstream centralizes settings-content structs in this crate (see its `terminal` module) | M2 |
 | `crates/settings/src/vscode_import.rs` | One `browser: None` line — the file builds `SettingsContent` as an exhaustive struct literal, so any new settings section must appear here. *(Added during ticket #17, forced by the row above.)* | M2 |
-| `crates/zed/src/zed/app_menus.rs` | One "Open Browser" menu entry | M2 |
+| `crates/zed/src/zed/app_menus.rs` | "Open Browser" (View) and "New Incognito Window" (File) menu entries *(second entry added during ticket #20)* | M2/M3 |
+| `crates/workspace/src/workspace.rs` | Add `Workspace::exclude_from_persistence()` — a 3-line additive method clearing `database_id`/`session_id` so incognito windows write no layout and are skipped by session restore. Needed because item serialization has no per-instance opt-out and empty-path workspaces *are* restored with the session (`last_session_workspace_locations`). *(Added during ticket #20.)* | M3 |
 | *(contingent)* `crates/gpui/src/key_dispatch.rs`, `window.rs` | `d14fb11` port, only if M2 IME evaluation demands it | M2 |
 | *(M3)* `script/bundle-mac*`, entitlements | CEF framework/helper bundling | M3 |
 
@@ -511,6 +512,25 @@ Gate: soft — items are independent.
   (persistence skips already modeled), theme-color tab tinting (`page_chrome.rs`
   color half), default-browser registration (Linux `.desktop` + `xdg-settings`;
   macOS deferred to a macOS session).
+  *DevTools + incognito shipped (2026-07-12, ticket #20), validated on the
+  nested-Xwayland harness:* DevTools opens via F12/ctrl-shift-i/palette and a
+  context-menu "Inspect" entry as a native CEF-managed window whose CDP target
+  title names the active tab's URL, with the page's DOM in the Elements panel;
+  `close_all_browsers` calls `close_dev_tools()` first so quitting with
+  DevTools open shuts down cleanly (verified, exit 0). Incognito windows open
+  via `browser::NewIncognitoWindow` (File menu, ctrl-shift-n in a browser
+  view); each gets one in-memory CEF request context shared by its tabs — CDP
+  confirmed the incognito context sees neither the persistent profile's
+  `localStorage` marker nor its cookies, while both survived a restart in the
+  regular window. Across a clean quit/relaunch with an incognito window open:
+  the window did not reopen, and `browser_tabs`/`browser_history` and the
+  workspace layout/session tables carried no incognito data (the workspace
+  opts out via the new `Workspace::exclude_from_persistence`, §6.3; upstream's
+  `next_id` does leave one empty placeholder `workspaces` row — no items, no
+  session, never restored). If the in-memory request context cannot be
+  created, incognito tabs fail to start with a visible engine error instead
+  of falling back to the persistent profile. Cue: EyeOff pane-tab
+  icon/"Incognito" title, chrome badge, and an incognito new-tab page.
 - Windows: explicitly unscheduled; keep `FramePresenter` and keycode layers
   Windows-shaped (Glass's `stage-windows-cef-runtime.ps1` is the reference when the
   time comes).
