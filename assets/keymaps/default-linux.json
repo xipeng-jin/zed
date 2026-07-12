@@ -1269,6 +1269,23 @@
     },
   },
   {
+    // Shadows Zed defaults while a browser view has focus, following the
+    // Terminal precedent above; inert everywhere else.
+    "context": "BrowserView",
+    "bindings": {
+      "ctrl-t": "browser::NewTab",
+      "ctrl-w": "browser::CloseTab",
+      "ctrl-shift-t": "browser::ReopenClosedTab",
+      "ctrl-l": "browser::FocusOmnibox",
+      "ctrl-r": "browser::Reload",
+      "ctrl-f": "browser::FindInPage",
+      "ctrl-tab": "browser::NextTab",
+      "ctrl-shift-tab": "browser::PreviousTab",
+      "alt-left": "browser::GoBack",
+      "alt-right": "browser::GoForward",
+    },
+  },
+  {
     "context": "AgentPanel > Terminal",
     "bindings": {
       "ctrl-n": "agent::NewThread",

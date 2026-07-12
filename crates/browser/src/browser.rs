@@ -12,6 +12,7 @@
 //! no CEF distribution present (ticket #8).
 
 mod bookmarks;
+mod browser_settings;
 mod browser_tab;
 mod browser_view;
 mod context_menu;
@@ -60,6 +61,7 @@ mod tab;
 ))]
 compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows");
 
+pub use browser_settings::BrowserSettings;
 pub use browser_view::{BrowserView, OpenBrowser, TabBackendFactory};
 pub use context_menu::ContextMenuContext;
 pub use downloads::DownloadUpdate;
@@ -105,6 +107,7 @@ pub fn init(cx: &mut App) {
             .detach();
 
             start_message_pump(cx);
+            browser_settings::init(cx);
             browser_view::init(cx);
         }
         Err(error) => {

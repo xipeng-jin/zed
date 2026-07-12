@@ -7,12 +7,14 @@
 //! URL prefix; arrow keys move the selection and `enter` navigates to it
 //! (ticket #11; port source `Glass:crates/browser/src/omnibox.rs`).
 
+use crate::browser_settings::{BrowserSettings, search_engine_label, search_url};
 use crate::history::{BrowserHistory, HistoryMatch};
 use editor::{Editor, EditorEvent, actions::SelectAll};
 use gpui::{
     Anchor, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
     Pixels, Render, SharedString, Subscription, Task, Window, anchored, canvas, deferred, point,
 };
+use settings::{BrowserSearchEngine, Settings as _};
 use std::time::Duration;
 use ui::prelude::*;
 use zed_actions::editor::{MoveDown, MoveUp};
@@ -41,10 +43,10 @@ pub(crate) enum OmniboxSuggestion {
 
 impl OmniboxSuggestion {
     /// The URL navigating to this suggestion loads.
-    pub fn resolve(&self) -> String {
+    pub fn resolve(&self, engine: &BrowserSearchEngine) -> String {
         match self {
-            Self::Url(text) => text_to_url(text),
-            Self::Search(query) => search_url(query),
+            Self::Url(text) => text_to_url(text, engine),
+            Self::Search(query) => search_url(engine, query),
             Self::History { url, .. } => url.clone(),
         }
     }
@@ -270,7 +272,7 @@ impl Omnibox {
         let Some(suggestion) = self.suggestions.get(index) else {
             return;
         };
-        let url = suggestion.resolve();
+        let url = suggestion.resolve(&BrowserSettings::get_global(cx).search_engine);
         self.close_dropdown(cx);
         cx.emit(OmniboxEvent::Navigate(url));
     }
@@ -290,7 +292,8 @@ impl Omnibox {
         if text.is_empty() {
             return;
         }
-        cx.emit(OmniboxEvent::Navigate(text_to_url(text)));
+        let url = text_to_url(text, &BrowserSettings::get_global(cx).search_engine);
+        cx.emit(OmniboxEvent::Navigate(url));
     }
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,7 +332,12 @@ impl Omnibox {
                 OmniboxSuggestion::Url(text) => (IconName::ToolWeb, text.clone().into(), None),
                 OmniboxSuggestion::Search(query) => (
                     IconName::MagnifyingGlass,
-                    format!("Search Google for \"{}\"", truncate_label(query, 72)).into(),
+                    format!(
+                        "Search {} for \"{}\"",
+                        search_engine_label(&BrowserSettings::get_global(cx).search_engine),
+                        truncate_label(query, 72)
+                    )
+                    .into(),
                     None,
                 ),
                 OmniboxSuggestion::History { url, title } => (
@@ -528,21 +536,16 @@ fn should_use_http_by_default(input: &str) -> bool {
     url.port().is_some() && !host.contains('.')
 }
 
-fn search_url(query: &str) -> String {
-    let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
-    format!("https://www.google.com/search?q={encoded}")
-}
-
 /// Resolve omnibox text into a navigable URL: explicit or inferable URLs pass
 /// through (with a default scheme added), everything else becomes a web
-/// search.
-pub fn text_to_url(text: &str) -> String {
+/// search on `engine`.
+pub fn text_to_url(text: &str, engine: &BrowserSearchEngine) -> String {
     if text.starts_with("http://") || text.starts_with("https://") {
         return text.to_string();
     }
 
     if !looks_like_url(text) {
-        return search_url(text);
+        return search_url(engine, text);
     }
 
     if should_use_http_by_default(text) {
@@ -554,28 +557,39 @@ pub fn text_to_url(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_url, text_to_url};
+    use super::{BrowserSearchEngine, looks_like_url, text_to_url};
 
     #[test]
     fn localhost_inputs_are_treated_as_urls() {
+        let engine = BrowserSearchEngine::Google;
         assert!(looks_like_url("localhost"));
         assert!(looks_like_url("localhost:3000"));
-        assert_eq!(text_to_url("localhost"), "http://localhost");
-        assert_eq!(text_to_url("localhost:3000"), "http://localhost:3000");
+        assert_eq!(text_to_url("localhost", &engine), "http://localhost");
+        assert_eq!(
+            text_to_url("localhost:3000", &engine),
+            "http://localhost:3000"
+        );
     }
 
     #[test]
     fn regular_domains_default_to_https() {
         assert!(looks_like_url("example.com"));
-        assert_eq!(text_to_url("example.com"), "https://example.com");
+        assert_eq!(
+            text_to_url("example.com", &BrowserSearchEngine::Google),
+            "https://example.com"
+        );
     }
 
     #[test]
-    fn plain_queries_still_search() {
+    fn plain_queries_search_on_the_configured_engine() {
         assert!(!looks_like_url("rust ownership"));
         assert_eq!(
-            text_to_url("rust ownership"),
+            text_to_url("rust ownership", &BrowserSearchEngine::Google),
             "https://www.google.com/search?q=rust+ownership"
+        );
+        assert_eq!(
+            text_to_url("rust ownership", &BrowserSearchEngine::DuckDuckGo),
+            "https://duckduckgo.com/?q=rust+ownership"
         );
     }
 }

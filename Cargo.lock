@@ -2468,6 +2468,7 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "settings",
  "smallvec",
  "tempfile",
  "ui",

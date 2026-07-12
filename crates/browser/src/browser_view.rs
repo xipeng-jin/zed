@@ -13,6 +13,7 @@
 //! stub backend.
 
 use crate::bookmarks::{Bookmark, BrowserBookmarks};
+use crate::browser_settings::BrowserSettings;
 use crate::browser_tab::{BrowserTab, ClosedTab};
 use crate::context_menu::{ContextMenuContext, MenuCommand, MenuItem, context_menu_model};
 use crate::downloads::BrowserDownloads;
@@ -35,6 +36,7 @@ use gpui::{
 use std::ops::Range;
 use notifications::status_toast::StatusToast;
 use project::Project;
+use settings::{BrowserNewTabBehavior, Settings as _};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -339,7 +341,7 @@ impl BrowserView {
             None => {
                 let tab = match initial_url {
                     Some(url) => this.create_tab(url),
-                    None => this.create_new_tab_page(),
+                    None => this.create_fresh_tab(cx),
                 };
                 this.tabs.push(tab);
             }
@@ -432,6 +434,21 @@ impl BrowserView {
     fn create_new_tab_page(&mut self) -> BrowserTab {
         let id = self.allocate_tab_id();
         BrowserTab::new_tab_page(id, self.backend_factory.create_backend())
+    }
+
+    /// A fresh tab per the `new_tab_behavior` setting: the app-rendered
+    /// new-tab page, or a tab loading the configured URL. The configured
+    /// value goes through the same URL-versus-search resolution as omnibox
+    /// input, so a scheme-less value like `example.com` still loads.
+    fn create_fresh_tab(&mut self, cx: &App) -> BrowserTab {
+        let settings = BrowserSettings::get_global(cx);
+        match settings.new_tab_behavior.clone() {
+            BrowserNewTabBehavior::NewTabPage => self.create_new_tab_page(),
+            BrowserNewTabBehavior::Url(url) => {
+                let url = crate::omnibox::text_to_url(&url, &settings.search_engine);
+                self.create_tab(url)
+            }
+        }
     }
 
     /// Whether this view holds the session-owner slot: the single designated
@@ -744,12 +761,15 @@ impl BrowserView {
     }
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = self.create_new_tab_page();
+        let tab = self.create_fresh_tab(cx);
+        let is_new_tab_page = tab.is_new_tab_page();
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
-        // A fresh tab shows the new-tab page; the user's next step is typing
-        // a destination.
-        self.focus_omnibox_blank(window, cx);
+        // A fresh new-tab page means the user's next step is typing a
+        // destination; a configured new-tab URL means reading the page.
+        if is_new_tab_page {
+            self.focus_omnibox_blank(window, cx);
+        }
     }
 
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -768,12 +788,15 @@ impl BrowserView {
 
         if self.tabs.is_empty() {
             // The view always shows at least one tab; closing the last one
-            // resets to a fresh new-tab page, like Glass
+            // resets to a fresh tab, like Glass
             // (`Glass:crates/browser/src/browser_view/tabs.rs:455`).
-            let tab = self.create_new_tab_page();
+            let tab = self.create_fresh_tab(cx);
+            let is_new_tab_page = tab.is_new_tab_page();
             self.tabs.push(tab);
             self.active_tab_index = 0;
-            self.focus_omnibox_blank(window, cx);
+            if is_new_tab_page {
+                self.focus_omnibox_blank(window, cx);
+            }
         } else if index < self.active_tab_index {
             self.active_tab_index -= 1;
         } else if was_active {
@@ -1776,7 +1799,27 @@ impl BrowserView {
             .rounded_md()
             .shadow_md()
             .when_some(self.find_editor.clone(), |this, editor| {
-                this.child(div().flex_1().min_w_0().px_1().child(editor))
+                // `enter`/`escape` reach here as `menu::Confirm`/`menu::Cancel`
+                // while the query editor is focused: single-line editors don't
+                // bind them, so the global bindings win and dispatch through
+                // this wrapper (the omnibox seam).
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_1()
+                        .key_context("BrowserFindBar")
+                        .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                            this.handle_find_next_in_page(&FindNextInPage, window, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &menu::SecondaryConfirm, window, cx| {
+                            this.handle_find_previous_in_page(&FindPreviousInPage, window, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                            this.handle_close_find_in_page(&CloseFindInPage, window, cx)
+                        }))
+                        .child(editor),
+                )
             })
             .child(
                 Label::new(match_text)
@@ -4920,6 +4963,138 @@ mod tests {
             assert_eq!(view.tabs.len(), 2);
             assert_eq!(view.active_tab_index, 0);
             assert_eq!(view.tabs[1].url(), "https://example.com/new");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_tab_behavior_setting_opens_the_configured_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        cx.update_global(|store: &mut settings::SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                // Scheme-less on purpose: the configured value resolves
+                // through the omnibox URL heuristic.
+                settings.browser.get_or_insert_default().new_tab_behavior = Some(
+                    settings::BrowserNewTabBehavior::Url("news.example/home".to_string()),
+                );
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(NewTab);
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.tabs.len(), 2);
+            assert!(!view.active_tab().is_new_tab_page());
+            assert_eq!(view.url(), "https://news.example/home");
+            assert!(
+                !view.omnibox.focus_handle(cx).is_focused(window),
+                "a configured new-tab URL leaves focus on the page, not the omnibox"
+            );
+        });
+        assert_eq!(
+            factory.controller(1).started_with().as_deref(),
+            Some("https://news.example/home"),
+            "the new tab starts its engine browser at the configured URL"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_search_engine_setting_drives_omnibox_searches(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, _factory) = stub_view(true, DEFAULT_URL, cx);
+        cx.update_global(|store: &mut settings::SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.browser.get_or_insert_default().search_engine =
+                    Some(settings::BrowserSearchEngine::DuckDuckGo);
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+
+        cx.dispatch_action(FocusOmnibox);
+        view.update_in(cx, |view, window, cx| {
+            view.omnibox.update(cx, |omnibox, cx| {
+                omnibox.set_editor_text("rust ownership", window, cx);
+            });
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.url(), "https://duckduckgo.com/?q=rust+ownership");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_browser_keymap_context_scopes_bindings_to_the_view(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let factory = StubBackendFactory::new(true);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let factory = factory.clone();
+            BrowserView::open_with_factory(workspace, window, cx, move || factory.create_backend());
+        });
+        cx.run_until_parked();
+        let view = workspace
+            .update(cx, |workspace, cx| {
+                workspace.items_of_type::<BrowserView>(cx).next()
+            })
+            .unwrap();
+
+        // The same binding the default keymap ships, minus the JSON layer.
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new("ctrl-t", NewTab, Some("BrowserView"))]);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.simulate_keystrokes("ctrl-t");
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.tabs.len(),
+                2,
+                "the binding fires while the browser view has focus"
+            );
+        });
+
+        // The binding also covers focus inside the view's chrome (the
+        // omnibox holds focus after the new tab opened above).
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.omnibox.focus_handle(cx).is_focused(window));
+        });
+        cx.simulate_keystrokes("ctrl-t");
+        cx.run_until_parked();
+        view.update(cx, |view, _| assert_eq!(view.tabs.len(), 3));
+
+        // With focus outside the browser view the binding is inert.
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            let editor = cx.new(|cx| editor::Editor::single_line(window, cx));
+            window.focus(&editor.focus_handle(cx), cx);
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
+            editor
+        });
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
+        cx.simulate_keystrokes("ctrl-t");
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.tabs.len(),
+                3,
+                "the binding is inert while focus is outside the browser view"
+            );
         });
     }
 }

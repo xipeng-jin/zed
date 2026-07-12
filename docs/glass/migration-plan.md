@@ -360,6 +360,7 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 | `assets/keymaps/default-linux.json`, `default-macos.json` | Context-scoped `BrowserView` bindings | M2 |
 | `assets/settings/default.json` | `browser` settings section defaults | M2 |
 | `crates/settings_content/src/settings_content.rs` (+ new `browser` content module) | Register the `browser` settings schema — upstream centralizes settings-content structs in this crate (see its `terminal` module) | M2 |
+| `crates/settings/src/vscode_import.rs` | One `browser: None` line — the file builds `SettingsContent` as an exhaustive struct literal, so any new settings section must appear here. *(Added during ticket #17, forced by the row above.)* | M2 |
 | `crates/zed/src/zed/app_menus.rs` | One "Open Browser" menu entry | M2 |
 | *(contingent)* `crates/gpui/src/key_dispatch.rs`, `window.rs` | `d14fb11` port, only if M2 IME evaluation demands it | M2 |
 | *(M3)* `script/bundle-mac*`, entitlements | CEF framework/helper bundling | M3 |
@@ -430,6 +431,19 @@ Linux, split next to an editor and a terminal, quit cleanly.**
 
 Gate: **usable as a daily browser on Linux; Gmail and GitHub login flows work
 (including an OAuth popup); sessions restore across restart.**
+*Gate passed (2026-07-11, ticket #17), on the nested-Xwayland harness:* browse /
+tabs / find / downloads / bookmarks driven end-to-end by the shipped keymap,
+which stayed inert with an editor focused (ctrl-t/ctrl-f kept their stock
+editor behavior); the View ▸ Browser menu entry activated the browser from an
+editor and the command palette listed every `browser:` action with its
+binding; settings (search engine, new-tab behavior, download directory)
+verified live including hot-reload; three-tab session + bookmarks restored across a clean
+quit/relaunch with `localStorage` and cookies surviving via the CEF profile
+(lazy engine restore confirmed — only the active tab's browser was recreated);
+`window.open` OAuth-style popup re-validated (native window, native typing,
+`postMessage` to the OSR opener, `window.close`). Credentialed Gmail/GitHub
+sign-ins remain manually unverifiable from the agent harness (no credentials);
+the popup mechanics and UA-spoof findings from ticket #15 stand.
 
 1. Internal tab strip (start from Glass's non-macOS fallback chrome,
    `browser_view.rs:1495-1516`, re-skinned with `ui` components), pinned tabs,

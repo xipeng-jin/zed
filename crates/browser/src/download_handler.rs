@@ -71,7 +71,7 @@ wrap_download_handler! {
                 return 0;
             };
 
-            let directory = downloads::default_download_directory();
+            let directory = downloads::download_directory();
             let file_name =
                 OsrDownloadHandler::file_name_for_download(suggested_name, download_item);
             let target_path = downloads::unique_download_path(&directory, &file_name);

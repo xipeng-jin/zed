@@ -105,6 +105,25 @@
     // workspace when the centered layout is used.
     "right_padding": 0.2,
   },
+  // Integrated browser settings
+  "browser": {
+    // The search engine used when omnibox input is not a URL. May take 2 forms:
+    // 1. A named engine: "google", "duck_duck_go", or "bing"
+    //      "search_engine": "google"
+    // 2. A custom URL template, in which {query} is replaced with the
+    //    percent-encoded search terms:
+    //      "search_engine": { "custom": "https://kagi.com/search?q={query}" }
+    "search_engine": "google",
+    // What a new browser tab opens. May take 2 forms:
+    // 1. The app-rendered new-tab page:
+    //      "new_tab_behavior": "new_tab_page"
+    // 2. A fixed URL:
+    //      "new_tab_behavior": { "url": "https://example.com" }
+    "new_tab_behavior": "new_tab_page",
+    // The directory downloads are saved into. When null, the home Downloads
+    // directory is used.
+    "download_directory": null,
+  },
   // Image viewer settings
   "image_viewer": {
     // The unit for image file sizes: "binary" (KiB, MiB) or decimal (KB, MB)

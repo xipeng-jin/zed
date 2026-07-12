@@ -112,9 +112,37 @@ fn format_size(bytes: i64) -> String {
     format!("{:.1} GB", safe_bytes / (1024.0 * 1024.0 * 1024.0))
 }
 
-/// Where downloads are saved: `~/Downloads`, else a directory inside Zed's
-/// data dir when the home Downloads directory cannot be created.
-pub(crate) fn default_download_directory() -> PathBuf {
+/// The settings-configured download directory, mirrored into a process
+/// global because the engine's download callback consults it outside any
+/// GPUI context (`crate::download_handler`). Kept in sync by
+/// `crate::browser_settings::init`.
+static DOWNLOAD_DIRECTORY_OVERRIDE: parking_lot::Mutex<Option<PathBuf>> =
+    parking_lot::Mutex::new(None);
+
+pub(crate) fn set_download_directory_override(directory: Option<PathBuf>) {
+    *DOWNLOAD_DIRECTORY_OVERRIDE.lock() = directory;
+}
+
+/// Serializes tests that touch the process-wide override, which would
+/// otherwise race across test threads.
+#[cfg(test)]
+pub(crate) static OVERRIDE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Where downloads are saved: the settings-configured directory when one is
+/// set and creatable, else `~/Downloads`, else a directory inside Zed's data
+/// dir when the home Downloads directory cannot be created.
+pub(crate) fn download_directory() -> PathBuf {
+    if let Some(configured) = DOWNLOAD_DIRECTORY_OVERRIDE.lock().clone() {
+        let configured = expand_home(&configured);
+        match std::fs::create_dir_all(&configured) {
+            Ok(()) => return configured,
+            Err(error) => log::warn!(
+                "[browser] failed to create configured download directory {}: {}",
+                configured.display(),
+                error
+            ),
+        }
+    }
     let preferred = paths::home_dir().join("Downloads");
     if std::fs::create_dir_all(&preferred).is_ok() {
         return preferred;
@@ -128,6 +156,13 @@ pub(crate) fn default_download_directory() -> PathBuf {
         );
     }
     fallback
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(stripped) => paths::home_dir().join(stripped),
+        Err(_) => path.to_owned(),
+    }
 }
 
 /// File name for a download: the engine's suggestion if any, else the last
@@ -339,6 +374,29 @@ mod tests {
             pending_save: None,
             _quit_flush: Subscription::new(|| {}),
         }
+    }
+
+    #[test]
+    fn test_download_directory_prefers_the_configured_override() {
+        let _guard = OVERRIDE_TEST_LOCK.lock();
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("browser-downloads");
+        set_download_directory_override(Some(configured.clone()));
+        assert_eq!(download_directory(), configured);
+        assert!(configured.is_dir(), "the configured directory is created");
+        set_download_directory_override(None);
+    }
+
+    #[test]
+    fn test_expand_home_maps_tilde_to_the_home_directory() {
+        assert_eq!(
+            expand_home(Path::new("~/browser-downloads")),
+            paths::home_dir().join("browser-downloads")
+        );
+        assert_eq!(
+            expand_home(Path::new("/absolute/downloads")),
+            PathBuf::from("/absolute/downloads")
+        );
     }
 
     #[test]

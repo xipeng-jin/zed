@@ -1,5 +1,6 @@
 mod action;
 mod agent;
+mod browser;
 mod editor;
 mod extension;
 mod fallible_options;
@@ -15,6 +16,7 @@ mod workspace;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
 pub use agent::*;
+pub use browser::*;
 pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
@@ -160,6 +162,9 @@ pub struct SettingsContent {
     ///
     /// Default: VSCode
     pub base_keymap: Option<BaseKeymapContent>,
+
+    /// Configuration of the integrated browser.
+    pub browser: Option<BrowserSettingsContent>,
 
     /// Configuration for the collab panel visual settings.
     pub collaboration_panel: Option<PanelSettingsContent>,
