@@ -233,19 +233,24 @@ fn build_cef_app() -> cef::App {
 
 // Google's sign-in endpoints reject unrecognized browser versions with 400
 // errors on the browserinfo fingerprint check, so present the matching stable
-// Chrome release's UA for the host platform instead of CEF's default.
+// Chrome release's UA for the host platform instead of CEF's default. The
+// Chrome version must track the pinned CEF respin's Chromium version
+// (migration plan §6.4); it appears once here so a bump edits one literal.
+macro_rules! spoofed_user_agent {
+    ($platform:literal) => {
+        concat!(
+            "Mozilla/5.0 (",
+            $platform,
+            ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.101 Safari/537.36"
+        )
+    };
+}
 #[cfg(target_os = "macos")]
-const SPOOFED_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-     AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/145.0.7632.75 Safari/537.36";
+const SPOOFED_USER_AGENT: &str = spoofed_user_agent!("Macintosh; Intel Mac OS X 10_15_7");
 #[cfg(target_os = "linux")]
-const SPOOFED_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) \
-     AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/145.0.7632.75 Safari/537.36";
+const SPOOFED_USER_AGENT: &str = spoofed_user_agent!("X11; Linux x86_64");
 #[cfg(target_os = "windows")]
-const SPOOFED_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-     AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/145.0.7632.75 Safari/537.36";
+const SPOOFED_USER_AGENT: &str = spoofed_user_agent!("Windows NT 10.0; Win64; x64");
 
 /// Resolve the CEF directory from `CEF_PATH` env var, falling back to `~/.local/share/cef`.
 #[cfg(target_os = "macos")]

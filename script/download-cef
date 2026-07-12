@@ -23,10 +23,10 @@ set -euo pipefail
 # The full CDN respin is pinned, not just the CEF version: the CDN can respin
 # a CEF version against a newer Chromium, and developers must all get
 # identical bits. The version component must stay in lockstep with the cef-rs
-# tag pinned in the workspace Cargo.toml (cef-v145.6.1+145.0.28):
+# tag pinned in the workspace Cargo.toml (cef-v150.0.0+150.0.10):
 # cef-dll-sys refuses CEF distributions newer than the version embedded in
 # its own crate version.
-CEF_RESPIN="145.0.28+g51162e8+chromium-145.0.7632.160"
+CEF_RESPIN="150.0.10+g8042e43+chromium-150.0.7871.101"
 CEF_VERSION="${CEF_RESPIN%%+*}"
 
 CEF_CDN="${CEF_DOWNLOAD_URL:-https://cef-builds.spotifycdn.com}"

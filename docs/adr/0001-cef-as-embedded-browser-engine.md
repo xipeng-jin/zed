@@ -1,7 +1,8 @@
 # CEF as the embedded browser engine
 
 The integrated browser uses the Chromium Embedded Framework via the `cef-rs`
-bindings (pinned at Glass's tag `cef-v145.6.1+145.0.28`), running in off-screen
+bindings (pinned at an exact tag, `cef-v150.0.0+150.0.10` since the post-M2
+version bump; originally Glass's `cef-v145.6.1+145.0.28`), running in off-screen
 rendering mode so page pixels are composited by GPUI like any other element. CEF is
 the only production-quality engine that supports rendering into someone else's
 compositor, which is what lets browser content live inside workspace panes, be

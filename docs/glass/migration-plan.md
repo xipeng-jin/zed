@@ -34,7 +34,7 @@ Findings below are **verified** against the checkouts unless explicitly marked
 | 5 | Workspace model | `BrowserView` as a pane `Item` with an internal browser tab strip; Glass's "modes" system deferred; "browser as default view on launch" dropped | ADR-0004 |
 | 6 | Scope cut | Exclude `service_hub*`, `app_runtime*`, native NSToolbar/native sidebar and Glass's `workspace.rs`/`dock.rs` rewrites, `toast` crate, sidebar `threads_navigator`, `terminal_session_manager`, Glass themes/branding/app-identity. Default-browser OS registration deferred to M3 | §5 |
 | 7 | Milestones | M1 engine-on-Linux → M2 daily-drivable UX → M3 macOS + extras | §7 |
-| 8 | CEF supply | Stock Spotify-CDN binaries, sha-verified, at Glass's exact pin (CEF 145.0.28 / cef-rs tag `cef-v145.6.1+145.0.28`); H.264/AAC gap accepted; source-built codecs out of scope | §6.4 |
+| 8 | CEF supply | Stock Spotify-CDN binaries, sha-verified, at an exact pin (initially Glass's CEF 145.0.28 / cef-rs tag `cef-v145.6.1+145.0.28`; bumped post-M2 to CEF 150.0.10 / `cef-v150.0.0+150.0.10`, ticket #23); H.264/AAC gap accepted; source-built codecs out of scope | §6.4 |
 | 9 | Command surface | Context-scoped browser keymap that shadows Zed defaults when a BrowserView is focused (terminal precedent); minimal `browser` settings section | §7 M2 |
 | 10 | GPUI policy | Port nothing from the gpui fork up front. One contingency patch (`d14fb11`, focused-input-context key dispatch) adopted only if stock dispatch proves broken during M2 IME work | §4 |
 
@@ -372,13 +372,15 @@ this list must first justify adding it here.
 ### 6.4 CEF supply chain
 
 - New `script/download-cef`: platform-aware (linux64/linuxarm64/macosarm64/macosx64)
-  download of the **minimal distribution** of CEF `145.0.28` from the Spotify CDN,
-  sha1-verified, extracted to `~/.local/share/cef` (override via `CEF_PATH`) —
-  conventions copied from `Glass:.github/workflows/release_glass.yml:136-187`.
-- Cargo dep pinned to Glass's exact tag:
-  `cef = { git = "https://github.com/tauri-apps/cef-rs", tag = "cef-v145.6.1+145.0.28", default-features = false }`.
-  Rationale: every ported handler was written against this API surface; version bumps
-  become deliberate follow-up tasks, never confounded with port bugs.
+  download of the **minimal distribution** of the pinned CEF version (currently
+  `150.0.10`) from the Spotify CDN, sha1-verified, extracted to
+  `~/.local/share/cef` (override via `CEF_PATH`) — conventions copied from
+  `Glass:.github/workflows/release_glass.yml:136-187`.
+- Cargo dep pinned to an exact tag:
+  `cef = { git = "https://github.com/tauri-apps/cef-rs", tag = "cef-v150.0.0+150.0.10", default-features = false }`
+  (originally Glass's `cef-v145.6.1+145.0.28`; bumped post-M2 per R6, ticket #23).
+  Rationale: every ported handler was written against a single API surface; version
+  bumps become deliberate follow-up tasks, never confounded with port bugs.
 - Known accepted gap: stock builds lack H.264/AAC. Document in user-facing docs.
 - Known risk: pinned Chromium goes stale (security). Revisit the pin immediately
   after M2 (see R6).
@@ -489,6 +491,12 @@ the popup mechanics and UA-spoof findings from ticket #15 stand.
    fires at credential submission, which validation could not exercise. The
    spoof is kept (harmless, and the failure it guards against is
    post-submission).
+   *Re-tested at CEF 150 (2026-07-11, ticket #23):* spoofed UA moved to
+   `Chrome/150.0.7871.101` alongside the engine bump; verified via CDP that
+   pages see exactly that UA, and Google's sign-in form again renders with no
+   interstitial. The submission-level necessity question remains inconclusive
+   for the same no-credentials reason; the spoof stays, tracking the pinned
+   Chromium version on each bump.
 
 ### M3 — Platform breadth + extras
 
@@ -570,6 +578,19 @@ Gate: soft — items are independent.
 - **R6 — Chromium staleness = security exposure.** CEF 145 will be months old by M2.
   Schedule a CEF/cef-rs upgrade task immediately post-M2, treating handler-API churn
   as its own change set.
+  *First bump executed (2026-07-11, ticket #23):* CEF 145.0.28 → 150.0.10
+  (respin `150.0.10+g8042e43+chromium-150.0.7871.101`), cef-rs tag
+  `cef-v145.6.1+145.0.28` → `cef-v150.0.0+150.0.10`. No handler-API churn:
+  the browser crate compiled and all unit tests passed unmodified. Both gates
+  re-passed on the nested-Xwayland harness at CEF 150 — M1 (navigate, scroll,
+  click, type on real sites in a pane split beside an editor and terminal;
+  clean ctrl-q with CEF shutdown completing both runs) and M2 (`window.open`
+  popup end to end: native window, native typing, `postMessage` to the OSR
+  opener, `window.close`; three-tab session restored lazily across
+  quit/relaunch with `localStorage` surviving via the CEF profile; Google
+  sign-in rendering — see the step-9 UA note). Later bumps repeat the same
+  recipe: move the Cargo tag + `CEF_RESPIN` + spoofed UA together, re-run
+  `script/download-cef`, absorb binding churn, re-run the M1/M2 gates.
 - **R7 — Key dispatch/IME correctness.** The one place a gpui patch might be forced
   (`d14fb11`). Contained by the M2 evaluation gate.
   **Resolved (2026-07-11, ticket #16): gate passed, patch not adopted.** Stock

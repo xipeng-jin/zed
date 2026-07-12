@@ -2,7 +2,7 @@
 
 The integrated browser embeds Chromium via CEF, consumed through the
 [`cef-rs`](https://github.com/tauri-apps/cef-rs) bindings pinned at tag
-`cef-v145.6.1+145.0.28` (ADR-0001). CEF itself is a prebuilt binary
+`cef-v150.0.0+150.0.10` (ADR-0001). CEF itself is a prebuilt binary
 distribution; this page covers getting it onto a Linux development machine and
 how the build and the running binary find it. Linux is the primary development
 platform (migration plan §1); the macOS flow is shaped but not yet validated.
@@ -20,7 +20,7 @@ free disk (a ~400 MB cached archive plus the ~1.7 GB extracted distribution).
 
 `script/download-cef`:
 
-- resolves the pinned CEF distribution (version `145.0.28`, pinned down to the
+- resolves the pinned CEF distribution (version `150.0.10`, pinned down to the
   exact CDN respin) for the host platform (`linux64`, `linuxarm64`,
   `macosarm64`, `macosx64`) against the Spotify CDN's `index.json`,
 - downloads the *minimal* distribution and verifies its sha1 against the index,
@@ -41,7 +41,7 @@ the CEF distribution in this order:
 2. `CEF_PATH` set → use that directory. The build validates
    `$CEF_PATH/archive.json`: its `name` must be a
    `cef_binary_<version>+…` archive whose version is not newer than the CEF
-   version baked into the crate's own version (the `+145.0.28` build-metadata
+   version baked into the crate's own version (the `+150.0.10` build-metadata
    suffix of the pinned tag). `script/download-cef` writes this manifest.
 3. Neither set → the build script downloads and extracts the same minimal
    distribution by itself into that build's `OUT_DIR`. This works but
@@ -117,19 +117,24 @@ LD_LIBRARY_PATH="$CEF_PATH" cargo test -p browser --features cef
 
 ## Version pinning and upgrades
 
-The CEF version is pinned in two places that must move together:
+The CEF version is pinned in three places that must move together:
 
 - `CEF_RESPIN` in `script/download-cef` (the full
-  `145.0.28+g51162e8+chromium-145.0.7632.160` respin, so every machine gets
-  identical bits even if the CDN respins the version), and
-- the `cef` dependency tag, `cef-v145.6.1+145.0.28` (added to the workspace
-  `Cargo.toml` together with `crates/browser` — migration plan §7, M1 step 2).
+  `150.0.10+g8042e43+chromium-150.0.7871.101` respin, so every machine gets
+  identical bits even if the CDN respins the version),
+- the `cef` dependency tag, `cef-v150.0.0+150.0.10` (added to the workspace
+  `Cargo.toml` together with `crates/browser` — migration plan §7, M1 step 2),
+  and
+- the spoofed user-agent's Chrome version in
+  `crates/browser/src/cef_instance.rs`, which must match the respin's
+  Chromium version.
 
 `cef-dll-sys` fails the build if `archive.json` names a CEF distribution newer
 than its own pin, so a mismatched bump is caught immediately. After changing
 the pin, re-run `script/download-cef`; it replaces the staged distribution
-when the version differs. A CEF/cef-rs upgrade is scheduled immediately after
-M2 (migration plan R6 — the pinned Chromium accrues security exposure).
+when the version differs. Because the pinned Chromium accrues security
+exposure (migration plan R6), upgrades are recurring deliberate tasks — the
+first (145.0.28 → 150.0.10) landed immediately after M2 (ticket #23).
 
 ## Known limitations
 
