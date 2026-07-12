@@ -63,10 +63,10 @@ compile_error!("the `cef` feature is only supported on Linux, macOS, and Windows
 
 pub use browser_settings::BrowserSettings;
 pub use browser_view::{BrowserView, NewIncognitoWindow, OpenBrowser, TabBackendFactory};
-pub use context_menu::ContextMenuContext;
-pub use downloads::DownloadUpdate;
 #[cfg(feature = "cef")]
 pub use cef_instance::CefInstance;
+pub use context_menu::ContextMenuContext;
+pub use downloads::DownloadUpdate;
 pub use frame_presenter::{FramePresenter, SoftwarePresenter};
 #[cfg(any(test, feature = "test-support"))]
 pub use stub_tab_backend::{
@@ -120,6 +120,30 @@ pub fn init(cx: &mut App) {
 
 #[cfg(not(feature = "cef"))]
 pub fn init(_cx: &mut App) {}
+
+/// Opens each URL as a browser tab in the workspace's browser view, creating
+/// the view if needed and activating the last tab. The app's open-url path
+/// calls this with web links handed over by the OS, e.g. when the app is
+/// registered as the default browser (ticket #21).
+#[cfg(feature = "cef")]
+pub fn open_urls(
+    workspace: &mut workspace::Workspace,
+    urls: Vec<String>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<workspace::Workspace>,
+) {
+    BrowserView::open_urls(workspace, urls, window, cx);
+}
+
+#[cfg(not(feature = "cef"))]
+pub fn open_urls(
+    _workspace: &mut workspace::Workspace,
+    urls: Vec<String>,
+    _window: &mut gpui::Window,
+    _cx: &mut gpui::Context<workspace::Workspace>,
+) {
+    log::error!("[browser] built without an engine; cannot open {urls:?}");
+}
 
 /// Callbacks run on the foreground thread after every message-pump iteration,
 /// used by browser views to drain their tab backends' event streams. A
@@ -209,9 +233,8 @@ fn pump_glib_main_context() {
         // Called only from the thread that initialized CEF (the foreground
         // thread), matching GLib's ownership expectations for the default
         // context.
-        let dispatched = unsafe {
-            glib_sys::g_main_context_iteration(std::ptr::null_mut(), glib_sys::GFALSE)
-        };
+        let dispatched =
+            unsafe { glib_sys::g_main_context_iteration(std::ptr::null_mut(), glib_sys::GFALSE) };
         if dispatched == glib_sys::GFALSE {
             break;
         }

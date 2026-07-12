@@ -355,7 +355,7 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 |---|---|---|
 | `Cargo.toml` (workspace) | Add `crates/browser` member + `browser` and `cef` workspace deps | M1 |
 | `crates/zed/Cargo.toml` | Add `browser` dep | M1 |
-| `crates/zed/src/main.rs` | (a) `browser::handle_cef_subprocess()` as first statement of `main()`, cfg'd for linux+macos+windows; (b) `browser::init(cx)` in the existing init block | M1 |
+| `crates/zed/src/main.rs` | (a) `browser::handle_cef_subprocess()` as first statement of `main()`, cfg'd for linux+macos+windows; (b) `browser::init(cx)` in the existing init block; (c) a `WebUrls` arm in `handle_open_request` calling `browser::open_urls` on the active-or-new workspace (a direct entity update, not an action dispatch — a cold-launched window has no dispatch tree yet), and http/https pass-through in `parse_url_arg` (which otherwise mangles a web-URL argv into `file://http://…`) — default-browser routing, ticket #21 | M1/M3 |
 | `crates/zed/src/zed.rs` | Add `browser` to `test_action_namespaces`' expected list — the test enumerates every registered action namespace, so the browser actions (M1) break it without this one-line entry. *(Added retroactively during ticket #9, when the zed-crate suite was first run against the branch.)* | M1 |
 | `assets/keymaps/default-linux.json`, `default-macos.json` | Context-scoped `BrowserView` bindings | M2 |
 | `assets/settings/default.json` | `browser` settings section defaults | M2 |
@@ -363,6 +363,8 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 | `crates/settings/src/vscode_import.rs` | One `browser: None` line — the file builds `SettingsContent` as an exhaustive struct literal, so any new settings section must appear here. *(Added during ticket #17, forced by the row above.)* | M2 |
 | `crates/zed/src/zed/app_menus.rs` | "Open Browser" (View) and "New Incognito Window" (File) menu entries *(second entry added during ticket #20)* | M2/M3 |
 | `crates/workspace/src/workspace.rs` | Add `Workspace::exclude_from_persistence()` — a 3-line additive method clearing `database_id`/`session_id` so incognito windows write no layout and are skipped by session restore. Needed because item serialization has no per-instance opt-out and empty-path workspaces *are* restored with the session (`last_session_workspace_locations`). *(Added during ticket #20.)* | M3 |
+| `crates/zed/src/zed/open_listener.rs` | Parse `http://`/`https://` into a new accumulating `OpenRequestKind::WebUrls` (after the `parse_zed_link` arm, so zed.dev channel links keep winning) — URL handling is centralized in `OpenRequest::parse`, which both the running-instance CLI socket path and the cold-launch argv path funnel through, so default-browser routing (ticket #21) cannot live in the additive crate. Mirrors `Glass:crates/zed/src/zed/open_listener.rs:142` | M3 |
+| `crates/zed/resources/zed.desktop.in` | Add `x-scheme-handler/http;x-scheme-handler/https` to `MimeType` — the desktop-entry mechanism that makes the app selectable as default browser in the system default-apps setting (ticket #21) | M3 |
 | *(contingent)* `crates/gpui/src/key_dispatch.rs`, `window.rs` | `d14fb11` port, only if M2 IME evaluation demands it | M2 |
 | *(M3)* `script/bundle-mac*`, entitlements | CEF framework/helper bundling | M3 |
 
@@ -531,6 +533,28 @@ Gate: soft — items are independent.
   created, incognito tabs fail to start with a visible engine error instead
   of falling back to the persistent profile. Cue: EyeOff pane-tab
   icon/"Incognito" title, chrome badge, and an incognito new-tab page.
+  *Default-browser registration on Linux shipped (2026-07-12, ticket #21),
+  validated on the nested-Xwayland harness under isolated XDG dirs:* the
+  desktop entry now declares `x-scheme-handler/http;x-scheme-handler/https`,
+  and `xdg-settings set/get/check default-web-browser` plus
+  `xdg-mime query default` all accepted/resolved a dev copy of the entry.
+  Web links route through the existing open-url path: `OpenRequest::parse`
+  turns http/https into an accumulating `WebUrls` kind (ordered after
+  `parse_zed_link`, so zed.dev channel links keep winning) and
+  `handle_open_request` updates the active-or-new workspace directly with
+  `browser::open_urls` — a direct entity update, not an action dispatch,
+  because a cold-launched window may not have rendered a dispatch tree yet.
+  `xdg-open` against a running instance appended and activated the tab in the
+  workspace's browser view (no second instance: the CLI socket path needs a
+  non-dev release channel, `ZED_RELEASE_CHANNEL=stable` in validation); with
+  the app closed, `xdg-open` launched it via the CLI and the link landed as
+  the active tab beside the lazily-restored session tabs; clean ctrl-q with
+  complete CEF shutdown afterwards in both runs. macOS registration stays
+  deferred to a macOS session (§8). Residual (needs a follow-up ticket):
+  `get_any_active_multi_workspace` routes by active window, so an external
+  link arriving while an incognito window (#20) is focused opens in that
+  window's incognito browser view; most browsers instead route external
+  links to a regular window, creating one if needed.
 - Windows: explicitly unscheduled; keep `FramePresenter` and keycode layers
   Windows-shaped (Glass's `stage-windows-cef-runtime.ps1` is the reference when the
   time comes).

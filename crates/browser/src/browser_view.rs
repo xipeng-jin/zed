@@ -21,7 +21,9 @@ use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
 use crate::tab_backend::{BrowserTabOpenTarget, OpenTargetRequest, TabBackend};
-use crate::text_input::{BrowserKeyDispatch, BrowserTextInputState, key_down_dispatch, key_up_dispatch};
+use crate::text_input::{
+    BrowserKeyDispatch, BrowserTextInputState, key_down_dispatch, key_up_dispatch,
+};
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, actions::SelectAll as EditorSelectAll};
@@ -33,10 +35,10 @@ use gpui::{
     Task, UTF16Selection, WeakEntity, Window, actions, anchored, canvas, deferred, div, img, point,
     size,
 };
-use std::ops::Range;
 use notifications::status_toast::StatusToast;
 use project::Project;
 use settings::{BrowserNewTabBehavior, Settings as _};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -440,7 +442,7 @@ impl BrowserView {
     #[cfg(feature = "cef")]
     pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         let backend_factory = cx.global::<TabBackendFactory>().clone();
-        Self::open_internal(workspace, backend_factory, window, cx);
+        Self::get_or_create(workspace, backend_factory, window, cx);
     }
 
     #[cfg(test)]
@@ -450,7 +452,7 @@ impl BrowserView {
         cx: &mut Context<Workspace>,
         backend_factory: impl Fn() -> Box<dyn TabBackend> + 'static,
     ) {
-        Self::open_internal(
+        Self::get_or_create(
             workspace,
             TabBackendFactory::new(backend_factory),
             window,
@@ -458,21 +460,66 @@ impl BrowserView {
         );
     }
 
+    /// The engine-backed entry point behind [`crate::open_urls`].
+    #[cfg(feature = "cef")]
+    pub fn open_urls(
+        workspace: &mut Workspace,
+        urls: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let backend_factory = cx.global::<TabBackendFactory>().clone();
+        Self::open_urls_internal(workspace, backend_factory, urls, window, cx);
+    }
+
+    #[cfg(test)]
+    fn open_urls_with_factory(
+        workspace: &mut Workspace,
+        urls: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        backend_factory: impl Fn() -> Box<dyn TabBackend> + 'static,
+    ) {
+        Self::open_urls_internal(
+            workspace,
+            TabBackendFactory::new(backend_factory),
+            urls,
+            window,
+            cx,
+        );
+    }
+
     #[cfg(any(feature = "cef", test))]
-    fn open_internal(
+    fn open_urls_internal(
+        workspace: &mut Workspace,
+        backend_factory: TabBackendFactory,
+        urls: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if urls.is_empty() {
+            return;
+        }
+        let view = Self::get_or_create(workspace, backend_factory, window, cx);
+        view.update(cx, |view, cx| view.open_external_urls(urls, window, cx));
+    }
+
+    #[cfg(any(feature = "cef", test))]
+    fn get_or_create(
         workspace: &mut Workspace,
         backend_factory: TabBackendFactory,
         window: &mut Window,
         cx: &mut Context<Workspace>,
-    ) {
+    ) -> Entity<BrowserView> {
         // One browser view per workspace (ADR-0004); reopening focuses it.
         let existing = workspace.items_of_type::<BrowserView>(cx).next();
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
-            return;
+            return existing;
         }
         let view = cx.new(|cx| BrowserView::restore_or_new(backend_factory, window, cx));
-        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        view
     }
 
     /// Open a new incognito window: a fresh workspace window holding one
@@ -871,6 +918,26 @@ impl BrowserView {
         }
     }
 
+    /// Appends one tab per URL and activates the last, like Glass's
+    /// external-URL entry point
+    /// (`Glass:crates/browser/src/browser_view/tabs.rs:28`).
+    #[cfg(any(feature = "cef", test))]
+    fn open_external_urls(
+        &mut self,
+        urls: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if urls.is_empty() {
+            return;
+        }
+        for url in urls {
+            let tab = self.create_tab(url);
+            self.tabs.push(tab);
+        }
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+    }
+
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
@@ -1083,7 +1150,11 @@ impl BrowserView {
         cx.notify();
     }
 
-    fn ensure_find_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+    fn ensure_find_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
         if let Some(editor) = self.find_editor.clone() {
             return editor;
         }
@@ -1159,12 +1230,7 @@ impl BrowserView {
         cx.notify();
     }
 
-    fn handle_find_in_page(
-        &mut self,
-        _: &FindInPage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_find_in_page(&mut self, _: &FindInPage, window: &mut Window, cx: &mut Context<Self>) {
         self.find_visible = true;
         self.focus_find_editor(window, cx);
         if !self.find_query.is_empty() {
@@ -1823,9 +1889,11 @@ impl BrowserView {
                                         "Show in Folder",
                                     )
                                     .label_size(LabelSize::Small)
-                                    .on_click(move |_, _, cx| {
-                                        cx.reveal_path(Path::new(&saved_path));
-                                    }),
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            cx.reveal_path(Path::new(&saved_path));
+                                        },
+                                    ),
                                 ),
                         )
                     })
@@ -2208,9 +2276,11 @@ impl Render for BrowserView {
                 this.toggle_bookmark_for_active_tab(cx)
             }))
             .on_action(cx.listener(|this, _: &CopyUrl, _, cx| this.copy_url(cx)))
-            .on_action(cx.listener(|this, _: &ToggleDownloadCenter, _, cx| {
-                this.toggle_download_center(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleDownloadCenter, _, cx| {
+                    this.toggle_download_center(cx)
+                }),
+            )
             .on_action(cx.listener(Self::handle_find_in_page))
             .on_action(cx.listener(Self::handle_find_next_in_page))
             .on_action(cx.listener(Self::handle_find_previous_in_page))
@@ -2842,7 +2912,9 @@ mod tests {
                     selected_range: Some(0..1),
                 },
                 RecordedCommand::ImeCancelComposition,
-                RecordedCommand::ImeCommitText { text: "你好".into() },
+                RecordedCommand::ImeCommitText {
+                    text: "你好".into()
+                },
             ],
         );
     }
@@ -2864,7 +2936,9 @@ mod tests {
                     key: "enter".into(),
                     is_held: false,
                 },
-                RecordedCommand::KeyUp { key: "enter".into() },
+                RecordedCommand::KeyUp {
+                    key: "enter".into()
+                },
             ],
             "an IME-committed newline acts as an Enter keypress, not inserted text"
         );
@@ -2899,9 +2973,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_navigation_resets_editability_and_drops_the_composition(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_navigation_resets_editability_and_drops_the_composition(cx: &mut TestAppContext) {
         init_test(cx);
         let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
         let controller = factory.controller(0);
@@ -3249,6 +3321,98 @@ mod tests {
         .unwrap();
         workspace.update(cx, |workspace, cx| {
             assert_eq!(workspace.items_of_type::<BrowserView>(cx).count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_urls_opens_web_links_as_tabs(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let factory = StubBackendFactory::new(false);
+
+        // With no browser view in the workspace, external links create one:
+        // the fresh view's new-tab page plus one tab per link, the last one
+        // active.
+        workspace.update_in(cx, {
+            let factory = factory.clone();
+            |workspace, window, cx| {
+                BrowserView::open_urls_with_factory(
+                    workspace,
+                    vec![
+                        "https://example.com/a".to_string(),
+                        "https://example.com/b".to_string(),
+                    ],
+                    window,
+                    cx,
+                    move || factory.create_backend(),
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        let view = workspace.update(cx, |workspace, cx| {
+            let items: Vec<_> = workspace.items_of_type::<BrowserView>(cx).collect();
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                workspace.active_item_as::<BrowserView>(cx),
+                Some(items[0].clone()),
+                "the browser view holding the opened link is focused"
+            );
+            items[0].clone()
+        });
+        view.update(cx, |view, _| {
+            let urls: Vec<_> = view.tabs.iter().map(|tab| tab.url().to_string()).collect();
+            assert_eq!(urls, ["", "https://example.com/a", "https://example.com/b"]);
+            assert!(view.tabs[0].is_new_tab_page());
+            assert_eq!(view.active_tab().url(), "https://example.com/b");
+        });
+
+        // With the view already present, another link appends and activates a
+        // tab in it instead of creating a second view.
+        workspace.update_in(cx, {
+            |workspace, window, cx| {
+                BrowserView::open_urls_with_factory(
+                    workspace,
+                    vec!["https://example.com/c".to_string()],
+                    window,
+                    cx,
+                    move || factory.create_backend(),
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<BrowserView>(cx).count(), 1);
+        });
+        view.update(cx, |view, _| {
+            assert_eq!(view.tabs.len(), 4);
+            assert_eq!(view.active_tab().url(), "https://example.com/c");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_urls_with_nothing_to_open_changes_nothing(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            BrowserView::open_urls_with_factory(workspace, Vec::new(), window, cx, || {
+                Box::new(crate::stub_tab_backend::StubTabBackend::new(false).0)
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items_of_type::<BrowserView>(cx).count(),
+                0,
+                "an empty URL list does not conjure a browser view"
+            );
         });
     }
 
@@ -4301,9 +4465,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_incognito_window_is_excluded_from_workspace_persistence(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_incognito_window_is_excluded_from_workspace_persistence(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         let factory = StubBackendFactory::new(true);
         cx.update(|cx| {
@@ -5116,12 +5278,12 @@ mod tests {
 
         // Tab 0 is now inactive; its find results must not clobber the
         // overlay shown for the active tab.
-        factory.controller(0).script_events([
-            TabBackendEvent::FindResult {
+        factory
+            .controller(0)
+            .script_events([TabBackendEvent::FindResult {
                 count: 7,
                 active_match_ordinal: 3,
-            },
-        ]);
+            }]);
         pump(cx);
         view.update(cx, |view, _| {
             assert_eq!(view.find_match_count, 0);

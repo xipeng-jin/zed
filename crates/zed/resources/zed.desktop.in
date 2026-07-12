@@ -13,7 +13,9 @@ Keywords=zed;
 # To add Zed to "Open Folder With..." context menu, add `inode/directory` to the MimeType field (semicolon separated)
 # Arch linux users have reported this setting Zed as default file browser. See https://github.com/zed-industries/zed/pull/39076 and related issues.
 # If this happens to you, an unconfirmed fix may be to install Arch's `gnome-defaults-list` package.
-MimeType=text/plain;application/x-zerosize;x-scheme-handler/zed;
+# The x-scheme-handler/http(s) entries let the system default-apps setting
+# select Zed as the default web browser; web links then open as browser tabs.
+MimeType=text/plain;application/x-zerosize;x-scheme-handler/zed;x-scheme-handler/http;x-scheme-handler/https;
 Actions=NewWorkspace;
 
 [Desktop Action NewWorkspace]

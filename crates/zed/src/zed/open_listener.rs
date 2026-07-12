@@ -79,6 +79,11 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    /// Web links handed over by the OS, e.g. when Zed is registered as the
+    /// default browser; they open as browser tabs.
+    WebUrls {
+        urls: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -117,8 +122,16 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::WebUrls { urls } => f.debug_struct("WebUrls").field("urls", urls).finish(),
         }
     }
+}
+
+/// A web link the OS may hand over when Zed is registered as the default
+/// browser; shared with `parse_url_arg` so argv and open-request parsing
+/// cannot drift.
+pub fn is_web_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 impl OpenRequest {
@@ -204,6 +217,15 @@ impl OpenRequest {
                     } => {
                         this.open_channel_notes.push((channel_id, heading));
                     }
+                }
+            } else if is_web_url(&url) {
+                // After `parse_zed_link`, so zed.dev channel links keep
+                // parsing as channel joins. Accumulate rather than overwrite:
+                // a `%U` desktop-entry invocation may carry several links.
+                if let Some(OpenRequestKind::WebUrls { urls }) = &mut this.kind {
+                    urls.push(url);
+                } else {
+                    this.kind = Some(OpenRequestKind::WebUrls { urls: vec![url] });
                 }
             } else {
                 log::error!("unhandled url: {}", url);
@@ -1433,6 +1455,55 @@ mod tests {
             }
             _ => panic!("Expected AgentPanel kind"),
         }
+    }
+
+    #[gpui::test]
+    fn test_parse_web_urls(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        // Web links accumulate into one request so a multi-URL `%U`
+        // desktop-entry invocation drops none of them.
+        let request = cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec![
+                        "https://example.com/docs".into(),
+                        "http://example.org/".into(),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+
+        match request.kind {
+            Some(OpenRequestKind::WebUrls { urls }) => {
+                assert_eq!(urls, ["https://example.com/docs", "http://example.org/"]);
+            }
+            _ => panic!("Expected WebUrls kind"),
+        }
+    }
+
+    #[gpui::test]
+    fn test_zed_links_still_win_over_generic_web_urls(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        // Channel links are https URLs too; they must keep parsing as
+        // channel joins, not as browser tabs.
+        let request = cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec!["https://zed.dev/channel/some-channel-283".into()],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+
+        assert!(request.kind.is_none(), "channel links are not WebUrls");
+        assert_eq!(request.join_channel, Some(283));
     }
 
     #[gpui::test]
