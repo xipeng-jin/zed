@@ -9,6 +9,7 @@
 
 use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
+use crate::page_chrome::PageChrome;
 use crate::text_input::BrowserTextInputState;
 use anyhow::Result;
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
@@ -129,6 +130,9 @@ pub enum TabBackendEvent {
     /// The render process reported whether the page's focused node is
     /// editable, which drives keystroke routing (ticket #16).
     TextInputStateChanged(BrowserTextInputState),
+    /// The page's sampled theme color changed, or resolved to nothing
+    /// (`None`); it tints the page's tab in the tab strip (ticket #22).
+    PageChromeChanged(Option<PageChrome>),
 }
 
 /// One software-OSR frame: a tightly-packed premultiplied BGRA buffer at

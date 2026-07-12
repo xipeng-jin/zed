@@ -20,6 +20,7 @@ mod downloads;
 mod frame_presenter;
 mod history;
 mod omnibox;
+mod page_chrome;
 mod session;
 #[cfg(any(test, feature = "test-support"))]
 mod stub_tab_backend;
@@ -68,6 +69,7 @@ pub use cef_instance::CefInstance;
 pub use context_menu::ContextMenuContext;
 pub use downloads::DownloadUpdate;
 pub use frame_presenter::{FramePresenter, SoftwarePresenter};
+pub use page_chrome::{PageChrome, PageChromeSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use stub_tab_backend::{
     RecordedCommand, StubBackendFactory, StubTabBackend, StubTabController,

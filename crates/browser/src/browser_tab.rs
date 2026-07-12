@@ -10,10 +10,11 @@
 use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
+use crate::page_chrome::PageChrome;
 use crate::tab_backend::{OpenTargetRequest, TabBackend, TabBackendEvent};
 use crate::text_input::{BrowserTextInputState, CommittedTextAction, committed_text_action};
 use gpui::{
-    AnyElement, Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta, SharedString,
+    AnyElement, Hsla, Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta, SharedString,
     SharedUri, Window,
 };
 use std::ops::Range;
@@ -82,6 +83,9 @@ pub(crate) struct BrowserTab {
     /// Latest focused-node editability reported by this tab's render process;
     /// reset on navigation until the new page reports.
     text_input_state: BrowserTextInputState,
+    /// The page's reported theme color, tinting this tab in the tab strip;
+    /// reset on navigation until the new page reports (ticket #22).
+    page_chrome: Option<PageChrome>,
 }
 
 impl BrowserTab {
@@ -101,6 +105,7 @@ impl BrowserTab {
             engine_error: None,
             last_viewport: None,
             text_input_state: BrowserTextInputState::default(),
+            page_chrome: None,
         }
     }
 
@@ -240,6 +245,10 @@ impl BrowserTab {
                         // one.
                         self.favicon_url = None;
                     }
+                    // The old page's theme color must not tint the new page's
+                    // tab; hold no tint until the new page reports
+                    // (`Glass:crates/browser/src/tab.rs:197`).
+                    self.page_chrome = None;
                     self.url = url;
                     changes.identity_changed = true;
                     changes.visited = true;
@@ -300,6 +309,12 @@ impl BrowserTab {
                         changes.text_input_changed = true;
                     }
                 }
+                TabBackendEvent::PageChromeChanged(page_chrome) => {
+                    if self.page_chrome != page_chrome {
+                        self.page_chrome = page_chrome;
+                        changes.needs_notify = true;
+                    }
+                }
             }
         }
         changes
@@ -314,6 +329,7 @@ impl BrowserTab {
         self.is_new_tab_page = false;
         self.url = url;
         self.favicon_url = None;
+        self.page_chrome = None;
         if self.backend.is_started() {
             self.backend.navigate(&self.url);
         }
@@ -392,6 +408,12 @@ impl BrowserTab {
 
     pub fn text_input_state(&self) -> BrowserTextInputState {
         self.text_input_state
+    }
+
+    /// The page's reported theme color, if any, for tinting this tab in the
+    /// tab strip.
+    pub fn page_chrome_color(&self) -> Option<Hsla> {
+        self.page_chrome.map(|page_chrome| page_chrome.color)
     }
 
     pub fn ime_set_composition(&mut self, text: &str, selected_range: Option<Range<usize>>) {

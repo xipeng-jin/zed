@@ -129,8 +129,7 @@ impl ZedCefApp {
             browser_process_handler: ZedBrowserProcessHandlerBuilder::new(
                 ZedBrowserProcessHandler {},
             ),
-            render_process_handler: crate::text_input::TextInputRenderProcessHandlerBuilder::build(
-            ),
+            render_process_handler: crate::page_chrome::PageChromeRenderProcessHandlerBuilder::build(),
         }
     }
 }

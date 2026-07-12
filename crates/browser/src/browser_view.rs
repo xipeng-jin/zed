@@ -1602,6 +1602,13 @@ impl BrowserView {
         }
     }
 
+    /// Tint strength for a page's theme color over the theme's own tab
+    /// background. A translucent wash keeps the theme's text and icon colors
+    /// legible in both light and dark themes (a full-strength page color
+    /// could sit at any lightness), while the active/inactive distinction
+    /// survives in the differing backgrounds underneath.
+    const TAB_TINT_OPACITY: f32 = 0.35;
+
     fn render_tab_strip_tab(
         &self,
         index: usize,
@@ -1654,6 +1661,16 @@ impl BrowserView {
             }))
             .when(!url.is_empty(), |this| this.tooltip(Tooltip::text(url)))
             .end_slot(end_slot)
+            // First child so the wash paints beneath the favicon, label, and
+            // close button.
+            .when_some(tab.page_chrome_color(), |this, color| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(color.opacity(Self::TAB_TINT_OPACITY)),
+                )
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -2566,6 +2583,7 @@ mod tests {
     use super::*;
     use crate::downloads::DownloadUpdate;
     use crate::omnibox::OmniboxSuggestion;
+    use crate::page_chrome::{PageChrome, PageChromeSource};
     use crate::stub_tab_backend::{RecordedCommand, StubBackendFactory, StubTabController};
     use crate::tab_backend::{OpenDisposition, SoftwareFrame, TabBackendEvent};
     use gpui::{
@@ -2699,6 +2717,52 @@ mod tests {
                 "Example Docs",
                 "pane tab shows the page title"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_page_chrome_tints_the_tab_until_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (view, cx, factory) = stub_view(true, DEFAULT_URL, cx);
+        let controller = factory.controller(0);
+
+        let blue = gpui::rgb(0x1d4e89).into();
+        controller.script_events([TabBackendEvent::PageChromeChanged(Some(PageChrome {
+            color: blue,
+            source: PageChromeSource::SampledTopEdge,
+        }))]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.active_tab().page_chrome_color(),
+                Some(blue),
+                "the reported theme color tints the tab"
+            );
+        });
+
+        // Navigating away drops the old page's tint until the new page
+        // reports one.
+        controller.script_events([TabBackendEvent::AddressChanged(
+            "https://example.com/next".into(),
+        )]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.active_tab().page_chrome_color(), None);
+        });
+
+        // A page can also withdraw its color explicitly (it resolved to
+        // nothing after a mutation).
+        let green = gpui::rgb(0x0b8043).into();
+        controller.script_events([
+            TabBackendEvent::PageChromeChanged(Some(PageChrome {
+                color: green,
+                source: PageChromeSource::ThemeColorMeta,
+            })),
+            TabBackendEvent::PageChromeChanged(None),
+        ]);
+        pump(cx);
+        view.update(cx, |view, _| {
+            assert_eq!(view.active_tab().page_chrome_color(), None);
         });
     }
 

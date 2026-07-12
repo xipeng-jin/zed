@@ -144,20 +144,16 @@ pub(crate) fn committed_text_action(text: &str) -> CommittedTextAction {
 }
 
 #[cfg(feature = "cef")]
-pub(crate) use engine::{
-    TextInputRenderProcessHandlerBuilder, extract_text_input_state_from_message,
-};
+pub(crate) use engine::{extract_text_input_state_from_message, send_text_input_state};
 
 /// The process-message plumbing that carries the editability signal from the
 /// render process to the browser process.
 #[cfg(feature = "cef")]
 mod engine {
     use super::BrowserTextInputState;
-    use cef::rc::Rc as _;
     use cef::{
         CefString, Domnode, Frame, ImplDomnode, ImplFrame, ImplListValue, ImplProcessMessage,
-        ImplRenderProcessHandler, ProcessId, ProcessMessage, RenderProcessHandler,
-        WrapRenderProcessHandler, process_message_create, wrap_render_process_handler,
+        ProcessId, ProcessMessage, process_message_create,
     };
 
     const TEXT_INPUT_STATE_MESSAGE_NAME: &str = "zed.text_input_state";
@@ -177,8 +173,9 @@ mod engine {
         })
     }
 
-    /// Report the focused node's editability from the render process.
-    fn send_text_input_state(frame: &mut Frame, focused_node: Option<&Domnode>) {
+    /// Report the focused node's editability from the render process. Invoked
+    /// by the crate's render-process handler (`page_chrome.rs`).
+    pub(crate) fn send_text_input_state(frame: &mut Frame, focused_node: Option<&Domnode>) {
         let Some(message) =
             process_message_create(Some(&CefString::from(TEXT_INPUT_STATE_MESSAGE_NAME)))
         else {
@@ -200,39 +197,6 @@ mod engine {
         frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
     }
 
-    #[derive(Clone)]
-    struct TextInputRenderProcessHandler;
-
-    wrap_render_process_handler! {
-        pub(crate) struct TextInputRenderProcessHandlerBuilder {
-            handler: TextInputRenderProcessHandler,
-        }
-
-        impl RenderProcessHandler {
-            fn on_focused_node_changed(
-                &self,
-                _browser: Option<&mut cef::Browser>,
-                frame: Option<&mut Frame>,
-                node: Option<&mut Domnode>,
-            ) {
-                let Some(frame) = frame else {
-                    return;
-                };
-
-                if frame.is_main() == 0 {
-                    return;
-                }
-
-                send_text_input_state(frame, node.as_deref());
-            }
-        }
-    }
-
-    impl TextInputRenderProcessHandlerBuilder {
-        pub(crate) fn build() -> RenderProcessHandler {
-            Self::new(TextInputRenderProcessHandler)
-        }
-    }
 }
 
 #[cfg(test)]

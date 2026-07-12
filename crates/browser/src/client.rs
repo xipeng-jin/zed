@@ -1,7 +1,7 @@
 //! CEF client, ported (M2 subset) from `Glass:crates/browser/src/client.rs`.
 //! Ties together the render, load, display, life-span, keyboard, download,
 //! find, context-menu, request, and permission handlers, and receives the
-//! render process's text-input state messages.
+//! render process's text-input state and page-chrome messages.
 
 use crate::context_menu_handler::{ContextMenuHandlerBuilder, OsrContextMenuHandler};
 use crate::display_handler::{DisplayHandlerBuilder, OsrDisplayHandler};
@@ -11,6 +11,7 @@ use crate::life_span_handler::{
     LifeSpanHandlerBuilder, OsrLifeSpanHandler, PopupLifeSpanHandler, PopupLifeSpanHandlerBuilder,
 };
 use crate::load_handler::{LoadHandlerBuilder, OsrLoadHandler};
+use crate::page_chrome::extract_page_chrome_from_message;
 use crate::permission_handler::{OsrPermissionHandler, PermissionHandlerBuilder};
 use crate::render_handler::{OsrRenderHandler, RenderHandlerBuilder, RenderState};
 use crate::request_handler::{OsrRequestHandler, RequestHandlerBuilder};
@@ -166,15 +167,23 @@ wrap_client! {
                 return 0;
             };
 
-            let Some(text_input_state) = extract_text_input_state_from_message(message) else {
-                return 0;
-            };
+            if let Some(text_input_state) = extract_text_input_state_from_message(message) {
+                send_event(
+                    &self.event_sender,
+                    TabBackendEvent::TextInputStateChanged(text_input_state),
+                );
+                return 1;
+            }
 
-            send_event(
-                &self.event_sender,
-                TabBackendEvent::TextInputStateChanged(text_input_state),
-            );
-            1
+            if let Some(page_chrome) = extract_page_chrome_from_message(message) {
+                send_event(
+                    &self.event_sender,
+                    TabBackendEvent::PageChromeChanged(page_chrome),
+                );
+                return 1;
+            }
+
+            0
         }
     }
 }
