@@ -204,7 +204,13 @@ fn main() {
     // call does not return.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     if let Err(error) = browser::handle_cef_subprocess() {
-        // Log but don't fail - CEF might not be available.
+        // A process CEF re-invoked as a subprocess must never fall through and
+        // boot the full editor; anything else can continue without browser
+        // support (CEF might not be available).
+        if std::env::args().any(|argument| argument.starts_with("--type=")) {
+            eprintln!("error: failed to run as a CEF subprocess: {error:#}");
+            process::exit(1);
+        }
         eprintln!("CEF subprocess handling warning: {error:#}");
     }
 

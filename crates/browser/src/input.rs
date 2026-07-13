@@ -98,44 +98,26 @@ pub(crate) fn should_send_char_event(keystroke: &Keystroke, is_held: bool) -> bo
         return false;
     }
 
-    !matches!(
-        keystroke.key.as_str(),
-        "backspace"
-            | "tab"
-            | "delete"
-            | "escape"
-            | "left"
-            | "right"
-            | "up"
-            | "down"
-            | "home"
-            | "end"
-            | "pageup"
-            | "pagedown"
-            | "f1"
-            | "f2"
-            | "f3"
-            | "f4"
-            | "f5"
-            | "f6"
-            | "f7"
-            | "f8"
-            | "f9"
-            | "f10"
-            | "f11"
-            | "f12"
-    )
+    !crate::text_input::NON_CHARACTER_NAMED_KEYS.contains(&keystroke.key.as_str())
+}
+
+/// The fixed codepoint a named key contributes to CEF char events, shared by
+/// the modified and unmodified character fields.
+fn named_key_character(key: &str) -> Option<u16> {
+    match key {
+        "enter" => Some(0x0D),
+        "backspace" => Some(0x08),
+        "tab" => Some(0x09),
+        "escape" => Some(0x1B),
+        "space" => Some(' ' as u16),
+        "delete" => Some(0x7F),
+        _ => None,
+    }
 }
 
 fn key_character(keystroke: &Keystroke) -> u16 {
-    match keystroke.key.as_str() {
-        "enter" => 0x0D,
-        "backspace" => 0x08,
-        "tab" => 0x09,
-        "escape" => 0x1B,
-        "space" => ' ' as u16,
-        "delete" => 0x7F,
-        _ => keystroke
+    named_key_character(&keystroke.key).unwrap_or_else(|| {
+        keystroke
             .key_char
             .as_ref()
             .and_then(|text| text.chars().next())
@@ -147,26 +129,23 @@ fn key_character(keystroke: &Keystroke) -> u16 {
                     .filter(|character| !character.is_control())
                     .map(|character| character as u16)
             })
-            .unwrap_or(0),
-    }
+            .unwrap_or(0)
+    })
 }
 
 fn unmodified_key_character(keystroke: &Keystroke) -> u16 {
-    match keystroke.key.as_str() {
-        "enter" => 0x0D,
-        "backspace" => 0x08,
-        "tab" => 0x09,
-        "escape" => 0x1B,
-        "space" => ' ' as u16,
-        "delete" => 0x7F,
-        _ if keystroke.key.len() == 1 => keystroke
-            .key
-            .chars()
-            .next()
-            .map(|character| character as u16)
-            .unwrap_or(0),
-        _ => 0,
-    }
+    named_key_character(&keystroke.key).unwrap_or_else(|| {
+        if keystroke.key.len() == 1 {
+            keystroke
+                .key
+                .chars()
+                .next()
+                .map(|character| character as u16)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    })
 }
 
 pub(crate) fn convert_modifiers(modifiers: &Modifiers) -> u32 {

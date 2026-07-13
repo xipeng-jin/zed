@@ -96,9 +96,3 @@ wrap_permission_handler! {
         }
     }
 }
-
-impl PermissionHandlerBuilder {
-    pub fn build(handler: OsrPermissionHandler) -> cef::PermissionHandler {
-        Self::new(handler)
-    }
-}

@@ -6,9 +6,8 @@
 //! One bookmark set exists per app — every browser view reads and mutates the
 //! same shared entity, so it is also the single writer of the persisted blob.
 
-use crate::session;
-use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use crate::session::{self, PersistedBlob};
+use gpui::{App, Context, Entity, Subscription, Task};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use util::ResultExt as _;
@@ -26,26 +25,29 @@ pub(crate) struct Bookmark {
 
 pub(crate) struct BrowserBookmarks {
     bookmarks: Vec<Bookmark>,
-    /// Debounced bookmark write; replacing it pushes the deadline out. Also
-    /// the dirty flag: `Some` means mutations have not been written.
+    /// Debounced bookmark write; see [`PersistedBlob::pending_save_mut`].
     pending_save: Option<Task<()>>,
     _quit_flush: Subscription,
 }
 
-struct GlobalBrowserBookmarks(Entity<BrowserBookmarks>);
+impl PersistedBlob for BrowserBookmarks {
+    const KEY: &'static str = session::BROWSER_BOOKMARKS_KEY;
+    const SAVE_DEBOUNCE: Duration = BOOKMARKS_SAVE_DEBOUNCE;
 
-impl Global for GlobalBrowserBookmarks {}
+    fn serialize_blob(&self) -> Option<String> {
+        serde_json::to_string(&self.bookmarks).log_err()
+    }
+
+    fn pending_save_mut(&mut self) -> &mut Option<Task<()>> {
+        &mut self.pending_save
+    }
+}
 
 impl BrowserBookmarks {
     /// The app-wide shared bookmarks, created (restoring the persisted blob)
     /// on first access.
     pub fn global(cx: &mut App) -> Entity<Self> {
-        if let Some(global) = cx.try_global::<GlobalBrowserBookmarks>() {
-            return global.0.clone();
-        }
-        let bookmarks = cx.new(Self::new);
-        cx.set_global(GlobalBrowserBookmarks(bookmarks.clone()));
-        bookmarks
+        session::global_entity(cx, Self::new)
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -103,40 +105,6 @@ impl BrowserBookmarks {
         let count_before = self.bookmarks.len();
         self.bookmarks.retain(|bookmark| bookmark.url != url);
         self.bookmarks.len() != count_before
-    }
-
-    fn serialize(&self) -> Option<String> {
-        serde_json::to_string(&self.bookmarks).log_err()
-    }
-
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.pending_save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(BOOKMARKS_SAVE_DEBOUNCE)
-                .await;
-            let Ok((bookmarks, store)) = this.update(cx, |this, cx| {
-                this.pending_save = None;
-                (this.serialize(), KeyValueStore::global(cx))
-            }) else {
-                return;
-            };
-            if let Some(bookmarks) = bookmarks {
-                session::save_bookmarks(store, bookmarks).await.log_err();
-            }
-        }));
-    }
-
-    fn flush_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        if self.pending_save.take().is_none() {
-            return Task::ready(());
-        }
-        let Some(bookmarks) = self.serialize() else {
-            return Task::ready(());
-        };
-        let store = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            session::save_bookmarks(store, bookmarks).await.log_err();
-        })
     }
 }
 
@@ -210,7 +178,7 @@ mod tests {
             None,
         );
 
-        let json = bookmarks.serialize().unwrap();
+        let json = bookmarks.serialize_blob().unwrap();
         let restored: Vec<Bookmark> = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, bookmarks.bookmarks());
     }

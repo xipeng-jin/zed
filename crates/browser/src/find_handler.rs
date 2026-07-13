@@ -3,9 +3,7 @@
 //! overlay.
 
 use crate::tab_backend::{EventSender, TabBackendEvent, send_event};
-use cef::{
-    Browser, FindHandler, ImplFindHandler, WrapFindHandler, rc::Rc as _, wrap_find_handler,
-};
+use cef::{Browser, FindHandler, ImplFindHandler, WrapFindHandler, rc::Rc as _, wrap_find_handler};
 
 #[derive(Clone)]
 pub(crate) struct OsrFindHandler {
@@ -41,11 +39,5 @@ wrap_find_handler! {
                 },
             );
         }
-    }
-}
-
-impl FindHandlerBuilder {
-    pub fn build(handler: OsrFindHandler) -> cef::FindHandler {
-        Self::new(handler)
     }
 }

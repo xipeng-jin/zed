@@ -12,7 +12,9 @@ use crate::cef_instance::CefInstance;
 use crate::client::{ClientBuilder, MANUAL_KEY_EVENT};
 use crate::input;
 use crate::render_handler::RenderState;
-use crate::tab_backend::{EventReceiver, PaintOutput, TabBackend, TabBackendEvent, event_channel};
+use crate::tab_backend::{
+    EventReceiver, FindOptions, PaintOutput, TabBackend, TabBackendEvent, event_channel,
+};
 use anyhow::{Context as _, Result};
 use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
@@ -418,14 +420,14 @@ impl TabBackend for CefTab {
         });
     }
 
-    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
+    fn find(&mut self, query: &str, options: FindOptions) {
         self.with_host(|host| {
             let query = cef::CefString::from(query);
             host.find(
                 Some(&query),
-                if forward { 1 } else { 0 },
-                if match_case { 1 } else { 0 },
-                if find_next { 1 } else { 0 },
+                if options.forward { 1 } else { 0 },
+                if options.match_case { 1 } else { 0 },
+                if options.find_next { 1 } else { 0 },
             );
         });
     }

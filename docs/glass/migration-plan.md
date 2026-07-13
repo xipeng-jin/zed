@@ -550,7 +550,7 @@ Gate: soft — items are independent.
   the app closed, `xdg-open` launched it via the CLI and the link landed as
   the active tab beside the lazily-restored session tabs; clean ctrl-q with
   complete CEF shutdown afterwards in both runs. macOS registration stays
-  deferred to a macOS session (§8). Residual (needs a follow-up ticket):
+  deferred to a macOS session (§8). Residual (ticketed as #24):
   `get_any_active_multi_workspace` routes by active window, so an external
   link arriving while an incognito window (#20) is focused opens in that
   window's incognito browser view; most browsers instead route external
@@ -594,7 +594,7 @@ Gate: soft — items are independent.
   Chromium sandbox needs user namespaces or a SUID helper; keeping `no_sandbox` is
   the pragmatic M1 choice but is a real security tradeoff for a daily-driver browser.
   Revisit after M2 (decision principles rank correctness first, security eighth —
-  documented deliberately).
+  documented deliberately). *Revisit ticketed as #25 (2026-07-13).*
 - **R3 — Native popup windows on Linux.** The OAuth path creates non-OSR CEF windows;
   unowned by GPUI. Focus/stacking behavior needs empirical validation (M2 step 6).
   **Validated (2026-07-11, ticket #15): works, with two required fixes.**

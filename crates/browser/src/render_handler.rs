@@ -131,9 +131,3 @@ wrap_render_handler! {
         }
     }
 }
-
-impl RenderHandlerBuilder {
-    pub fn build(handler: OsrRenderHandler) -> cef::RenderHandler {
-        Self::new(handler)
-    }
-}

@@ -75,8 +75,8 @@ pub use stub_tab_backend::{
     RecordedCommand, StubBackendFactory, StubTabBackend, StubTabController,
 };
 pub use tab_backend::{
-    BrowserTabOpenTarget, OpenDisposition, OpenTargetRequest, PaintOutput, SoftwareFrame,
-    TabBackend, TabBackendEvent,
+    BrowserTabOpenTarget, FindOptions, OpenDisposition, OpenTargetRequest, PaintOutput,
+    SoftwareFrame, TabBackend, TabBackendEvent,
 };
 pub use text_input::BrowserTextInputState;
 

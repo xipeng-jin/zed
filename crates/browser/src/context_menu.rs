@@ -135,7 +135,9 @@ fn normalize_separators(items: Vec<MenuItem>) -> Vec<MenuItem> {
     let mut normalized: Vec<MenuItem> = Vec::with_capacity(items.len());
     for item in items {
         if item == MenuItem::Separator
-            && normalized.last().is_none_or(|last| *last == MenuItem::Separator)
+            && normalized
+                .last()
+                .is_none_or(|last| *last == MenuItem::Separator)
         {
             continue;
         }

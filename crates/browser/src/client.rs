@@ -191,7 +191,7 @@ wrap_client! {
 impl ClientBuilder {
     pub fn build(render_state: Arc<Mutex<RenderState>>, event_sender: EventSender) -> cef::Client {
         let life_span_handler =
-            LifeSpanHandlerBuilder::build(OsrLifeSpanHandler::new(event_sender.clone()));
+            LifeSpanHandlerBuilder::new(OsrLifeSpanHandler::new(event_sender.clone()));
         Self::build_inner(
             render_state,
             event_sender,
@@ -208,7 +208,7 @@ impl ClientBuilder {
         event_sender: EventSender,
     ) -> cef::Client {
         let life_span_handler =
-            PopupLifeSpanHandlerBuilder::build(PopupLifeSpanHandler::new(event_sender.clone()));
+            PopupLifeSpanHandlerBuilder::new(PopupLifeSpanHandler::new(event_sender.clone()));
         Self::build_inner(
             render_state,
             event_sender,
@@ -232,16 +232,16 @@ impl ClientBuilder {
         let context_menu_handler = OsrContextMenuHandler::new(event_sender.clone());
         let permission_handler = OsrPermissionHandler::new();
         Self::new(
-            RenderHandlerBuilder::build(render_handler),
-            LoadHandlerBuilder::build(load_handler),
-            DisplayHandlerBuilder::build(display_handler),
+            RenderHandlerBuilder::new(render_handler),
+            LoadHandlerBuilder::new(load_handler),
+            DisplayHandlerBuilder::new(display_handler),
             life_span_handler,
             keyboard_handler,
-            DownloadHandlerBuilder::build(download_handler),
-            FindHandlerBuilder::build(find_handler),
-            ContextMenuHandlerBuilder::build(context_menu_handler),
-            RequestHandlerBuilder::build(request_handler),
-            PermissionHandlerBuilder::build(permission_handler),
+            DownloadHandlerBuilder::new(download_handler),
+            FindHandlerBuilder::new(find_handler),
+            ContextMenuHandlerBuilder::new(context_menu_handler),
+            RequestHandlerBuilder::new(request_handler),
+            PermissionHandlerBuilder::new(permission_handler),
             event_sender,
         )
     }

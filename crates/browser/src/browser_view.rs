@@ -20,10 +20,8 @@ use crate::downloads::BrowserDownloads;
 use crate::history::BrowserHistory;
 use crate::omnibox::{Omnibox, OmniboxEvent};
 use crate::session;
-use crate::tab_backend::{BrowserTabOpenTarget, OpenTargetRequest, TabBackend};
-use crate::text_input::{
-    BrowserKeyDispatch, BrowserTextInputState, key_down_dispatch, key_up_dispatch,
-};
+use crate::tab_backend::{BrowserTabOpenTarget, FindOptions, OpenTargetRequest, TabBackend};
+use crate::text_input::{BrowserKeyDispatch, BrowserTextInputState, key_dispatch};
 use anyhow::anyhow;
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent, actions::SelectAll as EditorSelectAll};
@@ -429,14 +427,10 @@ impl BrowserView {
             };
             self.tabs.push(tab);
         }
-        self.active_tab_index = saved.active_index.min(self.tabs.len() - 1);
+        self.active_tab_index = saved.active_index.min(self.tabs.len().saturating_sub(1));
         // The saved order is strip order, but re-sort so an older or
         // hand-edited blob cannot violate the pinned-first invariant.
-        let active_id = self.tabs[self.active_tab_index].id;
-        self.tabs.sort_by_key(|tab| !tab.is_pinned());
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == active_id) {
-            self.active_tab_index = index;
-        }
+        self.sort_tabs_pinned_first();
     }
 
     #[cfg(feature = "cef")]
@@ -674,19 +668,26 @@ impl BrowserView {
     }
 
     // `tabs` is never empty and `active_tab_index` is kept in bounds by every
-    // tab-list mutation, so these lookups cannot fail.
+    // tab-list mutation; if a bug ever violates the index half of that
+    // invariant, fall back to the last tab instead of panicking.
     fn active_tab(&self) -> &BrowserTab {
-        &self.tabs[self.active_tab_index]
+        self.tabs
+            .get(self.active_tab_index)
+            .or_else(|| self.tabs.last())
+            .expect("a browser view always has at least one tab")
     }
 
     fn active_tab_mut(&mut self) -> &mut BrowserTab {
-        &mut self.tabs[self.active_tab_index]
+        let index = self.active_tab_index.min(self.tabs.len().saturating_sub(1));
+        self.tabs
+            .get_mut(index)
+            .expect("a browser view always has at least one tab")
     }
 
     /// The active tab, if it has an engine page to receive input — a new-tab
     /// page has none, so user input aimed at the content area goes nowhere.
     fn active_engine_tab_mut(&mut self) -> Option<&mut BrowserTab> {
-        let tab = &mut self.tabs[self.active_tab_index];
+        let tab = self.active_tab_mut();
         if tab.is_new_tab_page() {
             None
         } else {
@@ -780,9 +781,9 @@ impl BrowserView {
                 downloads.record_update(update, is_incognito, cx);
             });
         }
-        if let Some((count, active_match_ordinal)) = active_find_result {
-            self.find_match_count = count;
-            self.find_active_match_ordinal = active_match_ordinal;
+        if let Some(find_result) = active_find_result {
+            self.find_match_count = find_result.match_count;
+            self.find_active_match_ordinal = find_result.active_match_ordinal;
             needs_notify = true;
         }
         if active_text_input_lost {
@@ -907,13 +908,23 @@ impl BrowserView {
     }
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.push_fresh_tab(cx);
+        self.activate_tab(index, window, cx);
+        self.focus_omnibox_on_fresh_tab(window, cx);
+    }
+
+    /// Append a fresh tab per the `new_tab_behavior` setting; returns its
+    /// index.
+    fn push_fresh_tab(&mut self, cx: &mut Context<Self>) -> usize {
         let tab = self.create_fresh_tab(cx);
-        let is_new_tab_page = tab.is_new_tab_page();
         self.tabs.push(tab);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
-        // A fresh new-tab page means the user's next step is typing a
-        // destination; a configured new-tab URL means reading the page.
-        if is_new_tab_page {
+        self.tabs.len() - 1
+    }
+
+    /// A fresh new-tab page means the user's next step is typing a
+    /// destination; a configured new-tab URL means reading the page.
+    fn focus_omnibox_on_fresh_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab().is_new_tab_page() {
             self.focus_omnibox_blank(window, cx);
         }
     }
@@ -956,13 +967,8 @@ impl BrowserView {
             // The view always shows at least one tab; closing the last one
             // resets to a fresh tab, like Glass
             // (`Glass:crates/browser/src/browser_view/tabs.rs:455`).
-            let tab = self.create_fresh_tab(cx);
-            let is_new_tab_page = tab.is_new_tab_page();
-            self.tabs.push(tab);
-            self.active_tab_index = 0;
-            if is_new_tab_page {
-                self.focus_omnibox_blank(window, cx);
-            }
+            self.active_tab_index = self.push_fresh_tab(cx);
+            self.focus_omnibox_on_fresh_tab(window, cx);
         } else if index < self.active_tab_index {
             self.active_tab_index -= 1;
         } else if was_active {
@@ -1032,15 +1038,20 @@ impl BrowserView {
         }
     }
 
-    /// Restore pinned-first ordering after a pin state change, keeping the
-    /// relative order within each group (stable sort) and the active tab
-    /// active.
-    fn resort_tabs_pinned_first(&mut self, cx: &mut Context<Self>) {
+    /// Restore pinned-first ordering, keeping the relative order within each
+    /// group (stable sort) and the active tab active.
+    fn sort_tabs_pinned_first(&mut self) {
         let active_id = self.active_tab().id;
         self.tabs.sort_by_key(|tab| !tab.is_pinned());
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == active_id) {
             self.active_tab_index = index;
         }
+    }
+
+    /// [`sort_tabs_pinned_first`](Self::sort_tabs_pinned_first) after a pin
+    /// state change, persisting and re-rendering the new order.
+    fn resort_tabs_pinned_first(&mut self, cx: &mut Context<Self>) {
+        self.sort_tabs_pinned_first();
         self.schedule_session_save(cx);
         cx.notify();
     }
@@ -1225,7 +1236,14 @@ impl BrowserView {
         }
         let query = self.find_query.clone();
         if let Some(tab) = self.active_engine_tab_mut() {
-            tab.find(&query, forward, false, find_next);
+            tab.find(
+                &query,
+                FindOptions {
+                    forward,
+                    match_case: false,
+                    find_next,
+                },
+            );
         }
         cx.notify();
     }
@@ -1245,12 +1263,7 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.find_visible {
-            self.find_visible = true;
-            self.focus_find_editor(window, cx);
-        }
-        self.run_find(true, true, cx);
-        cx.notify();
+        self.step_find_in_page(true, window, cx);
     }
 
     fn handle_find_previous_in_page(
@@ -1259,11 +1272,17 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.step_find_in_page(false, window, cx);
+    }
+
+    /// Step to the adjacent find match, opening the find overlay first if it
+    /// is not showing.
+    fn step_find_in_page(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.find_visible {
             self.find_visible = true;
             self.focus_find_editor(window, cx);
         }
-        self.run_find(false, true, cx);
+        self.run_find(forward, true, cx);
         cx.notify();
     }
 
@@ -1486,7 +1505,7 @@ impl BrowserView {
         if !self.focus_handle.is_focused(window) {
             return;
         }
-        let route = key_down_dispatch(
+        let route = key_dispatch(
             &event.keystroke,
             self.active_tab_text_input_state().editable,
             self.text_input_composing(),
@@ -1505,7 +1524,7 @@ impl BrowserView {
         if !self.focus_handle.is_focused(window) {
             return;
         }
-        let route = key_up_dispatch(
+        let route = key_dispatch(
             &event.keystroke,
             self.active_tab_text_input_state().editable,
             self.text_input_composing(),
@@ -4955,7 +4974,9 @@ mod tests {
         .unwrap();
         cx.update(|cx| {
             let store = KeyValueStore::global(cx);
-            cx.background_spawn(async move { session::save_bookmarks(store, json).await })
+            cx.background_spawn(async move {
+                session::save_blob(store, session::BROWSER_BOOKMARKS_KEY, json).await
+            })
         })
         .await
         .unwrap();
@@ -5057,8 +5078,6 @@ mod tests {
         controller.script_events([TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
             url: "https://foreground.example".into(),
             disposition: OpenDisposition::NewForegroundTab,
-            user_gesture: true,
-            is_popup_request: true,
         })]);
         pump(cx);
         view.update(cx, |view, _| {
@@ -5078,8 +5097,6 @@ mod tests {
         controller.script_events([TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
             url: "https://background.example".into(),
             disposition: OpenDisposition::NewBackgroundTab,
-            user_gesture: true,
-            is_popup_request: false,
         })]);
         pump(cx);
         view.update(cx, |view, _| {
@@ -5270,9 +5287,11 @@ mod tests {
             find_commands(&controller),
             vec![RecordedCommand::Find {
                 query: "needle".into(),
-                forward: true,
-                match_case: false,
-                find_next: false,
+                options: FindOptions {
+                    forward: true,
+                    match_case: false,
+                    find_next: false,
+                },
             }],
         );
 
@@ -5298,15 +5317,19 @@ mod tests {
             vec![
                 RecordedCommand::Find {
                     query: "needle".into(),
-                    forward: true,
-                    match_case: false,
-                    find_next: true,
+                    options: FindOptions {
+                        forward: true,
+                        match_case: false,
+                        find_next: true,
+                    },
                 },
                 RecordedCommand::Find {
                     query: "needle".into(),
-                    forward: false,
-                    match_case: false,
-                    find_next: true,
+                    options: FindOptions {
+                        forward: false,
+                        match_case: false,
+                        find_next: true,
+                    },
                 },
             ],
         );

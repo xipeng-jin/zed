@@ -74,19 +74,23 @@ impl OpenDisposition {
 }
 
 /// A page-initiated request to open `url` somewhere other than the current
-/// browser tab, surfaced to the browser view for routing.
-///
-/// `user_gesture` and `is_popup_request` are not consulted yet; they are
-/// carried from Glass's `OpenTargetRequest` so a future popup-blocking policy
-/// (gate non-gestured opens) has the signal it needs.
+/// browser tab, surfaced to the browser view for routing. Glass additionally
+/// carried the engine's user-gesture and popup-origin flags; they were never
+/// consulted, so they are not ported (a future popup-blocking policy can
+/// reintroduce them from the engine callbacks).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTargetRequest {
     pub url: String,
     pub disposition: OpenDisposition,
-    pub user_gesture: bool,
-    /// True when the request came from popup creation (`on_before_popup`)
-    /// rather than a link-open (`on_open_urlfrom_tab`).
-    pub is_popup_request: bool,
+}
+
+/// How one in-page find request behaves. `find_next` distinguishes stepping
+/// through the current query's matches from starting a fresh search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindOptions {
+    pub forward: bool,
+    pub match_case: bool,
+    pub find_next: bool,
 }
 
 /// Events flowing from the engine to the app, drained on the foreground thread
@@ -235,10 +239,9 @@ pub trait TabBackend: 'static {
     /// Abandon the in-progress composition, removing the preedit text.
     fn ime_cancel_composition(&mut self);
 
-    /// Start or continue an in-page find. `find_next` distinguishes stepping
-    /// through the current query's matches from starting a fresh search;
-    /// results come back as [`TabBackendEvent::FindResult`]s.
-    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool);
+    /// Start or continue an in-page find; results come back as
+    /// [`TabBackendEvent::FindResult`]s.
+    fn find(&mut self, query: &str, options: FindOptions);
 
     /// End the in-page find, optionally clearing the match selection.
     fn stop_finding(&mut self, clear_selection: bool);
@@ -307,8 +310,6 @@ pub(crate) fn redirect_open_target_to_tab(
     sender: &EventSender,
     target_url: Option<String>,
     disposition: OpenDisposition,
-    user_gesture: bool,
-    is_popup_request: bool,
 ) -> bool {
     if disposition.app_tab_target().is_none() {
         return false;
@@ -318,12 +319,7 @@ pub(crate) fn redirect_open_target_to_tab(
     };
     send_event(
         sender,
-        TabBackendEvent::OpenTargetRequested(OpenTargetRequest {
-            url,
-            disposition,
-            user_gesture,
-            is_popup_request,
-        }),
+        TabBackendEvent::OpenTargetRequested(OpenTargetRequest { url, disposition }),
     );
     true
 }

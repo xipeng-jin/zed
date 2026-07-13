@@ -38,20 +38,13 @@ fn route_popup(
     sender: &EventSender,
     target_url: Option<&cef::CefString>,
     target_disposition: cef::WindowOpenDisposition,
-    user_gesture: ::std::os::raw::c_int,
     window_info: Option<&mut cef::WindowInfo>,
     client: Option<&mut Option<cef::Client>>,
 ) -> ::std::os::raw::c_int {
     let disposition = OpenDisposition::from(target_disposition);
     let target_url = target_url.map(ToString::to_string);
 
-    if redirect_open_target_to_tab(
-        sender,
-        target_url.clone(),
-        disposition,
-        user_gesture != 0,
-        true,
-    ) {
+    if redirect_open_target_to_tab(sender, target_url.clone(), disposition) {
         log::info!(
             "[browser::life_span] redirecting popup disposition {disposition:?} into browser tab flow"
         );
@@ -110,7 +103,7 @@ wrap_life_span_handler! {
             target_url: Option<&cef::CefString>,
             _target_frame_name: Option<&cef::CefString>,
             target_disposition: cef::WindowOpenDisposition,
-            user_gesture: ::std::os::raw::c_int,
+            _user_gesture: ::std::os::raw::c_int,
             _popup_features: Option<&cef::PopupFeatures>,
             window_info: Option<&mut cef::WindowInfo>,
             client: Option<&mut Option<cef::Client>>,
@@ -122,7 +115,6 @@ wrap_life_span_handler! {
                 &self.handler.sender,
                 target_url,
                 target_disposition,
-                user_gesture,
                 window_info,
                 client,
             )
@@ -135,12 +127,6 @@ wrap_life_span_handler! {
         fn do_close(&self, _browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
             0 // Allow close.
         }
-    }
-}
-
-impl LifeSpanHandlerBuilder {
-    pub fn build(handler: OsrLifeSpanHandler) -> cef::LifeSpanHandler {
-        Self::new(handler)
     }
 }
 
@@ -173,7 +159,7 @@ wrap_life_span_handler! {
             target_url: Option<&cef::CefString>,
             _target_frame_name: Option<&cef::CefString>,
             target_disposition: cef::WindowOpenDisposition,
-            user_gesture: ::std::os::raw::c_int,
+            _user_gesture: ::std::os::raw::c_int,
             _popup_features: Option<&cef::PopupFeatures>,
             window_info: Option<&mut cef::WindowInfo>,
             client: Option<&mut Option<cef::Client>>,
@@ -185,7 +171,6 @@ wrap_life_span_handler! {
                 &self.handler.sender,
                 target_url,
                 target_disposition,
-                user_gesture,
                 window_info,
                 client,
             )
@@ -206,11 +191,5 @@ wrap_life_span_handler! {
         fn do_close(&self, _browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
             0 // Allow close.
         }
-    }
-}
-
-impl PopupLifeSpanHandlerBuilder {
-    pub fn build(handler: PopupLifeSpanHandler) -> cef::LifeSpanHandler {
-        Self::new(handler)
     }
 }

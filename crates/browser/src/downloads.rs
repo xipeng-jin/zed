@@ -11,9 +11,8 @@
 //! incognito windows appear in the download center but are excluded from
 //! persistence (CONTEXT.md "incognito window").
 
-use crate::session;
-use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use crate::session::{self, PersistedBlob};
+use gpui::{App, Context, Entity, Subscription, Task};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,6 +39,35 @@ pub struct DownloadUpdate {
     pub is_complete: bool,
     pub is_canceled: bool,
     pub is_interrupted: bool,
+}
+
+/// A download's lifecycle state, derived from the update's four state flags.
+/// The flags stay as they are on the wire — they mirror CEF's `DownloadItem`
+/// and the persisted blob format — while this enum makes their mutual
+/// exclusivity and precedence explicit for anything consuming the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadStatus {
+    Complete,
+    Canceled,
+    Interrupted,
+    InProgress,
+    Queued,
+}
+
+impl DownloadUpdate {
+    pub(crate) fn status(&self) -> DownloadStatus {
+        if self.is_complete {
+            DownloadStatus::Complete
+        } else if self.is_canceled {
+            DownloadStatus::Canceled
+        } else if self.is_interrupted {
+            DownloadStatus::Interrupted
+        } else if self.is_in_progress {
+            DownloadStatus::InProgress
+        } else {
+            DownloadStatus::Queued
+        }
+    }
 }
 
 /// A download in the download center: the latest engine update plus how the
@@ -75,26 +103,22 @@ impl DownloadRecord {
     /// One-line status: completion, cancellation, interruption, or live
     /// progress with received/total sizes.
     pub fn status_text(&self) -> String {
-        if self.update.is_complete {
-            return String::from("Complete");
+        match self.update.status() {
+            DownloadStatus::Complete => String::from("Complete"),
+            DownloadStatus::Canceled => String::from("Canceled"),
+            DownloadStatus::Interrupted => String::from("Interrupted"),
+            DownloadStatus::InProgress => {
+                let received = format_size(self.update.received_bytes);
+                let total = if self.update.total_bytes > 0 {
+                    format_size(self.update.total_bytes)
+                } else {
+                    String::from("--")
+                };
+                let percent = self.update.percent_complete.max(0);
+                format!("{percent}% ({received}/{total})")
+            }
+            DownloadStatus::Queued => String::from("Queued"),
         }
-        if self.update.is_canceled {
-            return String::from("Canceled");
-        }
-        if self.update.is_interrupted {
-            return String::from("Interrupted");
-        }
-        if self.update.is_in_progress {
-            let received = format_size(self.update.received_bytes);
-            let total = if self.update.total_bytes > 0 {
-                format_size(self.update.total_bytes)
-            } else {
-                String::from("--")
-            };
-            let percent = self.update.percent_complete.max(0);
-            return format!("{percent}% ({received}/{total})");
-        }
-        String::from("Queued")
     }
 }
 
@@ -226,26 +250,37 @@ pub(crate) fn unique_download_path(directory: &Path, file_name: &str) -> PathBuf
 pub(crate) struct BrowserDownloads {
     /// All download records, newest first.
     downloads: Vec<DownloadRecord>,
-    /// Debounced blob write; replacing it pushes the deadline out. Also the
-    /// dirty flag: `Some` means mutations have not been written.
+    /// Debounced blob write; see [`PersistedBlob::pending_save_mut`].
     pending_save: Option<Task<()>>,
     _quit_flush: Subscription,
 }
 
-struct GlobalBrowserDownloads(Entity<BrowserDownloads>);
+impl PersistedBlob for BrowserDownloads {
+    const KEY: &'static str = session::BROWSER_DOWNLOADS_KEY;
+    const SAVE_DEBOUNCE: Duration = DOWNLOADS_SAVE_DEBOUNCE;
 
-impl Global for GlobalBrowserDownloads {}
+    /// Incognito records never touch the persisted blob (CONTEXT.md
+    /// "incognito window").
+    fn serialize_blob(&self) -> Option<String> {
+        let updates = self
+            .downloads
+            .iter()
+            .filter(|record| !record.is_incognito)
+            .map(|record| &record.update)
+            .collect::<Vec<_>>();
+        serde_json::to_string(&updates).log_err()
+    }
+
+    fn pending_save_mut(&mut self) -> &mut Option<Task<()>> {
+        &mut self.pending_save
+    }
+}
 
 impl BrowserDownloads {
     /// The app-wide shared download list, created (restoring the persisted
     /// blob) on first access.
     pub fn global(cx: &mut App) -> Entity<Self> {
-        if let Some(global) = cx.try_global::<GlobalBrowserDownloads>() {
-            return global.0.clone();
-        }
-        let downloads = cx.new(Self::new);
-        cx.set_global(GlobalBrowserDownloads(downloads.clone()));
-        downloads
+        session::global_entity(cx, Self::new)
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -303,46 +338,6 @@ impl BrowserDownloads {
                 },
             );
         }
-    }
-
-    fn serialize(&self) -> Option<String> {
-        let updates = self
-            .downloads
-            .iter()
-            .filter(|record| !record.is_incognito)
-            .map(|record| &record.update)
-            .collect::<Vec<_>>();
-        serde_json::to_string(&updates).log_err()
-    }
-
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.pending_save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(DOWNLOADS_SAVE_DEBOUNCE)
-                .await;
-            let Ok((downloads, store)) = this.update(cx, |this, cx| {
-                this.pending_save = None;
-                (this.serialize(), KeyValueStore::global(cx))
-            }) else {
-                return;
-            };
-            if let Some(downloads) = downloads {
-                session::save_downloads(store, downloads).await.log_err();
-            }
-        }));
-    }
-
-    fn flush_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        if self.pending_save.take().is_none() {
-            return Task::ready(());
-        }
-        let Some(downloads) = self.serialize() else {
-            return Task::ready(());
-        };
-        let store = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            session::save_downloads(store, downloads).await.log_err();
-        })
     }
 }
 
@@ -413,7 +408,10 @@ mod tests {
             file_name_for_download("", "https://example.com/x/archive.tar.gz?token=abc"),
             "archive.tar.gz"
         );
-        assert_eq!(file_name_for_download("", "https://example.com/"), "download");
+        assert_eq!(
+            file_name_for_download("", "https://example.com/"),
+            "download"
+        );
         assert_eq!(file_name_for_download("", "not a url"), "download");
     }
 
@@ -508,7 +506,7 @@ mod tests {
         store.apply_update(update(2), true);
 
         assert_eq!(store.downloads().len(), 2);
-        let json = store.serialize().unwrap();
+        let json = store.serialize_blob().unwrap();
         let persisted: Vec<DownloadUpdate> = serde_json::from_str(&json).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].id, 1);
@@ -523,7 +521,7 @@ mod tests {
         complete.full_path = Some("/home/user/Downloads/file-7.zip".to_string());
         store.apply_update(complete.clone(), false);
 
-        let json = store.serialize().unwrap();
+        let json = store.serialize_blob().unwrap();
         let restored: Vec<DownloadUpdate> = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, vec![complete]);
     }

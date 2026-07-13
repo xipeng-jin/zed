@@ -7,10 +7,9 @@
 //! incognito ones, which never record) land in the same shared entity, so it
 //! is also the single writer of the persisted blob.
 
-use crate::session;
-use db::kvp::KeyValueStore;
+use crate::session::{self, PersistedBlob};
 use fuzzy::StringMatchCandidate;
-use gpui::{App, AppContext as _, BackgroundExecutor, Context, Entity, Global, Subscription, Task};
+use gpui::{App, BackgroundExecutor, Context, Entity, Subscription, Task};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,15 +41,23 @@ pub(crate) struct HistoryMatch {
 
 pub(crate) struct BrowserHistory {
     entries: Vec<HistoryEntry>,
-    /// Debounced history write; replacing it pushes the deadline out. Also
-    /// the dirty flag: `Some` means recorded visits have not been written.
+    /// Debounced history write; see [`PersistedBlob::pending_save_mut`].
     pending_save: Option<Task<()>>,
     _quit_flush: Subscription,
 }
 
-struct GlobalBrowserHistory(Entity<BrowserHistory>);
+impl PersistedBlob for BrowserHistory {
+    const KEY: &'static str = session::BROWSER_HISTORY_KEY;
+    const SAVE_DEBOUNCE: Duration = HISTORY_SAVE_DEBOUNCE;
 
-impl Global for GlobalBrowserHistory {}
+    fn serialize_blob(&self) -> Option<String> {
+        serde_json::to_string(&self.entries).log_err()
+    }
+
+    fn pending_save_mut(&mut self) -> &mut Option<Task<()>> {
+        &mut self.pending_save
+    }
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -63,12 +70,7 @@ impl BrowserHistory {
     /// The app-wide shared history, created (restoring the persisted blob) on
     /// first access.
     pub fn global(cx: &mut App) -> Entity<Self> {
-        if let Some(global) = cx.try_global::<GlobalBrowserHistory>() {
-            return global.0.clone();
-        }
-        let history = cx.new(Self::new);
-        cx.set_global(GlobalBrowserHistory(history.clone()));
-        history
+        session::global_entity(cx, Self::new)
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -118,38 +120,6 @@ impl BrowserHistory {
                 }
             }
         }
-    }
-
-    fn serialize(&self) -> Option<String> {
-        serde_json::to_string(&self.entries).log_err()
-    }
-
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.pending_save = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(HISTORY_SAVE_DEBOUNCE).await;
-            let Ok((history, store)) = this.update(cx, |this, cx| {
-                this.pending_save = None;
-                (this.serialize(), KeyValueStore::global(cx))
-            }) else {
-                return;
-            };
-            if let Some(history) = history {
-                session::save_history(store, history).await.log_err();
-            }
-        }));
-    }
-
-    fn flush_on_quit(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        if self.pending_save.take().is_none() {
-            return Task::ready(());
-        }
-        let Some(history) = self.serialize() else {
-            return Task::ready(());
-        };
-        let store = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            session::save_history(store, history).await.log_err();
-        })
     }
 
     /// Fuzzy-match `query` against `entries` (title and URL), re-ranking the

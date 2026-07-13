@@ -95,9 +95,3 @@ wrap_context_menu_handler! {
         }
     }
 }
-
-impl ContextMenuHandlerBuilder {
-    pub fn build(handler: OsrContextMenuHandler) -> cef::ContextMenuHandler {
-        Self::new(handler)
-    }
-}

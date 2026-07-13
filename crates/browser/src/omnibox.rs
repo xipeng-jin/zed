@@ -488,39 +488,34 @@ fn truncate_label(input: &str, max_chars: usize) -> String {
 }
 
 fn looks_like_url(input: &str) -> bool {
-    if input.starts_with("http://") || input.starts_with("https://") {
-        return true;
-    }
-    if input.contains("://") {
-        return true;
-    }
+    input.starts_with("http://")
+        || input.starts_with("https://")
+        || input.contains("://")
+        || parse_as_schemeless_url(input).is_some()
+}
 
+/// `input` parsed with an `http://` scheme prepended — the shared basis for
+/// URL-ness and default-scheme decisions. `None` when the input does not read
+/// as a scheme-less URL (whitespace, unparsable, or a host that reads as a
+/// search term rather than a site).
+fn parse_as_schemeless_url(input: &str) -> Option<url::Url> {
     if input.chars().any(char::is_whitespace) {
-        return false;
+        return None;
     }
 
-    let Ok(url) = url::Url::parse(&format!("http://{input}")) else {
-        return false;
-    };
-
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    host.eq_ignore_ascii_case("localhost")
+    let url = url::Url::parse(&format!("http://{input}")).ok()?;
+    let host = url.host_str()?;
+    let is_url = host.eq_ignore_ascii_case("localhost")
         || host.contains('.')
         || host.parse::<std::net::IpAddr>().is_ok()
-        || (url.port().is_some() && !host.contains('.'))
+        || (url.port().is_some() && !host.contains('.'));
+    is_url.then_some(url)
 }
 
 /// Scheme-less hosts that are clearly local development targets (localhost,
 /// loopback addresses, bare hosts with a port) rarely serve TLS; everything
 /// else defaults to https.
-fn should_use_http_by_default(input: &str) -> bool {
-    let Ok(url) = url::Url::parse(&format!("http://{input}")) else {
-        return false;
-    };
-
+fn should_use_http_by_default(url: &url::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -544,14 +539,13 @@ pub fn text_to_url(text: &str, engine: &BrowserSearchEngine) -> String {
         return text.to_string();
     }
 
-    if !looks_like_url(text) {
-        return search_url(engine, text);
-    }
-
-    if should_use_http_by_default(text) {
-        format!("http://{text}")
-    } else {
-        format!("https://{text}")
+    match parse_as_schemeless_url(text) {
+        Some(url) if should_use_http_by_default(&url) => format!("http://{text}"),
+        Some(_) => format!("https://{text}"),
+        // An explicit non-web scheme still reads as a URL, not a search; it
+        // keeps the historical https prefix.
+        None if text.contains("://") => format!("https://{text}"),
+        None => search_url(engine, text),
     }
 }
 

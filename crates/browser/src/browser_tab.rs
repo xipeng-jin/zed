@@ -11,7 +11,7 @@ use crate::context_menu::ContextMenuContext;
 use crate::downloads::DownloadUpdate;
 use crate::frame_presenter::{FramePresenter, SoftwarePresenter};
 use crate::page_chrome::PageChrome;
-use crate::tab_backend::{OpenTargetRequest, TabBackend, TabBackendEvent};
+use crate::tab_backend::{FindOptions, OpenTargetRequest, TabBackend, TabBackendEvent};
 use crate::text_input::{BrowserTextInputState, CommittedTextAction, committed_text_action};
 use gpui::{
     AnyElement, Hsla, Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta, SharedString,
@@ -25,6 +25,14 @@ pub(crate) struct ClosedTab {
     pub title: String,
     pub favicon_url: Option<SharedUri>,
     pub is_pinned: bool,
+}
+
+/// One in-page find result: how many matches, and which one is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FindResult {
+    pub match_count: i32,
+    /// 1-based; 0 while unknown.
+    pub active_match_ordinal: i32,
 }
 
 /// What a drain of pending engine events changed, so the view can decide
@@ -43,10 +51,9 @@ pub(crate) struct DrainedChanges {
     /// the app-global download list. No `needs_notify`: views re-render
     /// through their observation of that list instead.
     pub downloads: Vec<DownloadUpdate>,
-    /// Latest in-page find result: match count and 1-based active match
-    /// ordinal. Only the last result in a drain matters; the view shows it in
-    /// the find overlay when this tab is active.
-    pub find_result: Option<(i32, i32)>,
+    /// Latest in-page find result. Only the last result in a drain matters;
+    /// the view shows it in the find overlay when this tab is active.
+    pub find_result: Option<FindResult>,
     /// The page requested a context menu; the view renders it. Only the last
     /// request in a drain survives (they cannot stack).
     pub context_menu: Option<ContextMenuContext>,
@@ -57,6 +64,26 @@ pub(crate) struct DrainedChanges {
     /// navigation); the view re-checks keystroke routing and drops any
     /// composition aimed at a field that no longer accepts it.
     pub text_input_changed: bool,
+}
+
+/// A viewport as pushed to the engine, comparable across draws: logical size
+/// plus the scale factor in thousandths (f32 has no `Eq`; a sub-thousandth
+/// scale change is not worth re-pushing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ViewportKey {
+    width: u32,
+    height: u32,
+    scale_factor_thousandths: u32,
+}
+
+impl ViewportKey {
+    fn new(width: u32, height: u32, scale_factor: f32) -> Self {
+        Self {
+            width,
+            height,
+            scale_factor_thousandths: (scale_factor * 1000.0) as u32,
+        }
+    }
 }
 
 pub(crate) struct BrowserTab {
@@ -77,9 +104,9 @@ pub(crate) struct BrowserTab {
     /// navigation clears it and starts the engine.
     is_new_tab_page: bool,
     engine_error: Option<String>,
-    /// Last viewport pushed to the engine: logical width and height, plus the
-    /// scale factor in thousandths (to keep the key comparable).
-    last_viewport: Option<(u32, u32, u32)>,
+    /// Last viewport pushed to the engine, so only real changes cross the
+    /// seam.
+    last_viewport: Option<ViewportKey>,
     /// Latest focused-node editability reported by this tab's render process;
     /// reset on navigation until the new page reports.
     text_input_state: BrowserTextInputState,
@@ -208,7 +235,7 @@ impl BrowserTab {
         if self.is_new_tab_page || width == 0 || height == 0 {
             return;
         }
-        let viewport_key = (width, height, (scale_factor * 1000.0) as u32);
+        let viewport_key = ViewportKey::new(width, height, scale_factor);
         if !self.backend.is_started() {
             if self.engine_error.is_some() || !self.backend.engine_ready() {
                 return;
@@ -295,7 +322,10 @@ impl BrowserTab {
                     count,
                     active_match_ordinal,
                 } => {
-                    changes.find_result = Some((count, active_match_ordinal));
+                    changes.find_result = Some(FindResult {
+                        match_count: count,
+                        active_match_ordinal,
+                    });
                 }
                 TabBackendEvent::ContextMenuRequested(context) => {
                     changes.context_menu = Some(context);
@@ -442,8 +472,8 @@ impl BrowserTab {
         self.backend.ime_cancel_composition();
     }
 
-    pub fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
-        self.backend.find(query, forward, match_case, find_next);
+    pub fn find(&mut self, query: &str, options: FindOptions) {
+        self.backend.find(query, options);
     }
 
     pub fn stop_finding(&mut self, clear_selection: bool) {

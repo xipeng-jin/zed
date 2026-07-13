@@ -122,9 +122,3 @@ wrap_download_handler! {
         }
     }
 }
-
-impl DownloadHandlerBuilder {
-    pub fn build(handler: OsrDownloadHandler) -> cef::DownloadHandler {
-        Self::new(handler)
-    }
-}

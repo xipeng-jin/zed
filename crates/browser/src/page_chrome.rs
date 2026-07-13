@@ -581,7 +581,13 @@ mod engine {
                     return 0;
                 };
 
-                args.set_string(0, Some(&CefString::from(payload.as_str())));
+                if args.set_string(0, Some(&CefString::from(payload.as_str()))) == 0 {
+                    log::warn!(
+                        "[browser::page_chrome] failed to attach the page chrome payload \
+                         to the process message"
+                    );
+                    return 0;
+                }
 
                 let Some(context) = v8_context_get_current_context() else {
                     return 0;
@@ -639,11 +645,18 @@ mod engine {
                     return;
                 };
 
-                global.set_value_bykey(
+                if global.set_value_bykey(
                     Some(&CefString::from(PAGE_CHROME_BRIDGE_NAME)),
                     Some(&mut bridge),
                     Default::default(),
-                );
+                ) == 0
+                {
+                    log::warn!(
+                        "[browser::page_chrome] failed to install the page chrome bridge \
+                         on the page's global object"
+                    );
+                    return;
+                }
 
                 let mut result = None;
                 let mut eval_exception = None::<cef::V8Exception>;

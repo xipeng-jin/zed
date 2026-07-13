@@ -35,22 +35,14 @@ wrap_request_handler! {
             _frame: Option<&mut cef::Frame>,
             target_url: Option<&cef::CefString>,
             target_disposition: WindowOpenDisposition,
-            user_gesture: ::std::os::raw::c_int,
+            _user_gesture: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             let redirected = redirect_open_target_to_tab(
                 &self.handler.sender,
                 target_url.map(ToString::to_string),
                 OpenDisposition::from(target_disposition),
-                user_gesture != 0,
-                false,
             );
             if redirected { 1 } else { 0 }
         }
-    }
-}
-
-impl RequestHandlerBuilder {
-    pub fn build(handler: OsrRequestHandler) -> cef::RequestHandler {
-        Self::new(handler)
     }
 }

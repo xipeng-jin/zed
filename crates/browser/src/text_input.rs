@@ -40,21 +40,10 @@ pub(crate) enum BrowserKeyDispatch {
     TextInput,
 }
 
-pub(crate) fn key_down_dispatch(
-    keystroke: &Keystroke,
-    text_input_editable: bool,
-    text_input_composing: bool,
-) -> BrowserKeyDispatch {
-    if keystroke.modifiers.platform || keystroke.modifiers.control {
-        BrowserKeyDispatch::App
-    } else if should_use_text_input(keystroke, text_input_editable, text_input_composing) {
-        BrowserKeyDispatch::TextInput
-    } else {
-        BrowserKeyDispatch::Browser
-    }
-}
-
-pub(crate) fn key_up_dispatch(
+/// Classify one keystroke aimed at page content. Key-down and key-up route
+/// identically: a key-up must follow its key-down's route or the page sees
+/// unbalanced key events.
+pub(crate) fn key_dispatch(
     keystroke: &Keystroke,
     text_input_editable: bool,
     text_input_composing: bool,
@@ -91,39 +80,46 @@ fn should_use_text_input(
         return true;
     }
 
-    // Named keys without character input (navigation, editing, function keys)
-    // act on the page; everything else — dead keys included — belongs to the
-    // text-input path.
-    !matches!(
-        keystroke.key.as_str(),
-        "enter"
-            | "backspace"
-            | "tab"
-            | "delete"
-            | "escape"
-            | "space"
-            | "left"
-            | "right"
-            | "up"
-            | "down"
-            | "home"
-            | "end"
-            | "pageup"
-            | "pagedown"
-            | "f1"
-            | "f2"
-            | "f3"
-            | "f4"
-            | "f5"
-            | "f6"
-            | "f7"
-            | "f8"
-            | "f9"
-            | "f10"
-            | "f11"
-            | "f12"
-    )
+    // Named keys without character input act on the page; everything else —
+    // dead keys included — belongs to the text-input path. Enter and space
+    // join the shared list here because without character input they act on
+    // the page too (they only reach this point when the platform reported no
+    // `key_char`).
+    !(matches!(keystroke.key.as_str(), "enter" | "space")
+        || NON_CHARACTER_NAMED_KEYS.contains(&keystroke.key.as_str()))
 }
+
+/// Named keys that never carry character input (navigation, editing, function
+/// keys). Shared with the engine char-event gate in `input.rs` so the two
+/// lists cannot drift; enter and space are deliberately absent — they produce
+/// characters for the engine (`input.rs`) even though they act on the page in
+/// keystroke routing (see [`key_dispatch`]).
+pub(crate) const NON_CHARACTER_NAMED_KEYS: &[&str] = &[
+    "backspace",
+    "tab",
+    "delete",
+    "escape",
+    "left",
+    "right",
+    "up",
+    "down",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+];
 
 /// What committing `text` through the input handler should do to the page.
 /// Some IMEs commit a bare newline for the confirm key; the page expects an
@@ -188,23 +184,26 @@ mod engine {
             return;
         };
 
-        args.set_bool(
+        if args.set_bool(
             0,
             focused_node.is_some_and(|node| node.is_editable() != 0) as i32,
-        );
+        ) == 0
+        {
+            log::warn!(
+                "[browser::text_input] failed to attach the editability flag to the \
+                 text-input state message"
+            );
+            return;
+        }
 
         let mut message = message;
         frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BrowserKeyDispatch, CommittedTextAction, committed_text_action, key_down_dispatch,
-        key_up_dispatch,
-    };
+    use super::{BrowserKeyDispatch, CommittedTextAction, committed_text_action, key_dispatch};
     use gpui::{Keystroke, Modifiers};
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
@@ -220,11 +219,7 @@ mod tests {
         let keystroke = keystroke("e", Some("e"), Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, false, false),
-            BrowserKeyDispatch::Browser
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, false, false),
+            key_dispatch(&keystroke, false, false),
             BrowserKeyDispatch::Browser
         );
     }
@@ -234,11 +229,7 @@ mod tests {
         let keystroke = keystroke("e", Some("e"), Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::TextInput
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::TextInput
         );
     }
@@ -248,11 +239,7 @@ mod tests {
         let keystroke = keystroke("left", None, Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::Browser
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::Browser
         );
     }
@@ -262,11 +249,7 @@ mod tests {
         let keystroke = keystroke("enter", Some("\r"), Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::Browser
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::Browser
         );
     }
@@ -276,11 +259,7 @@ mod tests {
         let keystroke = keystroke("c", Some("c"), Modifiers::command());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::App
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::App
         );
     }
@@ -297,11 +276,7 @@ mod tests {
         );
 
         assert_eq!(
-            key_down_dispatch(&keystroke, false, false),
-            BrowserKeyDispatch::Browser
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, false, false),
+            key_dispatch(&keystroke, false, false),
             BrowserKeyDispatch::Browser
         );
     }
@@ -318,11 +293,7 @@ mod tests {
         );
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::TextInput
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::TextInput
         );
     }
@@ -332,11 +303,7 @@ mod tests {
         let keystroke = keystroke("e", Some("e"), Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, true),
-            BrowserKeyDispatch::TextInput
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, true),
+            key_dispatch(&keystroke, true, true),
             BrowserKeyDispatch::TextInput
         );
     }
@@ -346,11 +313,7 @@ mod tests {
         let keystroke = keystroke("dead-acute", None, Modifiers::default());
 
         assert_eq!(
-            key_down_dispatch(&keystroke, true, false),
-            BrowserKeyDispatch::TextInput
-        );
-        assert_eq!(
-            key_up_dispatch(&keystroke, true, false),
+            key_dispatch(&keystroke, true, false),
             BrowserKeyDispatch::TextInput
         );
     }

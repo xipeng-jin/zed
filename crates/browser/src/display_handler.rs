@@ -104,9 +104,3 @@ wrap_display_handler! {
         }
     }
 }
-
-impl DisplayHandlerBuilder {
-    pub fn build(handler: OsrDisplayHandler) -> cef::DisplayHandler {
-        Self::new(handler)
-    }
-}

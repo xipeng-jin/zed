@@ -8,7 +8,7 @@
 //! through the same post-pump drain the real engine uses — script, then call
 //! [`crate::simulate_message_pump`].
 
-use crate::tab_backend::{PaintOutput, SoftwareFrame, TabBackend, TabBackendEvent};
+use crate::tab_backend::{FindOptions, PaintOutput, SoftwareFrame, TabBackend, TabBackendEvent};
 use anyhow::{Result, anyhow};
 use gpui::{Keystroke, Modifiers, MouseButton, Pixels, Point, ScrollDelta};
 use parking_lot::Mutex;
@@ -74,9 +74,7 @@ pub enum RecordedCommand {
     ImeCancelComposition,
     Find {
         query: String,
-        forward: bool,
-        match_case: bool,
-        find_next: bool,
+        options: FindOptions,
     },
     StopFinding {
         clear_selection: bool,
@@ -230,8 +228,18 @@ impl StubBackendFactory {
     }
 
     /// Controller for the `index`-th backend created, in creation order.
+    /// Panics with a diagnostic when no such backend exists — misuse of this
+    /// test-support seam is a test bug.
+    #[track_caller]
     pub fn controller(&self, index: usize) -> StubTabController {
-        self.controllers.lock()[index].clone()
+        let controllers = self.controllers.lock();
+        match controllers.get(index) {
+            Some(controller) => controller.clone(),
+            None => panic!(
+                "no stub backend #{index}: only {} backend(s) were created",
+                controllers.len()
+            ),
+        }
     }
 
     /// Number of backends created so far.
@@ -378,12 +386,10 @@ impl TabBackend for StubTabBackend {
         self.record(RecordedCommand::ImeCancelComposition);
     }
 
-    fn find(&mut self, query: &str, forward: bool, match_case: bool, find_next: bool) {
+    fn find(&mut self, query: &str, options: FindOptions) {
         self.record(RecordedCommand::Find {
             query: query.to_string(),
-            forward,
-            match_case,
-            find_next,
+            options,
         });
     }
 

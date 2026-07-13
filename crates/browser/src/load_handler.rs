@@ -62,9 +62,3 @@ wrap_load_handler! {
         }
     }
 }
-
-impl LoadHandlerBuilder {
-    pub fn build(handler: OsrLoadHandler) -> cef::LoadHandler {
-        Self::new(handler)
-    }
-}
