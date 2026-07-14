@@ -3,7 +3,7 @@
 //!
 //! Commands go in through [`TabBackend`] methods; engine state comes back out
 //! through the [`TabBackendEvent`] stream and the paint-output frame source.
-//! Two implementations exist: the real CEF backend (`CefTab` in `tab.rs`,
+//! Two implementations exist: the real CEF backend (`CefTab` in `cef_tab.rs`,
 //! behind the `cef` feature) and the scripted stub for deterministic tests
 //! (`stub_tab_backend.rs`).
 

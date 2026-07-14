@@ -1201,20 +1201,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             }
             OpenRequestKind::WebUrls { urls } => {
                 cx.spawn(async move |cx| {
-                    let workspace =
-                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
-                    // Update the workspace directly rather than dispatching an
-                    // action: on a cold launch the window has not rendered
-                    // yet, so an action dispatched at it has no dispatch tree
-                    // to land in.
-                    workspace.update(cx, |multi_workspace, window, cx| {
-                        multi_workspace
-                            .workspace()
-                            .clone()
-                            .update(cx, |workspace, cx| {
-                                browser::open_urls(workspace, urls, window, cx);
-                            })
-                    })
+                    browser::open_urls_in_regular_workspace(app_state, urls, cx.clone()).await
                 })
                 .detach_and_log_err(cx);
             }

@@ -210,8 +210,12 @@ toolbar/titlebar coupling (`ModeViewRegistry::set_titlebar_center_view` etc.).
 ### 3.5 Persistence
 
 Everything is JSON blobs in Zed's existing KV store (`db::kvp`), no SQL schema.
-Keys (`Glass:crates/browser/src/session.rs:7-11`): `browser_tabs`,
-`browser_pinned_tabs`, `browser_history`, `browser_bookmarks`, `browser_downloads`.
+Keys (`crates/browser/src/session.rs`): `browser_tabs`, `browser_history`,
+`browser_bookmarks`, `browser_downloads`. Deviation from Glass's key set
+(`Glass:crates/browser/src/session.rs:7-11`): Glass's separate
+`browser_pinned_tabs` key is not ported — pinned state already travels in
+`SerializedTab.is_pinned` inside the `browser_tabs` blob, and a second key
+would duplicate that source of truth.
 
 - `SerializedTab { url, title, is_new_tab_page, is_pinned, favicon_url }`;
   restore recreates tabs lazily (`Glass:crates/browser/src/browser_view/session.rs:10-48`).
@@ -362,7 +366,7 @@ None on Linux (self-fork via early-`main()` guard). The macOS helper
 | `crates/settings_content/src/settings_content.rs` (+ new `browser` content module) | Register the `browser` settings schema — upstream centralizes settings-content structs in this crate (see its `terminal` module) | M2 |
 | `crates/settings/src/vscode_import.rs` | One `browser: None` line — the file builds `SettingsContent` as an exhaustive struct literal, so any new settings section must appear here. *(Added during ticket #17, forced by the row above.)* | M2 |
 | `crates/zed/src/zed/app_menus.rs` | "Open Browser" (View) and "New Incognito Window" (File) menu entries *(second entry added during ticket #20)* | M2/M3 |
-| `crates/workspace/src/workspace.rs` | Add `Workspace::exclude_from_persistence()` — a 3-line additive method clearing `database_id`/`session_id` so incognito windows write no layout and are skipped by session restore. Needed because item serialization has no per-instance opt-out and empty-path workspaces *are* restored with the session (`last_session_workspace_locations`). *(Added during ticket #20.)* | M3 |
+| `crates/workspace/src/workspace.rs` | Add `Workspace::exclude_from_persistence()` — an additive method clearing `database_id`/`session_id` so incognito windows write no layout and are skipped by session restore. Needed because item serialization has no per-instance opt-out and empty-path workspaces *are* restored with the session (`last_session_workspace_locations`). *(Added during ticket #20.)* Extended with an `excluded_from_persistence` flag + `is_excluded_from_persistence()` getter so external-link routing can skip incognito windows. *(Added during ticket #24.)* | M3 |
 | `crates/zed/src/zed/open_listener.rs` | Parse `http://`/`https://` into a new accumulating `OpenRequestKind::WebUrls` (after the `parse_zed_link` arm, so zed.dev channel links keep winning) — URL handling is centralized in `OpenRequest::parse`, which both the running-instance CLI socket path and the cold-launch argv path funnel through, so default-browser routing (ticket #21) cannot live in the additive crate. Mirrors `Glass:crates/zed/src/zed/open_listener.rs:142` | M3 |
 | `crates/zed/resources/zed.desktop.in` | Add `x-scheme-handler/http;x-scheme-handler/https` to `MimeType` — the desktop-entry mechanism that makes the app selectable as default browser in the system default-apps setting (ticket #21) | M3 |
 | *(contingent)* `crates/gpui/src/key_dispatch.rs`, `window.rs` | `d14fb11` port, only if M2 IME evaluation demands it | M2 |
@@ -480,10 +484,15 @@ the popup mechanics and UA-spoof findings from ticket #15 stand.
    drops the call for null range pointers, so no preedit ever reached the page
    (confirmed by contrast with CDP `Input.imeSetComposition`, which drew the preedit).
    The port passes Chromium's invalid-range sentinel (`u32::MAX..u32::MAX`) for "no
-   replacement" and a caret-at-end default selection instead (`tab.rs`).
+   replacement" and a caret-at-end default selection instead (`cef_tab.rs`).
 8. Keymap (context `BrowserView`, shadowing set: `ctrl-t`, `ctrl-w`, `ctrl-shift-t`,
    `ctrl-l`, `ctrl-r`, `ctrl-f`, `ctrl-tab`/`ctrl-shift-tab`, `alt-left`/`alt-right`)
    + `browser` settings section (search engine, new-tab behavior, download dir).
+   The shipped settings elaborate slightly beyond "minimal": `search_engine`
+   also accepts a custom `{query}` URL template and `new_tab_behavior` a fixed
+   URL (PRD story 34's configurability, applied to both knobs). Dev-only
+   tooling that likewise post-dates this plan: `.claude/skills/verify` wraps
+   the nested-Xwayland harness below as a reusable agent skill.
 9. UA spoofing carried over (Google sign-in); re-verify it is still needed.
    *Re-verified (2026-07-11, ticket #15):* with the spoofed UA, Google's
    sign-in form renders with no "browser not secure" interstitial, both on
@@ -541,20 +550,23 @@ Gate: soft — items are independent.
   Web links route through the existing open-url path: `OpenRequest::parse`
   turns http/https into an accumulating `WebUrls` kind (ordered after
   `parse_zed_link`, so zed.dev channel links keep winning) and
-  `handle_open_request` updates the active-or-new workspace directly with
-  `browser::open_urls` — a direct entity update, not an action dispatch,
-  because a cold-launched window may not have rendered a dispatch tree yet.
+  `handle_open_request` hands them to
+  `browser::open_urls_in_regular_workspace` — a direct entity update, not an
+  action dispatch, because a cold-launched window may not have rendered a
+  dispatch tree yet.
   `xdg-open` against a running instance appended and activated the tab in the
   workspace's browser view (no second instance: the CLI socket path needs a
   non-dev release channel, `ZED_RELEASE_CHANNEL=stable` in validation); with
   the app closed, `xdg-open` launched it via the CLI and the link landed as
   the active tab beside the lazily-restored session tabs; clean ctrl-q with
   complete CEF shutdown afterwards in both runs. macOS registration stays
-  deferred to a macOS session (§8). Residual (ticketed as #24):
-  `get_any_active_multi_workspace` routes by active window, so an external
-  link arriving while an incognito window (#20) is focused opens in that
-  window's incognito browser view; most browsers instead route external
-  links to a regular window, creating one if needed.
+  deferred to a macOS session (§8). *Residual #24 resolved (2026-07-13):*
+  external links no longer follow the active window blindly —
+  `browser::open_urls_in_regular_workspace` skips windows whose workspace is
+  excluded from persistence (`Workspace::is_excluded_from_persistence`, §6.3),
+  so a link arriving while an incognito window (#20) is focused lands in an
+  existing regular window, or a freshly created one when only incognito
+  windows are open — matching how mainstream browsers route external links.
 - Windows: explicitly unscheduled; keep `FramePresenter` and keycode layers
   Windows-shaped (Glass's `stage-windows-cef-runtime.ps1` is the reference when the
   time comes).

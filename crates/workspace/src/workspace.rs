@@ -1406,6 +1406,7 @@ pub struct Workspace {
     serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
     _items_serializer: Task<Result<()>>,
     session_id: Option<String>,
+    excluded_from_persistence: bool,
     scheduled_tasks: Vec<Task<()>>,
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
@@ -1859,6 +1860,7 @@ impl Workspace {
             serializable_items_tx,
             _items_serializer,
             session_id: Some(session_id),
+            excluded_from_persistence: false,
 
             scheduled_tasks: Vec::new(),
             last_open_dock_positions: Vec::new(),
@@ -6892,8 +6894,16 @@ impl Workspace {
     /// reopen on relaunch. Used by windows whose contents must leave no trace,
     /// e.g. incognito browser windows.
     pub fn exclude_from_persistence(&mut self) {
+        self.excluded_from_persistence = true;
         self.database_id = None;
         self.session_id = None;
+    }
+
+    /// Whether [`Self::exclude_from_persistence`] detached this workspace.
+    /// Content arriving from outside the app (e.g. web links handed over by
+    /// the OS) must not be routed into such a workspace's window.
+    pub fn is_excluded_from_persistence(&self) -> bool {
+        self.excluded_from_persistence
     }
 
     #[cfg(any(test, feature = "test-support"))]

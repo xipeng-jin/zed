@@ -30,6 +30,8 @@ mod text_input;
 #[cfg(feature = "cef")]
 mod cef_instance;
 #[cfg(feature = "cef")]
+mod cef_tab;
+#[cfg(feature = "cef")]
 mod client;
 #[cfg(feature = "cef")]
 mod context_menu_handler;
@@ -53,8 +55,6 @@ mod permission_handler;
 mod render_handler;
 #[cfg(feature = "cef")]
 mod request_handler;
-#[cfg(feature = "cef")]
-mod tab;
 
 #[cfg(all(
     feature = "cef",
@@ -127,7 +127,7 @@ pub fn init(_cx: &mut App) {}
 /// the view if needed and activating the last tab. The app's open-url path
 /// calls this with web links handed over by the OS, e.g. when the app is
 /// registered as the default browser (ticket #21).
-#[cfg(feature = "cef")]
+#[cfg(any(feature = "cef", test))]
 pub fn open_urls(
     workspace: &mut workspace::Workspace,
     urls: Vec<String>,
@@ -137,7 +137,7 @@ pub fn open_urls(
     BrowserView::open_urls(workspace, urls, window, cx);
 }
 
-#[cfg(not(feature = "cef"))]
+#[cfg(not(any(feature = "cef", test)))]
 pub fn open_urls(
     _workspace: &mut workspace::Workspace,
     urls: Vec<String>,
@@ -145,6 +145,78 @@ pub fn open_urls(
     _cx: &mut gpui::Context<workspace::Workspace>,
 ) {
     log::error!("[browser] built without an engine; cannot open {urls:?}");
+}
+
+/// Opens external web links (handed over by the OS, ticket #21) in a regular
+/// window: the active workspace window unless its contents leave no trace
+/// (an incognito window, ticket #24) — external links must not leak into an
+/// incognito session — otherwise any other regular window, otherwise a newly
+/// created one. The workspace is updated directly rather than via a dispatched
+/// action: on a cold launch the window has not rendered yet, so an action
+/// dispatched at it has no dispatch tree to land in.
+pub async fn open_urls_in_regular_workspace(
+    app_state: std::sync::Arc<workspace::AppState>,
+    urls: Vec<String>,
+    mut cx: gpui::AsyncApp,
+) -> anyhow::Result<()> {
+    let window = match regular_workspace_window(&mut cx) {
+        Some(window) => window,
+        None => {
+            cx.update(|cx| {
+                workspace::Workspace::new_local(
+                    Vec::new(),
+                    app_state,
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await?
+            .window
+        }
+    };
+    window.update(&mut cx, |multi_workspace, window, cx| {
+        window.activate_window();
+        multi_workspace
+            .workspace()
+            .clone()
+            .update(cx, |workspace, cx| {
+                open_urls(workspace, urls, window, cx);
+            })
+    })
+}
+
+/// The workspace window external links may land in: the active window if its
+/// workspace participates in persistence, otherwise any other window whose
+/// workspace does. `None` when every open workspace window is a leave-no-trace
+/// (incognito) one, or none are open.
+fn regular_workspace_window(
+    cx: &mut gpui::AsyncApp,
+) -> Option<gpui::WindowHandle<workspace::MultiWorkspace>> {
+    cx.update(|cx| {
+        let is_regular = |window: &gpui::WindowHandle<workspace::MultiWorkspace>,
+                          cx: &gpui::App| {
+            window.read(cx).is_ok_and(|multi_workspace| {
+                !multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .is_excluded_from_persistence()
+            })
+        };
+        if let Some(window) = cx
+            .active_window()
+            .and_then(|window| window.downcast::<workspace::MultiWorkspace>())
+            && is_regular(&window, cx)
+        {
+            return Some(window);
+        }
+        cx.windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<workspace::MultiWorkspace>())
+            .find(|window| is_regular(window, cx))
+    })
 }
 
 /// Callbacks run on the foreground thread after every message-pump iteration,
@@ -211,15 +283,15 @@ fn start_message_pump(cx: &mut App) {
                 cx.update(run_pump_observers);
             }
 
-            let wait_us = CefInstance::time_until_next_pump_us();
-            let cap_us = if tab::has_live_browsers() {
+            let wait_micros = CefInstance::time_until_next_pump_us();
+            let cap_micros = if cef_tab::has_live_browsers() {
                 1_000
             } else {
                 33_000
             };
-            let sleep_us = wait_us.clamp(500, cap_us);
+            let sleep_micros = wait_micros.clamp(500, cap_micros);
             cx.background_executor()
-                .timer(Duration::from_micros(sleep_us))
+                .timer(Duration::from_micros(sleep_micros))
                 .await;
         }
     })

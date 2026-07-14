@@ -178,13 +178,13 @@ wrap_life_span_handler! {
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             if let Some(browser) = browser {
-                crate::tab::register_browser(browser);
+                crate::cef_tab::register_browser(browser);
             }
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             if let Some(browser) = browser {
-                crate::tab::unregister_browser(browser);
+                crate::cef_tab::unregister_browser(browser);
             }
         }
 

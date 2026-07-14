@@ -521,7 +521,7 @@ impl CefInstance {
         // remain, and GPUI's entity lifecycle doesn't guarantee entities drop
         // before quit futures run. Pump a few times afterwards so CEF
         // processes the closes (Glass:crates/browser/src/cef_instance.rs:492).
-        let closed = crate::tab::close_all_browsers();
+        let closed = crate::cef_tab::close_all_browsers();
         if closed > 0 {
             for _ in 0..10 {
                 cef::do_message_loop_work();

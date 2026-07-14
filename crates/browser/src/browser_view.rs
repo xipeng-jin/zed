@@ -180,7 +180,7 @@ struct BrowserContextMenu {
 
 #[cfg(feature = "cef")]
 pub fn init(cx: &mut App) {
-    cx.set_global(crate::tab::backend_factory());
+    cx.set_global(crate::cef_tab::backend_factory());
     workspace::register_serializable_item::<BrowserView>(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenBrowser, window, cx| {
@@ -455,7 +455,7 @@ impl BrowserView {
     }
 
     /// The engine-backed entry point behind [`crate::open_urls`].
-    #[cfg(feature = "cef")]
+    #[cfg(any(feature = "cef", test))]
     pub fn open_urls(
         workspace: &mut Workspace,
         urls: Vec<String>,
@@ -4582,6 +4582,164 @@ mod tests {
                 .next()
                 .expect("the incognito window opens with a browser view");
             assert!(view.read(cx).is_incognito);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_urls_skip_a_focused_incognito_window(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        cx.update(|cx| {
+            let factory = factory.clone();
+            cx.set_global(TabBackendFactory::new(move || factory.create_backend()));
+        });
+
+        let regular = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    Vec::new(),
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let incognito_workspace = regular
+            .workspace
+            .update(cx, |workspace, cx| {
+                BrowserView::open_incognito_window(workspace, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let active_is_incognito = cx.update(|cx| {
+            let active = cx
+                .active_window()
+                .and_then(|window| window.downcast::<workspace::MultiWorkspace>())
+                .expect("the incognito window is a workspace window");
+            active
+                .read(cx)
+                .unwrap()
+                .workspace()
+                .read(cx)
+                .is_excluded_from_persistence()
+        });
+        assert!(
+            active_is_incognito,
+            "precondition: the incognito window is the focused one"
+        );
+
+        crate::open_urls_in_regular_workspace(
+            app_state.clone(),
+            vec!["https://external.example".to_string()],
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        incognito_workspace.update(cx, |workspace, cx| {
+            let view = workspace
+                .items_of_type::<BrowserView>(cx)
+                .next()
+                .expect("the incognito window keeps its browser view");
+            assert!(
+                view.read(cx)
+                    .tabs
+                    .iter()
+                    .all(|tab| tab.url() != "https://external.example"),
+                "an external link never lands in an incognito window"
+            );
+        });
+        regular.workspace.update(cx, |workspace, cx| {
+            let view = workspace
+                .items_of_type::<BrowserView>(cx)
+                .next()
+                .expect("the external link opens a browser view in the regular window");
+            assert_eq!(view.read(cx).url(), "https://external.example");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_urls_open_a_new_window_when_only_incognito_windows_exist(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let factory = StubBackendFactory::new(true);
+        cx.update(|cx| {
+            let factory = factory.clone();
+            cx.set_global(TabBackendFactory::new(move || factory.create_backend()));
+        });
+
+        // The hosting window's root is a bare `Workspace`, not a
+        // `MultiWorkspace`, so the only workspace *window* is the incognito
+        // one opened below.
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (host_workspace, host_cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let incognito_workspace = host_workspace
+            .update(host_cx, |workspace, cx| {
+                BrowserView::open_incognito_window(workspace, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        crate::open_urls_in_regular_workspace(
+            app_state.clone(),
+            vec!["https://external.example".to_string()],
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        incognito_workspace.update(cx, |workspace, cx| {
+            let view = workspace
+                .items_of_type::<BrowserView>(cx)
+                .next()
+                .expect("the incognito window keeps its browser view");
+            assert!(
+                view.read(cx)
+                    .tabs
+                    .iter()
+                    .all(|tab| tab.url() != "https://external.example"),
+                "an external link never lands in an incognito window"
+            );
+        });
+        cx.update(|cx| {
+            let regular_windows: Vec<_> = cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<workspace::MultiWorkspace>())
+                .filter(|window| {
+                    window.read(cx).is_ok_and(|multi_workspace| {
+                        !multi_workspace
+                            .workspace()
+                            .read(cx)
+                            .is_excluded_from_persistence()
+                    })
+                })
+                .collect();
+            assert_eq!(
+                regular_windows.len(),
+                1,
+                "a fresh regular window opens to host the external link"
+            );
+            let workspace = regular_windows[0].read(cx).unwrap().workspace().clone();
+            let view = workspace
+                .read(cx)
+                .items_of_type::<BrowserView>(cx)
+                .next()
+                .expect("the fresh window holds a browser view with the link");
+            assert_eq!(view.read(cx).url(), "https://external.example");
         });
     }
 
