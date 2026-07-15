@@ -26,6 +26,8 @@ anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
+# THROWAWAY SPIKE dependency (wayfinder ticket xipeng-jin/zed#34).
+ghostty_vt.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 libc.workspace = true

@@ -18446,6 +18446,7 @@ dependencies = [
  "collections",
  "futures 0.3.32",
  "futures-lite 1.13.0",
+ "ghostty_vt",
  "gpui",
  "itertools 0.14.0",
  "libc",

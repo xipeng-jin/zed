@@ -1,6 +1,9 @@
 mod mappings;
 
 mod alacritty;
+// THROWAWAY SPIKE (wayfinder ticket xipeng-jin/zed#34) — env-gated via
+// ZED_GHOSTTY_SPIKE=1. Linux-only; this branch does not build on Windows.
+mod ghostty_spike;
 mod pty_info;
 pub mod terminal_settings;
 
@@ -12,7 +15,7 @@ use log::trace;
 
 use futures::{
     FutureExt,
-    channel::mpsc::{UnboundedReceiver, unbounded},
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
 
 use itertools::Itertools as _;
@@ -914,6 +917,13 @@ fn init_command_startup_marker_command(shell_kind: ShellKind, marker_id: u64) ->
 pub struct TerminalBuilder {
     terminal: Terminal,
     events_rx: UnboundedReceiver<PtyEvent>,
+    // THROWAWAY SPIKE: byte + command channels handed to the foreground
+    // ghostty driver task in `subscribe` (the !Send ghostty terminal cannot
+    // be created here — `new` runs on a background thread).
+    ghostty_spike_channels: Option<(
+        UnboundedReceiver<ghostty_spike::SpikeMsg>,
+        UnboundedReceiver<ghostty_spike::SpikeCmd>,
+    )>,
 }
 
 impl TerminalBuilder {
@@ -1013,6 +1023,7 @@ impl TerminalBuilder {
         TerminalBuilder {
             terminal,
             events_rx,
+            ghostty_spike_channels: None,
         }
     }
 
@@ -1145,6 +1156,8 @@ impl TerminalBuilder {
                 alternate_scroll,
             );
 
+            let mut ghostty_spike_channels = None;
+
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
             // PTY path would feed.
@@ -1177,6 +1190,33 @@ impl TerminalBuilder {
                     }
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
+            } else if ghostty_spike::enabled() {
+                // THROWAWAY SPIKE: ghostty-vt-backed terminal path.
+                let spike_shell = shell_params.as_ref().map(|params| {
+                    (
+                        params.program.clone(),
+                        params.args.clone().unwrap_or_default(),
+                    )
+                });
+                let (pty, msg_rx) = match ghostty_spike::SpikePty::spawn(
+                    spike_shell,
+                    &env,
+                    working_directory.as_deref(),
+                ) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        bail!(TerminalError {
+                            directory: working_directory,
+                            program: shell_params.as_ref().map(|params| params.program.clone()),
+                            args: shell_params.as_ref().and_then(|params| params.args.clone()),
+                            title_override: terminal_title_override,
+                            source: std::io::Error::other(format!("{error:#}")),
+                        });
+                    }
+                };
+                let (cmd_tx, cmd_rx) = unbounded();
+                ghostty_spike_channels = Some((msg_rx, cmd_rx));
+                (TerminalType::GhosttySpike { pty, cmd_tx }, None)
             } else {
                 let alacritty_shell = shell_params.as_ref().map(|params| {
                     (
@@ -1307,12 +1347,25 @@ impl TerminalBuilder {
             Ok(TerminalBuilder {
                 terminal,
                 events_rx,
+                ghostty_spike_channels,
             })
         };
         cx.background_spawn(fut)
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
+        // THROWAWAY SPIKE: the ghostty driver task replaces the alacritty
+        // event loop pump. It must be spawned here (foreground) because the
+        // ghostty terminal is !Send.
+        if let Some((msg_rx, cmd_rx)) = self.ghostty_spike_channels.take() {
+            let TerminalType::GhosttySpike { pty, .. } = &self.terminal.terminal_type else {
+                unreachable!("spike channels always come with a spike terminal type");
+            };
+            self.terminal.event_loop_task =
+                ghostty_spike::spawn_driver(pty.clone(), msg_rx, cmd_rx, cx);
+            return self.terminal;
+        }
+
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
@@ -1400,6 +1453,10 @@ enum TerminalType {
     Pty {
         pty_tx: PtySender,
         info: Arc<PtyProcessInfo>,
+    },
+    GhosttySpike {
+        pty: ghostty_spike::SpikePty,
+        cmd_tx: UnboundedSender<ghostty_spike::SpikeCmd>,
     },
     DisplayOnly,
 }
@@ -1608,8 +1665,18 @@ impl Terminal {
 
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
-                    pty_tx.resize(new_bounds);
+                match &self.terminal_type {
+                    TerminalType::Pty { pty_tx, .. } => pty_tx.resize(new_bounds),
+                    TerminalType::GhosttySpike { pty, cmd_tx } => {
+                        pty.resize(new_bounds);
+                        if cmd_tx
+                            .unbounded_send(ghostty_spike::SpikeCmd::Resize(new_bounds))
+                            .is_err()
+                        {
+                            log::error!("ghostty spike: driver task gone, dropping resize");
+                        }
+                    }
+                    TerminalType::DisplayOnly => {}
                 }
 
                 resize(term, new_bounds);
@@ -1627,6 +1694,15 @@ impl Terminal {
             }
             InternalEvent::Scroll(scroll) => {
                 trace!("Scrolling: scroll={scroll:?}");
+                if let TerminalType::GhosttySpike { cmd_tx, .. } = &self.terminal_type {
+                    if cmd_tx
+                        .unbounded_send(ghostty_spike::SpikeCmd::Scroll(*scroll))
+                        .is_err()
+                    {
+                        log::error!("ghostty spike: driver task gone, dropping scroll");
+                    }
+                    return;
+                }
                 scroll_display(term, *scroll);
                 self.refresh_hovered_word(window);
 
@@ -1975,15 +2051,19 @@ impl Terminal {
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.pty_write_log.borrow_mut().push(input.to_vec());
-        if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
-            if log::log_enabled!(log::Level::Debug) {
-                if let Ok(str) = str::from_utf8(&input) {
-                    log::debug!("Writing to PTY: {:?}", str);
-                } else {
-                    log::debug!("Writing to PTY: {:?}", input);
+        match &self.terminal_type {
+            TerminalType::Pty { pty_tx, .. } => {
+                if log::log_enabled!(log::Level::Debug) {
+                    if let Ok(str) = str::from_utf8(&input) {
+                        log::debug!("Writing to PTY: {:?}", str);
+                    } else {
+                        log::debug!("Writing to PTY: {:?}", input);
+                    }
                 }
+                pty_tx.notify(input);
             }
-            pty_tx.notify(input);
+            TerminalType::GhosttySpike { pty, .. } => pty.write(&input),
+            TerminalType::DisplayOnly => {}
         }
     }
 
@@ -2265,6 +2345,24 @@ impl Terminal {
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
             self.process_terminal_event(&e, &mut terminal, window, cx)
+        }
+
+        // THROWAWAY SPIKE: content snapshots are owned by the ghostty driver
+        // task; the alacritty term is an idle shell whose (empty) content
+        // must not clobber them.
+        if matches!(self.terminal_type, TerminalType::GhosttySpike { .. }) {
+            return;
+        }
+
+        if ghostty_spike::perf_logging_enabled() {
+            let started = std::time::Instant::now();
+            self.last_content = make_content(&terminal, &self.last_content);
+            log::info!(
+                "alacritty perf: make_content took {:?} for {} cells",
+                started.elapsed(),
+                self.last_content.cells.len()
+            );
+            return;
         }
 
         self.last_content = make_content(&terminal, &self.last_content);
@@ -2707,7 +2805,7 @@ impl Terminal {
                 .read()
                 .as_ref()
                 .and_then(|process| foreground_process_command_from_argv(&process.argv)),
-            TerminalType::DisplayOnly => None,
+            TerminalType::GhosttySpike { .. } | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -2724,7 +2822,7 @@ impl Terminal {
                 .read()
                 .as_ref()
                 .map(|process| process.cwd.clone()),
-            TerminalType::DisplayOnly => None,
+            TerminalType::GhosttySpike { .. } | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -2775,6 +2873,7 @@ impl Terminal {
                             format!("{process_file} — {process_name}")
                         })
                         .unwrap_or_else(|| "Terminal".to_string()),
+                    TerminalType::GhosttySpike { .. } => "Terminal (ghostty spike)".to_string(),
                     TerminalType::DisplayOnly => "Terminal".to_string(),
                 }),
         }
@@ -2792,6 +2891,7 @@ impl Terminal {
                     // and wait_for_completed_task can complete
                     info.kill_child_process();
                 }
+                TerminalType::GhosttySpike { pty, .. } => pty.kill(),
                 TerminalType::DisplayOnly => {
                     // Non-PTY task terminals own their subprocess directly.
                     if let Some(subprocess) = &self.subprocess {
@@ -2805,14 +2905,14 @@ impl Terminal {
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),
-            TerminalType::DisplayOnly => None,
+            TerminalType::GhosttySpike { .. } | TerminalType::DisplayOnly => None,
         }
     }
 
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => Some(info.pid_getter()),
-            TerminalType::DisplayOnly => None,
+            TerminalType::GhosttySpike { .. } | TerminalType::DisplayOnly => None,
         }
     }
 
@@ -3113,19 +3213,21 @@ impl Drop for Terminal {
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
-        if let TerminalType::Pty { pty_tx, info } =
-            std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
-        {
-            pty_tx.shutdown();
-            info.terminate_child_process();
+        match std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly) {
+            TerminalType::Pty { pty_tx, info } => {
+                pty_tx.shutdown();
+                info.terminate_child_process();
 
-            let timer = self.background_executor.timer(Duration::from_millis(100));
-            self.background_executor
-                .spawn(async move {
-                    timer.await;
-                    info.kill_child_process();
-                })
-                .detach();
+                let timer = self.background_executor.timer(Duration::from_millis(100));
+                self.background_executor
+                    .spawn(async move {
+                        timer.await;
+                        info.kill_child_process();
+                    })
+                    .detach();
+            }
+            TerminalType::GhosttySpike { pty, .. } => pty.kill(),
+            TerminalType::DisplayOnly => {}
         }
     }
 }
@@ -4714,6 +4816,7 @@ mod tests {
                 info.pid_getter().fallback_pid(),
                 info.current.read().is_some()
             ),
+            TerminalType::GhosttySpike { .. } => "ghostty-spike".to_string(),
             TerminalType::DisplayOnly => "display-only".to_string(),
         });
         panic!(
