@@ -195,7 +195,7 @@ Scored against: (1) plain `cargo build` for contributors, (2) CI, (3) offline/ni
 1. `GHOSTTY_VT_LIB_DIR` set → link `<dir>/libghostty-vt.a` directly. No network, no zig, no git. (nix, distros, air-gapped builds, "I built it myself".)
 2. `GHOSTTY_SOURCE_DIR` set → source build: invoke zig against that checkout (dev loop on ghostty; pin is *not* enforced, a `cargo:warning` notes the checkout is unpinned).
 3. `GHOSTTY_VT_FROM_SOURCE=1` → source build at the pin: git-fetch ghostty at `GHOSTTY_COMMIT` into `OUT_DIR` (blobless clone + stamp, as today), then zig. (Escape hatch when prebuilt is missing for an exotic target; also what the publishing workflow runs.)
-4. Default → **prebuilt fetch**: download `libghostty-vt-<GHOSTTY_COMMIT[0..12]>-<target-triple>.tar.zst` from `https://github.com/zed-industries/libghostty-vt-prebuilt/releases/download/ghostty-<commit>/…` (final URL scheme owned by the artifact-pipeline ticket) into `$OUT_DIR/`, verify sha256 against the in-tree pin manifest, unpack, link.
+4. Default → **prebuilt fetch**: download `libghostty-vt-<GHOSTTY_COMMIT[0..10]>-<target-triple>.tar.gz` from `https://github.com/{prebuilt_repo}/releases/download/ghostty-<commit[0..10]>/…` (`prebuilt_repo` read from `ghostty_pin.toml`; scheme decided in [artifact-pipeline.md](artifact-pipeline.md)) into `$OUT_DIR/`, verify sha256 against the in-tree pin manifest, unpack, link.
 
 We do **not** carry libghostty-rs's `pkg-config` feature (a system libghostty of arbitrary API revision contradicts the pin; build.rs itself documents the API as pre-1.0) or `link-dynamic` (static only). Drop both to shrink the matrix. `DOCS_RS` short-circuit is kept.
 
@@ -211,7 +211,7 @@ We do **not** carry libghostty-rs's `pkg-config` feature (a system libghostty of
 
 All of the above get `cargo:rerun-if-env-changed`. Additionally `rerun-if-changed=build.rs` (fixing the broken relative path, §3.1) and `rerun-if-changed=ghostty_pin.toml`. `TARGET`/`HOST`/`DEBUG`/`OPT_LEVEL` rerun-triggers are kept as today.
 
-Profile mapping for source builds: unchanged from libghostty-rs (dev → `Debug`, `s|z` → `ReleaseSmall`, else `ReleaseFast`). The prebuilt artifact is **ReleaseFast regardless of cargo profile** — dev builds link the optimized archive (41 MB Debug vs 15 MB ReleaseFast; debugging inside ghostty is exactly the case where you set `GHOSTTY_SOURCE_DIR` anyway).
+Profile mapping: **all paths default to ReleaseFast regardless of cargo profile** — prebuilts are published ReleaseFast-only, and source builds drop libghostty-rs's `DEBUG=true → Debug` mapping because the spike measured zig-Debug cores degrading `vt_write` ~3000× with non-empty scrollback (spike-findings.md), so a plain dev build must never silently link a Debug core. `LIBGHOSTTY_VT_SYS_OPTIMIZE` remains the explicit override for source paths (debugging inside ghostty is exactly the case where you set `GHOSTTY_SOURCE_DIR` anyway).
 
 ### 6.3 Toolchain requirement and version check
 
@@ -255,6 +255,7 @@ Every failure panics the build script (cargo convention) with a message that nam
   # Single source of truth for the ghostty native pin.
   commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"
   release = "ghostty-a887df42c5"   # tag in the prebuilt-artifacts repo
+  prebuilt_repo = "xipeng-jin/libghostty-vt-prebuilt"   # owner/name; upstream handoff = repo transfer + this line
 
   [sha256]
   x86_64-unknown-linux-gnu = "…"
@@ -274,9 +275,9 @@ Every failure panics the build script (cargo convention) with a message that nam
 
 ## 8. Open questions → other tickets
 
-1. **Artifact pipeline ownership** (new ticket): where the publishing workflow lives (`zed-industries/libghostty-vt-prebuilt` repo vs in-tree workflow publishing to a release tag), runner matrix, retention, and whether to add artifact attestation/minisign on top of sha256 pins. Ghostty is MIT (`ghostty/LICENSE:1–3`); the release must ship the license text and the artifacts must flow into `script/generate-licenses`.
-2. **Vendoring ticket interface:** crate name/path; how `bindings.rs` regeneration is wired (keep libghostty-rs's `bindgen-tool` feature vs a `script/`); the header-hash stamp from §7.
-3. **Nix derivation:** import/adapt ghostty's `nix/libghostty-vt.nix` (with its `build.zig.zon.nix` package store) into `zed/nix/` and wire `GHOSTTY_VT_LIB_DIR` in `nix/build.nix`, mirroring `LK_CUSTOM_WEBRTC` (`zed/nix/build.nix:234`).
-4. **`-Dsimd=false` variant:** do we also publish a no-SIMD artifact (zero non-libc deps, lower perf) for exotic targets, or is musl+bundled SIMD sufficient? Needs a perf datapoint from the migration benchmarks.
+1. **Artifact pipeline ownership** — **resolved**, decision record: [artifact-pipeline.md](artifact-pipeline.md) (dedicated prebuilt repo, append-only releases, single-runner direct-zig workflow, GitHub artifact attestation, `generate-licenses` static section).
+2. **Vendoring ticket interface** — **resolved** by the vendoring ticket: `crates/ghostty_vt_sys` + `crates/ghostty_vt`, `bindgen-tool` feature kept (`gen-bindings` bin restamps `headers_sha256`).
+3. **Nix derivation** — **resolved**, and the sketch here was walked back: nix consumes the prebuilt via a fixed-output `fetchurl` derivation wired as `GHOSTTY_VT_LIB_DIR`, not an in-tree source derivation ([artifact-pipeline.md §6](artifact-pipeline.md)).
+4. **`-Dsimd=false` variant** — **resolved: no** ([artifact-pipeline.md §7](artifact-pipeline.md)).
 5. **Windows specifics** (deferred to the Windows gate): msvc vs gnullvm target choice, `ghostty-vt-static.lib` naming, ubsan-rt exclusion behavior (§3.2) when linking with MSVC.
-6. **Debug-symbols story:** whether the artifact release should also carry a `Debug` archive (41 MB) for opt-in via an env var, or whether `GHOSTTY_SOURCE_DIR` is deemed sufficient (current position: sufficient).
+6. **Debug-symbols story** — **resolved: no Debug artifact**; `GHOSTTY_SOURCE_DIR` is the debugging story, and source builds now default to ReleaseFast (§6.2, [artifact-pipeline.md §7](artifact-pipeline.md)).
