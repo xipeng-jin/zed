@@ -157,5 +157,71 @@ checklist in the removal-phase PR description:
 8. **Two-week Linux soak**: ghostty backend as the daily-driver terminal on real work
    (including agent-tool and debugger sessions) with zero unresolved P0/P1 terminal issues
    filed in the window. Alacritty remains in-tree as the rollback path during the soak.
-9. **macOS and Windows gates satisfied**, as defined by ticket #40 (deferred per the
-   Linux-first decision).
+9. **macOS and Windows gates satisfied** (§9). Per the Linux-first decision these complete
+   after the Linux subsystem swaps but before removal executes; the macOS and Linux soak
+   windows may run concurrently, and the Windows gates may complete any time during them.
+
+## 9. Platform gates (macOS, Windows)
+
+Decision record for [ticket #40](https://github.com/xipeng-jin/zed/issues/40). The bar is
+asymmetric by decision: **macOS runs the full Linux-grade program on real macOS hardware;
+Windows runs a reduced bar scoped to the PTY layer**, where all Windows-specific risk lives
+(the vt core is platform-independent and the Linux differential corpus vouches for it).
+
+### 9.1 macOS gate — full program
+
+Every §8 criterion 1–8 re-run on a dedicated macOS machine, with these platform bindings:
+
+- **Perf baseline is macOS-local**: the alacritty baseline (§6) is re-recorded on the same
+  macOS machine before comparison; the 20%/no-cliff bar is unchanged. The §6 suite gains a
+  **sustained-flood scenario** (`yes`/`cat` of a large file, measuring total throughput and
+  input-echo latency during the flood) targeting the macOS ~1 KiB master-read cap; it also
+  runs on Linux, where it doubles as the channel/batch-tuning validation from the
+  architecture note's open question 6. Remediation for a failure is the reserved tuning
+  path (channel capacity, batch cap, dedicated-terminal-thread escape hatch), not redesign.
+- **`/usr/bin/login` wrapper, ghostty behavior**: portable-pty does not wrap the shell in
+  `login` (alacritty_terminal does today for `Shell::System`), so Zed's macOS spawn layer
+  owns the wrapper — ported from **ghostty's** exec-layer behavior, not alacritty's, as a
+  deliberate upstream-alignment decision. This is a user-visible divergence from
+  alacritty-today and gets a divergence-ledger entry (§3.4). Verified two ways: a unit test
+  asserting the constructed argv against fixtures captured from ghostty's invocation, and
+  three manual smoke items on the macOS machine — `[[ -o login ]]` reports a login shell,
+  `PATH` reflects `path_helper` ordering (`/etc/zprofile` ran), and the session appears in
+  `who` (utmpx record written).
+- **Session-based soak**: two-week window on the macOS machine, ≥3 logged real development
+  sessions per week (builds, agent-tool runs, debugger use, long build floods), zero
+  unresolved P0/P1 terminal issues at exit, alacritty in-tree as rollback throughout. May
+  run concurrently with the Linux soak.
+
+### 9.2 Windows gate — reduced bar
+
+1. **Windows CI suites green** on the existing `self-32vcpu-windows-2022` runner, including
+   the Class A/B dispositions of §4.
+2. **ConPTY PTY integration suite** (extends §5's PTY seam tests; runs on the Windows CI
+   runner) covering the two §7 hazards from the architecture note — ConPTY delivers EOF only
+   after the pseudoconsole is dropped, and child-exit observation must not depend on
+   reader-EOF ordering:
+   - *Shutdown*: spawn `cmd.exe` through the seam, close the terminal; assert the child
+     terminated, the reader thread joined within a timeout (no EOF-wait hang), and no
+     orphaned `OpenConsole.exe`/conhost processes remain.
+   - *Exit observation*: spawn a command exiting with a known code; assert the exit is
+     observed with the right code while the master is still open. Mechanism decision:
+     **`try_wait` polling on the existing `pty_info` cadence** (no new thread, matches the
+     current alacritty `child_watcher` approach); `WaitForSingleObject` on
+     `as_raw_handle()` is the documented fallback if polling latency ever bites.
+   - *Kill path*: kill a long-running child; assert termination and reader-thread join.
+3. **`ChildKiller::kill()` fix sourced by git pin**: portable-pty is pinned as a git
+   dependency to the wezterm-repo rev containing wezterm#7709 (merged 2026-06-07, absent
+   from the 0.9.0 crates.io release), matching the existing `alacritty_terminal` git-pin
+   precedent. Returning to a crates.io release once one ships is a post-removal follow-up,
+   not a gate.
+4. **Manual smoke checklist on real Windows hardware**: open the terminal in PowerShell and
+   `cmd`, run a task, resize, paste multi-line text, kill a hung process, close the terminal
+   while a child is running.
+
+### 9.3 Blocking classification
+
+All §9.1 and §9.2 items **block the removal phase**. Explicitly riding after removal:
+migrating portable-pty from the git pin back to a crates.io release, and any channel/batch
+tuning beyond the perf bar (including activating the dedicated-terminal-thread escape
+hatch), which happens only if a real regression appears.
