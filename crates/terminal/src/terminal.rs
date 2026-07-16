@@ -61,15 +61,8 @@ use gpui::{
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
-    AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
-    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
+    AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, HyperlinkMatch,
+    PtySender, RegexSearches, StreamIngest, TerminalBackend, open_pty, pty_options,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -950,19 +943,22 @@ impl TerminalBuilder {
         let scrolling_history = max_scroll_history_lines
             .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
             .min(MAX_SCROLL_HISTORY_LINES);
-        let config = display_only_term_config(scrolling_history, cursor_shape);
 
         let (events_tx, events_rx) = unbounded();
-        let term = new_term(&config, terminal_bounds, events_tx, alternate_scroll);
+        let backend = TerminalBackend::new_display_only(
+            scrolling_history,
+            cursor_shape,
+            terminal_bounds,
+            events_tx,
+            alternate_scroll,
+        );
 
         let terminal = Terminal {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
             completion_tx: None,
-            term,
-            term_config: config,
-            output_processor: Processor::<StdSyncHandler>::new(),
+            backend,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1132,14 +1128,13 @@ impl TerminalBuilder {
                     .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
                     .min(MAX_SCROLL_HISTORY_LINES)
             };
-            let config = pty_term_config(scrolling_history, cursor_shape);
-
             //Spawn a task so the Alacritty EventLoop (or the subprocess reader) can communicate with us
             //TODO: Remove with a bounded sender which can be dispatched on &self
             let (events_tx, events_rx) = unbounded();
             //Set up the terminal...
-            let term = new_term(
-                &config,
+            let backend = TerminalBackend::new(
+                scrolling_history,
+                cursor_shape,
                 TerminalBounds::default(),
                 events_tx.clone(),
                 alternate_scroll,
@@ -1161,7 +1156,8 @@ impl TerminalBuilder {
                     args,
                     env.clone(),
                     working_directory.clone(),
-                    term.clone(),
+                    backend.stream_ingest(),
+                    backend.stream_ingest(),
                     events_tx,
                     &background_executor,
                 ) {
@@ -1215,8 +1211,7 @@ impl TerminalBuilder {
                 let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
 
                 //And connect them together
-                let pty_tx =
-                    spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
+                let pty_tx = backend.spawn_event_loop(events_tx, pty, pty_options.drain_on_exit)?;
 
                 (
                     TerminalType::Pty {
@@ -1233,9 +1228,7 @@ impl TerminalBuilder {
                 terminal_type,
                 subprocess,
                 completion_tx,
-                term,
-                term_config: config,
-                output_processor: Processor::<StdSyncHandler>::new(),
+                backend,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1410,9 +1403,7 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
-    term: Arc<AlacrittyTermLock>,
-    term_config: AlacrittyTermConfig,
-    output_processor: Processor<StdSyncHandler>,
+    backend: TerminalBackend,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1551,8 +1542,7 @@ impl Terminal {
                 self.write_to_pty(format(self.last_content.terminal_bounds).into_bytes())
             }
             TerminalBackendEvent::CursorBlinkingChange => {
-                let terminal = self.term.lock();
-                let blinking = terminal.cursor_style().blinking;
+                let blinking = self.backend.cursor_blinking();
                 cx.emit(Event::BlinkChanged(blinking));
             }
             TerminalBackendEvent::Bell => {
@@ -1580,7 +1570,9 @@ impl Terminal {
                 // we might respond with out of date value if a "set color" sequence is immediately
                 // followed by a color request sequence.
 
-                let color = self.term.lock().colors()[index]
+                let color = self
+                    .backend
+                    .color(index)
                     .unwrap_or_else(|| to_vte_rgb(get_color_at_index(index, cx.theme().as_ref())));
                 self.write_to_pty(format(color).into_bytes());
             }
@@ -1597,7 +1589,6 @@ impl Terminal {
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
-        term: &mut AlacrittyTerm,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1612,7 +1603,7 @@ impl Terminal {
                     pty_tx.resize(new_bounds);
                 }
 
-                resize(term, new_bounds);
+                self.backend.resize(new_bounds);
                 // If there are matches we need to emit a wake up event to
                 // invalidate the matches and recalculate their locations
                 // in the new terminal layout
@@ -1622,19 +1613,19 @@ impl Terminal {
             }
             InternalEvent::Clear => {
                 trace!("Clearing");
-                clear_saved_screen(term);
+                self.backend.clear();
                 cx.emit(Event::Wakeup);
             }
             InternalEvent::Scroll(scroll) => {
                 trace!("Scrolling: scroll={scroll:?}");
-                scroll_display(term, *scroll);
+                self.backend.scroll_display(*scroll);
                 self.refresh_hovered_word(window);
 
                 if self.vi_mode_enabled {
-                    update_vi_cursor_for_scroll(term, *scroll);
-                    if let Some(selection_head) = update_selection_to_vi_cursor(term) {
+                    self.backend.update_vi_cursor_for_scroll(*scroll);
+                    if let Some(selection_head) = self.backend.update_selection_to_vi_cursor() {
                         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                        if let Some(selection_text) = selection_text(term) {
+                        if let Some(selection_text) = self.backend.selection_text() {
                             cx.write_to_primary(ClipboardItem::new_string(selection_text));
                         }
 
@@ -1645,10 +1636,10 @@ impl Terminal {
             }
             InternalEvent::SetSelection(selection) => {
                 trace!("Setting selection: selection={selection:?}");
-                set_term_selection(term, selection.as_ref());
+                self.backend.set_selection(selection.as_ref());
 
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                if let Some(selection_text) = selection_text(term) {
+                if let Some(selection_text) = self.backend.selection_text() {
                     cx.write_to_primary(ClipboardItem::new_string(selection_text));
                 }
 
@@ -1662,12 +1653,12 @@ impl Terminal {
                 let (point, side) = grid_point_and_side(
                     *position,
                     self.last_content.terminal_bounds,
-                    display_offset(term),
+                    self.backend.display_offset(),
                 );
 
-                if update_term_selection(term, point, side) {
+                if self.backend.update_selection(point, side) {
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    if let Some(selection_text) = selection_text(term) {
+                    if let Some(selection_text) = self.backend.selection_text() {
                         cx.write_to_primary(ClipboardItem::new_string(selection_text));
                     }
 
@@ -1678,7 +1669,7 @@ impl Terminal {
 
             InternalEvent::Copy(keep_selection) => {
                 trace!("Copying selection: keep_selection={keep_selection:?}");
-                if let Some(txt) = selection_text(term) {
+                if let Some(txt) = self.backend.selection_text() {
                     cx.write_to_clipboard(ClipboardItem::new_string(txt));
                     if !keep_selection.unwrap_or_else(|| {
                         let settings = TerminalSettings::get_global(cx);
@@ -1690,22 +1681,22 @@ impl Terminal {
             }
             InternalEvent::ScrollToPoint(point) => {
                 trace!("Scrolling to point: point={point:?}");
-                scroll_to_point(term, *point);
+                self.backend.scroll_to_point(*point);
                 self.refresh_hovered_word(window);
             }
             InternalEvent::MoveViCursorToPoint(point) => {
                 trace!("Move vi cursor to point: point={point:?}");
-                vi_goto_point(term, *point);
+                self.backend.vi_goto_point(*point);
                 self.refresh_hovered_word(window);
             }
             InternalEvent::ToggleViMode => {
                 trace!("Toggling vi mode");
                 self.vi_mode_enabled = !self.vi_mode_enabled;
-                toggle_term_vi_mode(term);
+                self.backend.toggle_vi_mode();
             }
             InternalEvent::ViMotion(motion) => {
                 trace!("Performing vi motion: motion={motion:?}");
-                vi_motion(term, *motion);
+                self.backend.vi_motion(*motion);
             }
             InternalEvent::FindHyperlink(position, open) => {
                 trace!("Finding hyperlink at position: position={position:?}, open={open:?}");
@@ -1713,11 +1704,10 @@ impl Terminal {
                 let point = grid_point(
                     *position,
                     self.last_content.terminal_bounds,
-                    display_offset(term),
+                    self.backend.display_offset(),
                 );
 
-                match find_from_terminal_point(
-                    term,
+                match self.backend.find_from_terminal_point(
                     point,
                     &mut self.hyperlink_regex_searches,
                     self.path_style,
@@ -1773,9 +1763,7 @@ impl Terminal {
     }
 
     fn find_hyperlink_at_point(&mut self, point: Point) -> Option<HyperlinkMatch> {
-        let term_lock = self.term.lock();
-        find_from_terminal_point(
-            &term_lock,
+        self.backend.find_from_terminal_point(
             point,
             &mut self.hyperlink_regex_searches,
             self.path_style,
@@ -1822,8 +1810,7 @@ impl Terminal {
     }
 
     pub fn set_cursor_shape(&mut self, cursor_shape: SettingsCursorShape) {
-        set_default_cursor_style(&mut self.term_config, cursor_shape);
-        apply_config(&self.term, &self.term_config);
+        self.backend.set_default_cursor_style(cursor_shape);
     }
 
     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1832,19 +1819,17 @@ impl Terminal {
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
-        let mut term = self.term.lock();
-        self.output_processor.advance(&mut *term, &converted);
-        drop(term);
+        self.backend.write(&converted);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
     }
 
     pub fn total_lines(&self) -> usize {
-        total_lines(&self.term.lock_unfair())
+        self.backend.total_lines()
     }
 
     pub fn viewport_lines(&self) -> usize {
-        screen_lines(&self.term.lock_unfair())
+        self.backend.screen_lines()
     }
 
     //To test:
@@ -1877,9 +1862,7 @@ impl Terminal {
     }
 
     pub fn select_all(&mut self) {
-        let term = self.term.lock();
-        let range = full_content_range(&term);
-        drop(term);
+        let range = self.backend.full_content_range();
         self.set_selection(Some(Selection::simple_range(range)));
     }
 
@@ -1897,7 +1880,7 @@ impl Terminal {
     }
 
     pub fn shrink_to_used(&mut self) {
-        shrink_to_used(&mut self.term.lock());
+        self.backend.shrink_to_used();
     }
 
     pub fn scroll_line_up(&mut self) {
@@ -2033,12 +2016,11 @@ impl Terminal {
             return;
         };
 
-        let has_marker = {
-            let term = self.term.lock_unfair();
-            last_non_empty_lines(&term, INIT_COMMAND_STARTUP_MARKER_SEARCH_LINES)
-                .iter()
-                .any(|line| line.contains(marker))
-        };
+        let has_marker = self
+            .backend
+            .last_n_non_empty_lines(INIT_COMMAND_STARTUP_MARKER_SEARCH_LINES)
+            .iter()
+            .any(|line| line.contains(marker));
 
         if has_marker {
             self.complete_init_command_startup_handshake();
@@ -2085,9 +2067,8 @@ impl Terminal {
     }
 
     fn clear_for_init_command(&mut self, cx: &mut Context<Self>) {
-        let mut term = self.term.lock_unfair();
-        clear_saved_screen(&mut term);
-        self.last_content = make_content(&term, &self.last_content);
+        self.backend.clear();
+        self.last_content = self.backend.make_content(&self.last_content);
         cx.emit(Event::Wakeup);
     }
 
@@ -2260,30 +2241,24 @@ impl Terminal {
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let term = self.term.clone();
-        let mut terminal = term.lock_unfair();
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
-            self.process_terminal_event(&e, &mut terminal, window, cx)
+            self.process_terminal_event(&e, window, cx)
         }
 
-        self.last_content = make_content(&terminal, &self.last_content);
+        self.last_content = self.backend.make_content(&self.last_content);
     }
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
-        let term = self.term.lock_unfair();
-        let content = term.renderable_content();
-        f(RenderableCells::new(content.display_iter))
+        self.backend.with_renderable_cells(f)
     }
 
     pub fn get_content(&self) -> String {
-        let term = self.term.lock_unfair();
-        content_text(&term)
+        self.backend.content_text()
     }
 
     pub fn last_n_non_empty_lines(&self, n: usize) -> Vec<String> {
-        let terminal = self.term.lock_unfair();
-        last_non_empty_lines(&terminal, n)
+        self.backend.last_n_non_empty_lines(n)
     }
 
     pub fn focus_in(&self) {
@@ -2681,11 +2656,8 @@ impl Terminal {
     }
 
     pub fn find_matches(&self, searcher: Search, cx: &Context<Self>) -> Task<Vec<Range>> {
-        let term = self.term.clone();
-        cx.background_spawn(async move {
-            let term = term.lock();
-            search_matches(&term, searcher)
-        })
+        let searcher = self.backend.prepare_search(searcher);
+        cx.background_spawn(async move { searcher.run() })
     }
 
     pub fn working_directory(&self) -> Option<PathBuf> {
@@ -2886,11 +2858,11 @@ impl Terminal {
         let hide = task.spawned_task.hide;
 
         if !lines_to_show.is_empty() {
-            // SAFETY: the invocation happens on non `TaskStatus::Running` tasks, once,
-            // after either `AlacTermEvent::Exit` or `AlacTermEvent::ChildExit` events that are spawned
+            // The invocation happens on non `TaskStatus::Running` tasks, once,
+            // after either `Exit` or `ChildExit` events that are spawned
             // when Zed task finishes and no more output is made.
             // After the task summary is output once, no more text is appended to the terminal.
-            unsafe { append_text_to_term(&mut self.term.lock(), &lines_to_show) };
+            self.backend.append_lines(&lines_to_show);
         }
 
         match hide {
@@ -3007,14 +2979,16 @@ impl SubprocessHandle {
 }
 
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
-/// drives its output into `term`, mirroring what the Alacritty event loop does
-/// for a PTY but without one. Used when [`HeadlessTerminal`] is enabled.
+/// drives its output into the terminal backend, mirroring what the Alacritty
+/// event loop does for a PTY but without one. Used when [`HeadlessTerminal`]
+/// is enabled.
 fn spawn_task_subprocess(
     program: String,
     args: Vec<String>,
     env: HashMap<String, String>,
     working_directory: Option<PathBuf>,
-    term: Arc<AlacrittyTermLock>,
+    stdout_ingest: StreamIngest,
+    stderr_ingest: StreamIngest,
     events_tx: futures::channel::mpsc::UnboundedSender<PtyEvent>,
     executor: &BackgroundExecutor,
 ) -> Result<SubprocessHandle> {
@@ -3039,14 +3013,12 @@ fn spawn_task_subprocess(
         let executor = executor.clone();
         async move {
             // stdout and stderr are pumped concurrently, each through its own
-            // parser; the shared term mutex serializes grid mutation.
+            // parser; the backend's shared term mutex serializes grid mutation.
             type BoxedReader = Box<dyn futures::io::AsyncRead + Unpin + Send>;
-            let pump = |reader: Option<BoxedReader>| {
-                let term = term.clone();
+            let pump = |reader: Option<BoxedReader>, mut ingest: StreamIngest| {
                 let events_tx = events_tx.clone();
                 async move {
                     let Some(mut reader) = reader else { return };
-                    let mut processor = Processor::<StdSyncHandler>::new();
                     let mut buffer = [0u8; 8192];
                     let mut previous_byte_was_cr = false;
                     loop {
@@ -3059,10 +3031,7 @@ fn spawn_task_subprocess(
                             Ok(count) => {
                                 let converted =
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
-                                {
-                                    let mut term = term.lock();
-                                    processor.advance(&mut *term, &converted);
-                                }
+                                ingest.advance(&converted);
                                 events_tx
                                     .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Wakeup))
                                     .ok();
@@ -3073,7 +3042,7 @@ fn spawn_task_subprocess(
             };
             let stdout = stdout.map(|reader| Box::new(reader) as BoxedReader);
             let stderr = stderr.map(|reader| Box::new(reader) as BoxedReader);
-            futures::future::join(pump(stdout), pump(stderr)).await;
+            futures::future::join(pump(stdout, stdout_ingest), pump(stderr, stderr_ingest)).await;
 
             // Both pipes are closed, so the child has exited or is about to.
             // Poll for its status without holding the lock across an await.
@@ -3609,9 +3578,7 @@ mod tests {
         cx.run_until_parked();
 
         terminal.update(cx, |terminal, _cx| {
-            let term_lock = terminal.term.lock();
-            terminal.last_content = make_content(&term_lock, &terminal.last_content);
-            drop(term_lock);
+            terminal.last_content = terminal.backend.make_content(&terminal.last_content);
 
             let terminal_bounds = TerminalBounds::new(
                 px(20.0),
@@ -4298,10 +4265,9 @@ mod tests {
             terminal.write_output(b"line1\nline2\n", cx);
         });
 
-        // Get the content by directly accessing the term
+        // Get the content by directly accessing the backend
         let content = terminal.update(cx, |terminal, _cx| {
-            let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            terminal.backend.make_content(&terminal.last_content)
         });
 
         // If LF is properly converted to CRLF, each line should start at column 0
@@ -4345,10 +4311,9 @@ mod tests {
             terminal.write_output(b"line1\r\nline2\r\n", cx);
         });
 
-        // Get the content by directly accessing the term
+        // Get the content by directly accessing the backend
         let content = terminal.update(cx, |terminal, _cx| {
-            let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            terminal.backend.make_content(&terminal.last_content)
         });
 
         let cells = &content.cells;
@@ -4386,10 +4351,9 @@ mod tests {
             terminal.write_output(b"hello\rworld", cx);
         });
 
-        // Get the content by directly accessing the term
+        // Get the content by directly accessing the backend
         let content = terminal.update(cx, |terminal, _cx| {
-            let term = terminal.term.lock_unfair();
-            make_content(&term, &terminal.last_content)
+            terminal.backend.make_content(&terminal.last_content)
         });
 
         let cells = &content.cells;

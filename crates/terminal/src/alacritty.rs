@@ -31,14 +31,14 @@ use alacritty_terminal::{
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
-use vte::ansi::Handler;
+use vte::ansi::{Handler, Processor, StdSyncHandler};
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
-    PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
-    SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
+    PtyEvent, Range, RenderableCells, Rgb, Scroll, Search, Selection, SelectionRange,
+    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -116,7 +116,305 @@ fn window_size_from_terminal_bounds(bounds: TerminalBounds) -> WindowSize {
     }
 }
 
-pub(super) fn display_only_term_config(
+/// The alacritty-backed terminal core: the emulator grid, its config, and the
+/// parser feeding it. `ghostty::TerminalBackend` must expose this same inherent
+/// method surface so the swap only re-points one import and the construction
+/// call (docs/ghostty-migration/SPEC.md §4.1); all locking of the shared
+/// terminal state stays behind this struct.
+pub(super) struct TerminalBackend {
+    term: Arc<AlacrittyTermLock>,
+    config: AlacrittyTermConfig,
+    output_processor: Processor<StdSyncHandler>,
+}
+
+impl TerminalBackend {
+    pub(super) fn new(
+        scrolling_history: usize,
+        cursor_shape: SettingsCursorShape,
+        bounds: TerminalBounds,
+        events_tx: UnboundedSender<PtyEvent>,
+        alternate_scroll: AlternateScroll,
+    ) -> Self {
+        Self::with_config(
+            pty_term_config(scrolling_history, cursor_shape),
+            bounds,
+            events_tx,
+            alternate_scroll,
+        )
+    }
+
+    pub(super) fn new_display_only(
+        scrolling_history: usize,
+        cursor_shape: SettingsCursorShape,
+        bounds: TerminalBounds,
+        events_tx: UnboundedSender<PtyEvent>,
+        alternate_scroll: AlternateScroll,
+    ) -> Self {
+        Self::with_config(
+            display_only_term_config(scrolling_history, cursor_shape),
+            bounds,
+            events_tx,
+            alternate_scroll,
+        )
+    }
+
+    fn with_config(
+        config: AlacrittyTermConfig,
+        bounds: TerminalBounds,
+        events_tx: UnboundedSender<PtyEvent>,
+        alternate_scroll: AlternateScroll,
+    ) -> Self {
+        let mut term = Term::new(config.clone(), &bounds, ZedListener(events_tx));
+
+        if let AlternateScroll::Off = alternate_scroll {
+            term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::AlternateScroll));
+        }
+
+        Self {
+            term: Arc::new(FairMutex::new(term)),
+            config,
+            output_processor: Processor::new(),
+        }
+    }
+
+    pub(super) fn spawn_event_loop(
+        &self,
+        events_tx: UnboundedSender<PtyEvent>,
+        pty: AlacrittyPty,
+        drain_on_exit: bool,
+    ) -> Result<PtySender> {
+        let event_loop = EventLoop::new(
+            self.term.clone(),
+            ZedListener(events_tx),
+            pty,
+            drain_on_exit,
+            false,
+        )
+        .context("failed to create event loop")?;
+        let pty_tx = event_loop.channel();
+        let _io_thread = event_loop.spawn();
+
+        Ok(PtySender {
+            notifier: Notifier(pty_tx),
+        })
+    }
+
+    pub(super) fn stream_ingest(&self) -> StreamIngest {
+        StreamIngest {
+            term: self.term.clone(),
+            processor: Processor::new(),
+        }
+    }
+
+    pub(super) fn write(&mut self, bytes: &[u8]) {
+        let mut term = self.term.lock();
+        self.output_processor.advance(&mut *term, bytes);
+    }
+
+    pub(super) fn set_default_cursor_style(&mut self, cursor_shape: SettingsCursorShape) {
+        self.config.default_cursor_style = alacritty_cursor_style(cursor_shape);
+        self.term.lock().set_options(self.config.clone());
+    }
+
+    pub(super) fn make_content(&mut self, last_content: &Content) -> Content {
+        make_content(&self.term.lock_unfair(), last_content)
+    }
+
+    pub(super) fn with_renderable_cells<R>(
+        &self,
+        f: impl for<'a> FnOnce(RenderableCells<'a>) -> R,
+    ) -> R {
+        let term = self.term.lock_unfair();
+        let content = term.renderable_content();
+        f(RenderableCells::new(content.display_iter))
+    }
+
+    pub(super) fn total_lines(&self) -> usize {
+        self.term.lock_unfair().total_lines()
+    }
+
+    pub(super) fn screen_lines(&self) -> usize {
+        self.term.lock_unfair().screen_lines()
+    }
+
+    pub(super) fn display_offset(&self) -> usize {
+        self.term.lock_unfair().grid().display_offset()
+    }
+
+    pub(super) fn content_text(&self) -> String {
+        let term = self.term.lock_unfair();
+        let start = AlacPoint::new(term.topmost_line(), Column(0));
+        let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+        term.bounds_to_string(start, end)
+    }
+
+    pub(super) fn full_content_range(&self) -> Range {
+        let term = self.term.lock();
+        let start = AlacPoint::new(term.topmost_line(), Column(0));
+        let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+        Range::from_alacritty(start..=end)
+    }
+
+    pub(super) fn last_n_non_empty_lines(&self, line_count: usize) -> Vec<String> {
+        last_non_empty_lines(&self.term.lock_unfair(), line_count)
+    }
+
+    pub(super) fn cursor_blinking(&self) -> bool {
+        self.term.lock().cursor_style().blinking
+    }
+
+    pub(super) fn color(&self, index: usize) -> Option<Rgb> {
+        self.term.lock().colors()[index]
+    }
+
+    pub(super) fn resize(&mut self, bounds: TerminalBounds) {
+        self.term.lock_unfair().resize(bounds);
+    }
+
+    pub(super) fn scroll_display(&mut self, scroll: Scroll) {
+        self.term.lock_unfair().scroll_display(scroll.to_alacritty());
+    }
+
+    pub(super) fn scroll_to_point(&mut self, point: Point) {
+        self.term.lock_unfair().scroll_to_point(point.to_alacritty());
+    }
+
+    pub(super) fn clear(&mut self) {
+        clear_saved_screen(&mut self.term.lock_unfair());
+    }
+
+    pub(super) fn shrink_to_used(&mut self) {
+        self.term.lock().grid_mut().truncate();
+    }
+
+    /// Appends a stringified task summary to the terminal, after its output.
+    ///
+    /// This must only be called after the terminal's PTY is no longer alive.
+    /// New text being added to the terminal here uses "less public" APIs,
+    /// which do not maintain the entire terminal state intact.
+    ///
+    ///
+    /// The library
+    ///
+    /// * does not increment inner grid cursor's _lines_ on `input` calls
+    ///   (but displaying the lines correctly and incrementing cursor's columns)
+    ///
+    /// * ignores `\n` and \r` character input, requiring the `newline` call instead
+    ///
+    /// * does not alter grid state after `newline` call
+    ///   so its `bottommost_line` is always the same additions, and
+    ///   the cursor's `point` is not updated to the new line and column values
+    ///
+    /// * ??? there could be more consequences, and any further "proper" streaming from the PTY might bug and/or panic.
+    ///   Still, subsequent `append_lines` invocations are possible and display the contents correctly.
+    ///
+    /// Despite the quirks, this is the simplest approach to appending text to the terminal: its alternative, `grid_mut` manipulations,
+    /// do not properly set the scrolling state and display odd text after appending; also those manipulations are more tedious and error-prone.
+    /// The function achieves proper display and scrolling capabilities, at a cost of grid state not properly synchronized.
+    /// This is enough for printing moderately-sized texts like task summaries, but might break or perform poorly for larger texts.
+    pub(super) fn append_lines(&mut self, text_lines: &[&str]) {
+        let mut term = self.term.lock();
+        term.newline();
+        term.grid_mut().cursor.point.column = Column(0);
+        for line in text_lines {
+            for character in line.chars() {
+                term.input(character);
+            }
+            term.newline();
+            term.grid_mut().cursor.point.column = Column(0);
+        }
+    }
+
+    pub(super) fn set_selection(&mut self, selection: Option<&Selection>) {
+        self.term.lock_unfair().selection = selection.map(Selection::to_alacritty);
+    }
+
+    pub(super) fn update_selection(&mut self, point: Point, side: SelectionSide) -> bool {
+        let mut term = self.term.lock_unfair();
+        let Some(mut selection) = term.selection.take() else {
+            return false;
+        };
+        selection.update(point.to_alacritty(), side.to_alacritty());
+        term.selection = Some(selection);
+        true
+    }
+
+    pub(super) fn selection_text(&self) -> Option<String> {
+        self.term.lock_unfair().selection_to_string()
+    }
+
+    pub(super) fn toggle_vi_mode(&mut self) {
+        self.term.lock_unfair().toggle_vi_mode();
+    }
+
+    pub(super) fn vi_motion(&mut self, motion: ViMotion) {
+        self.term.lock_unfair().vi_motion(motion.to_alacritty());
+    }
+
+    pub(super) fn vi_goto_point(&mut self, point: Point) {
+        self.term.lock_unfair().vi_goto_point(point.to_alacritty());
+    }
+
+    pub(super) fn update_vi_cursor_for_scroll(&mut self, scroll: Scroll) {
+        update_vi_cursor_for_scroll(&mut self.term.lock_unfair(), scroll);
+    }
+
+    pub(super) fn update_selection_to_vi_cursor(&mut self) -> Option<Point> {
+        update_selection_to_vi_cursor(&mut self.term.lock_unfair())
+    }
+
+    pub(super) fn prepare_search(&self, searcher: Search) -> PreparedSearch {
+        PreparedSearch {
+            term: self.term.clone(),
+            searcher,
+        }
+    }
+
+    pub(super) fn find_from_terminal_point(
+        &self,
+        point: Point,
+        regex_searches: &mut RegexSearches,
+        path_style: PathStyle,
+    ) -> Option<HyperlinkMatch> {
+        let term = self.term.lock();
+        let point = point.to_alacritty().grid_clamp(&*term, Boundary::Grid);
+        hyperlinks::find_from_grid_point(&term, point, regex_searches, path_style)
+    }
+}
+
+/// Feeds raw bytes from a background reader (the headless subprocess path)
+/// into the shared emulator; each output stream gets its own parser while the
+/// terminal mutex serializes grid mutation.
+pub(super) struct StreamIngest {
+    term: Arc<AlacrittyTermLock>,
+    processor: Processor<StdSyncHandler>,
+}
+
+impl StreamIngest {
+    pub(super) fn advance(&mut self, bytes: &[u8]) {
+        let mut term = self.term.lock();
+        self.processor.advance(&mut *term, bytes);
+    }
+}
+
+/// A grid search prepared on the foreground and run to completion on a
+/// background thread, locking the shared emulator for the duration.
+pub(super) struct PreparedSearch {
+    term: Arc<AlacrittyTermLock>,
+    searcher: Search,
+}
+
+impl PreparedSearch {
+    pub(super) fn run(self) -> Vec<Range> {
+        let term = self.term.lock();
+        let mut searcher = self.searcher.into_alacritty();
+        all_search_matches(&term, &mut searcher)
+            .map(Range::from_alacritty)
+            .collect()
+    }
+}
+
+fn display_only_term_config(
     scrolling_history: usize,
     cursor_shape: SettingsCursorShape,
 ) -> AlacrittyTermConfig {
@@ -128,7 +426,7 @@ pub(super) fn display_only_term_config(
     }
 }
 
-pub(super) fn pty_term_config(
+fn pty_term_config(
     scrolling_history: usize,
     cursor_shape: SettingsCursorShape,
 ) -> AlacrittyTermConfig {
@@ -137,17 +435,6 @@ pub(super) fn pty_term_config(
         default_cursor_style: alacritty_cursor_style(cursor_shape),
         ..Config::default()
     }
-}
-
-pub(super) fn set_default_cursor_style(
-    config: &mut AlacrittyTermConfig,
-    cursor_shape: SettingsCursorShape,
-) {
-    config.default_cursor_style = alacritty_cursor_style(cursor_shape);
-}
-
-pub(super) fn apply_config(term: &AlacrittyTermLock, config: &AlacrittyTermConfig) {
-    term.lock().set_options(config.clone());
 }
 
 #[cfg(not(windows))]
@@ -180,86 +467,6 @@ pub(super) fn open_pty(
     window_id: u64,
 ) -> io::Result<AlacrittyPty> {
     tty::new(options, window_size_from_terminal_bounds(bounds), window_id)
-}
-
-pub(super) fn new_term(
-    config: &AlacrittyTermConfig,
-    bounds: TerminalBounds,
-    events_tx: UnboundedSender<PtyEvent>,
-    alternate_scroll: AlternateScroll,
-) -> Arc<AlacrittyTermLock> {
-    let mut term = Term::new(config.clone(), &bounds, ZedListener(events_tx));
-
-    if let AlternateScroll::Off = alternate_scroll {
-        term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::AlternateScroll));
-    }
-
-    Arc::new(FairMutex::new(term))
-}
-
-pub(super) fn spawn_event_loop(
-    term: Arc<AlacrittyTermLock>,
-    events_tx: UnboundedSender<PtyEvent>,
-    pty: AlacrittyPty,
-    drain_on_exit: bool,
-) -> Result<PtySender> {
-    let event_loop = EventLoop::new(term, ZedListener(events_tx), pty, drain_on_exit, false)
-        .context("failed to create event loop")?;
-    let pty_tx = event_loop.channel();
-    let _io_thread = event_loop.spawn();
-
-    Ok(PtySender {
-        notifier: Notifier(pty_tx),
-    })
-}
-
-pub(super) fn resize(term: &mut AlacrittyTerm, bounds: TerminalBounds) {
-    term.resize(bounds);
-}
-
-pub(super) fn display_offset(term: &AlacrittyTerm) -> usize {
-    term.grid().display_offset()
-}
-
-pub(super) fn scroll_display(term: &mut AlacrittyTerm, scroll: Scroll) {
-    term.scroll_display(scroll.to_alacritty());
-}
-
-pub(super) fn set_selection(term: &mut AlacrittyTerm, selection: Option<&Selection>) {
-    term.selection = selection.map(Selection::to_alacritty);
-}
-
-pub(super) fn update_selection(
-    term: &mut AlacrittyTerm,
-    point: Point,
-    side: SelectionSide,
-) -> bool {
-    let Some(mut selection) = term.selection.take() else {
-        return false;
-    };
-    selection.update(point.to_alacritty(), side.to_alacritty());
-    term.selection = Some(selection);
-    true
-}
-
-pub(super) fn selection_text(term: &AlacrittyTerm) -> Option<String> {
-    term.selection_to_string()
-}
-
-pub(super) fn scroll_to_point(term: &mut AlacrittyTerm, point: Point) {
-    term.scroll_to_point(point.to_alacritty());
-}
-
-pub(super) fn vi_goto_point(term: &mut AlacrittyTerm, point: Point) {
-    term.vi_goto_point(point.to_alacritty());
-}
-
-pub(super) fn toggle_vi_mode(term: &mut AlacrittyTerm) {
-    term.toggle_vi_mode();
-}
-
-pub(super) fn vi_motion(term: &mut AlacrittyTerm, motion: ViMotion) {
-    term.vi_motion(motion.to_alacritty());
 }
 
 fn alacritty_cursor_style(cursor_shape: SettingsCursorShape) -> AlacCursorStyle {
@@ -775,7 +982,7 @@ fn terminal_selection_range_from_alacritty(range: AlacSelectionRange) -> Selecti
     }
 }
 
-pub(super) fn clear_saved_screen(term: &mut Term<ZedListener>) {
+fn clear_saved_screen(term: &mut Term<ZedListener>) {
     term.clear_screen(ClearMode::Saved);
 
     let cursor = term.grid().cursor.point;
@@ -800,11 +1007,7 @@ pub(super) fn clear_saved_screen(term: &mut Term<ZedListener>) {
     }
 }
 
-pub(super) fn shrink_to_used(term: &mut Term<ZedListener>) {
-    term.grid_mut().truncate();
-}
-
-pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> Content {
+fn make_content(term: &Term<ZedListener>, last_content: &Content) -> Content {
     let content = term.renderable_content();
 
     let estimated_size = content.display_iter.size_hint().0;
@@ -847,27 +1050,7 @@ pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> 
     }
 }
 
-pub(super) fn content_text(term: &Term<ZedListener>) -> String {
-    let start = AlacPoint::new(term.topmost_line(), Column(0));
-    let end = AlacPoint::new(term.bottommost_line(), term.last_column());
-    term.bounds_to_string(start, end)
-}
-
-pub(super) fn total_lines(term: &Term<ZedListener>) -> usize {
-    term.total_lines()
-}
-
-pub(super) fn screen_lines(term: &Term<ZedListener>) -> usize {
-    term.screen_lines()
-}
-
-pub(super) fn full_content_range(term: &Term<ZedListener>) -> Range {
-    let start = AlacPoint::new(term.topmost_line(), Column(0));
-    let end = AlacPoint::new(term.bottommost_line(), term.last_column());
-    Range::from_alacritty(start..=end)
-}
-
-pub(super) fn last_non_empty_lines(term: &Term<ZedListener>, line_count: usize) -> Vec<String> {
+fn last_non_empty_lines(term: &Term<ZedListener>, line_count: usize) -> Vec<String> {
     let grid = term.grid();
     let mut lines = Vec::new();
 
@@ -889,7 +1072,7 @@ pub(super) fn last_non_empty_lines(term: &Term<ZedListener>, line_count: usize) 
     lines
 }
 
-pub(super) fn update_vi_cursor_for_scroll(term: &mut Term<ZedListener>, scroll: Scroll) {
+fn update_vi_cursor_for_scroll(term: &mut Term<ZedListener>, scroll: Scroll) {
     match scroll {
         Scroll::Delta(delta) => {
             term.vi_mode_cursor = term.vi_mode_cursor.scroll(term, delta);
@@ -913,22 +1096,12 @@ pub(super) fn update_vi_cursor_for_scroll(term: &mut Term<ZedListener>, scroll: 
     }
 }
 
-pub(super) fn update_selection_to_vi_cursor(term: &mut Term<ZedListener>) -> Option<Point> {
+fn update_selection_to_vi_cursor(term: &mut Term<ZedListener>) -> Option<Point> {
     let mut selection = term.selection.take()?;
     let point = term.vi_mode_cursor.point;
     selection.update(point, AlacDirection::Right);
     term.selection = Some(selection);
     Some(terminal_point_from_alacritty(point))
-}
-
-pub(super) fn find_from_terminal_point(
-    term: &AlacrittyTerm,
-    point: Point,
-    regex_searches: &mut RegexSearches,
-    path_style: PathStyle,
-) -> Option<HyperlinkMatch> {
-    let point = point.to_alacritty().grid_clamp(term, Boundary::Grid);
-    hyperlinks::find_from_grid_point(term, point, regex_searches, path_style)
 }
 
 fn logical_line_for_row(grid: &Grid<AlacCell>, current: i32, topmost: i32) -> (i32, String) {
@@ -967,50 +1140,6 @@ fn process_line(line: String) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Appends a stringified task summary to the terminal, after its output.
-///
-/// SAFETY: This function should only be called after terminal's PTY is no longer alive.
-/// New text being added to the terminal here, uses "less public" APIs,
-/// which are not maintaining the entire terminal state intact.
-///
-///
-/// The library
-///
-/// * does not increment inner grid cursor's _lines_ on `input` calls
-///   (but displaying the lines correctly and incrementing cursor's columns)
-///
-/// * ignores `\n` and \r` character input, requiring the `newline` call instead
-///
-/// * does not alter grid state after `newline` call
-///   so its `bottommost_line` is always the same additions, and
-///   the cursor's `point` is not updated to the new line and column values
-///
-/// * ??? there could be more consequences, and any further "proper" streaming from the PTY might bug and/or panic.
-///   Still, subsequent `append_text_to_term` invocations are possible and display the contents correctly.
-///
-/// Despite the quirks, this is the simplest approach to appending text to the terminal: its alternative, `grid_mut` manipulations,
-/// do not properly set the scrolling state and display odd text after appending; also those manipulations are more tedious and error-prone.
-/// The function achieves proper display and scrolling capabilities, at a cost of grid state not properly synchronized.
-/// This is enough for printing moderately-sized texts like task summaries, but might break or perform poorly for larger texts.
-pub(super) unsafe fn append_text_to_term(term: &mut Term<ZedListener>, text_lines: &[&str]) {
-    term.newline();
-    term.grid_mut().cursor.point.column = Column(0);
-    for line in text_lines {
-        for character in line.chars() {
-            term.input(character);
-        }
-        term.newline();
-        term.grid_mut().cursor.point.column = Column(0);
-    }
-}
-
-pub(super) fn search_matches(term: &AlacrittyTerm, searcher: Search) -> Vec<Range> {
-    let mut searcher = searcher.into_alacritty();
-    all_search_matches(term, &mut searcher)
-        .map(Range::from_alacritty)
-        .collect()
 }
 
 fn all_search_matches<'a, T>(
