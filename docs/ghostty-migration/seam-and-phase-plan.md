@@ -3,7 +3,9 @@
 Decision record for [ticket #36](https://github.com/xipeng-jin/zed/issues/36). Defines the
 replacement seam module's interface, the coexistence strategy for the two cores, and the
 ordered phase plan ending in `alacritty_terminal` removal. This is the spine of the final
-migration spec (ticket #38).
+migration spec — now assembled and locked as [SPEC.md](SPEC.md) (ticket #38), which is the
+execution authority; see the [Amendments](#amendments-spec-lock-2026-07-16) section for the
+two details the spec lock changed.
 
 Inputs (all locked, none reopened here): the [parity matrix](parity-matrix.md) (#29), the
 [PTY/threading architecture](pty-threading-architecture.md) (#30), the color contract (#31),
@@ -139,3 +141,22 @@ gate criteria green:
 5. Regenerate `licenses.md`: alacritty attribution leaves; **vte stays**, scoped to
    `strip_ansi_text`/`parse_ansi_text` per #31.
 6. Commit the final divergence ledger state.
+
+## Amendments (spec lock, 2026-07-16)
+
+Made while assembling and locking [SPEC.md](SPEC.md) (ticket #38); the spec is the
+execution authority for both:
+
+1. **S1's "no cfg switch" is scoped to within-platform choice.** As written, S1
+   conflicted with the build strategy's Linux-only target-specific dependency (§6.6):
+   P3's encoder call sites and P8's backend import compile on all platforms. Resolution
+   (SPEC.md §5): the Linux-first window uses exactly three temporary **per-platform** cfg
+   points (the dependency declaration, the `mappings/` encoder call sites from P3, the
+   backend import from P8); macOS/Windows stay on the alacritty-era paths until their
+   platform gates widen the cfg; all three markers are deleted at P10. No build of Zed
+   ever contains a backend choice for its own platform.
+2. **The phase plan gains P0** (SPEC.md §6): the artifact-pipeline implementation
+   ([artifact-pipeline.md §10](artifact-pipeline.md)) runs as a parallel track with its
+   own acceptance criteria (prebuilt links on all four Linux targets, source-build CI job
+   green, `nix build` green), no dependency on P1–P2, and a hard edge P0→P3 — making
+   P3's "gated on #39 prebuilts live" a plan edge instead of an unplaced precondition.

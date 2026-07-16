@@ -2,8 +2,11 @@
 
 Decision record for [ticket #37](https://github.com/xipeng-jin/zed/issues/37). Defines the
 test oracle, the new conformance tests, the interactive validation plan, and the explicit
-gate that must be green before the Alacritty-removal phase may execute. This becomes the
-verification section of the final migration spec (ticket #38).
+gate that must be green before the Alacritty-removal phase may execute. This is the
+verification section of the final migration spec, now assembled and locked as
+[SPEC.md](SPEC.md) (ticket #38), which is the execution authority; see the
+[Amendment](#amendment-spec-lock-2026-07-16) at the end for the one detail the spec lock
+changed.
 
 Inputs: the [parity matrix](parity-matrix.md) (#29), the
 [PTY/threading architecture](pty-threading-architecture.md) (#30), the
@@ -225,3 +228,14 @@ All §9.1 and §9.2 items **block the removal phase**. Explicitly riding after r
 migrating portable-pty from the git pin back to a crates.io release, and any channel/batch
 tuning beyond the perf bar (including activating the dedicated-terminal-thread escape
 hatch), which happens only if a real regression appears.
+
+## Amendment (spec lock, 2026-07-16)
+
+Made while assembling and locking [SPEC.md](SPEC.md) (ticket #38), the execution
+authority: **the sustained-flood scenario lands at phase P4**, not at the macOS gate.
+§9.1's "the §6 suite gains a sustained-flood scenario" conflicted with the phase plan,
+whose P4 acceptance criteria already require that benchmark to validate channel/batch
+tuning — an acceptance criterion needs its instrument when the phase lands. The macOS gate
+**re-records** the scenario on macOS hardware (unchanged bar); nothing else in §9.1
+changes. Relatedly, the spike's suggested time-budgeted drain is formally superseded by
+the per-turn batch cap + this benchmark + the dedicated-thread escape hatch (SPEC.md §3).
