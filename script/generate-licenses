@@ -24,6 +24,11 @@ echo -n "" >"$OUTPUT_FILE"
     echo -e "\n# ###### ICON LICENSES ######\n"
     cat assets/icons/LICENSES
 
+    # Static section: cargo-about cannot see private workspace crates or the
+    # native code statically linked into libghostty-vt.
+    echo -e "\n# ###### GHOSTTY TERMINAL LICENSES ######\n"
+    cat script/licenses/ghostty-vt-LICENSES
+
     echo -e "\n# ###### CODE LICENSES ######\n"
 } >>"$OUTPUT_FILE"
 

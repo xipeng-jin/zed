@@ -1,0 +1,44 @@
+# Keeps the GHOSTTY_VT_FROM_SOURCE=1 escape hatch alive: builds libghostty-vt
+# from ghostty source at the pinned commit on every PR, so the pin, the
+# vendored bindings (headers_sha256 check), and the zig build recipe cannot
+# rot while the default path links prebuilts. Contract:
+# docs/ghostty-migration/build-strategy.md §6; docs/ghostty-migration/SPEC.md §2.
+#
+# Hand-written (not xtask-generated): it must run on this fork, where the
+# xtask-generated workflows are guarded to zed-industries and use Namespace
+# runners. Fold into run_tests.rs when the migration upstreams.
+name: ghostty_source_build
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+      - migration/libghostty
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  source_build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - name: cache zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/zig
+          key: zig-packages-${{ hashFiles('crates/ghostty_vt_sys/ghostty_pin.toml') }}
+      - name: build from source at the pin and run tests
+        run: cargo test -p ghostty_vt --lib
+        env:
+          GHOSTTY_VT_FROM_SOURCE: "1"

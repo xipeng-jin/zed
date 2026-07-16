@@ -10,10 +10,9 @@
 //!    (dev loop for hacking on ghostty; the checkout is not pin-enforced).
 //! 3. `GHOSTTY_VT_FROM_SOURCE=1` — git-fetch ghostty at the pinned commit
 //!    and build with zig.
-//! 4. Default — fetch a Zed-published prebuilt archive, verified against the
-//!    sha256 pins in `ghostty_pin.toml`. Until the artifact pipeline
-//!    publishes the first release (empty `[sha256]` table), this falls back
-//!    to path 3 with a warning.
+//! 4. Default — fetch the Zed-published prebuilt archive from the
+//!    `prebuilt_repo` release, verified against the sha256 pins in
+//!    `ghostty_pin.toml` before unpacking. No zig, no git, no bindgen.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -28,6 +27,8 @@ const ZIG_DOWNLOAD_URL: &str = "https://ziglang.org/download/#release-0.15.2";
 
 struct Pin {
     commit: String,
+    release: String,
+    prebuilt_repo: String,
     headers_sha256: String,
     prebuilt_sha256: BTreeMap<String, String>,
 }
@@ -70,6 +71,8 @@ fn main() {
 /// is an error rather than something to guess about.
 fn parse_pin(contents: &str) -> Pin {
     let mut commit = None;
+    let mut release = None;
+    let mut prebuilt_repo = None;
     let mut headers_sha256 = None;
     let mut prebuilt_sha256 = BTreeMap::new();
     let mut in_sha256_table = false;
@@ -100,7 +103,8 @@ fn parse_pin(contents: &str) -> Pin {
         } else {
             match key {
                 "commit" => commit = Some(value),
-                "release" => {}
+                "release" => release = Some(value),
+                "prebuilt_repo" => prebuilt_repo = Some(value),
                 "headers_sha256" => headers_sha256 = Some(value),
                 other => {
                     panic!("ghostty-vt-sys: unrecognized key '{other}' in ghostty_pin.toml")
@@ -111,6 +115,9 @@ fn parse_pin(contents: &str) -> Pin {
 
     Pin {
         commit: commit.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'commit'"),
+        release: release.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'release'"),
+        prebuilt_repo: prebuilt_repo
+            .expect("ghostty-vt-sys: ghostty_pin.toml is missing 'prebuilt_repo'"),
         headers_sha256: headers_sha256
             .expect("ghostty-vt-sys: ghostty_pin.toml is missing 'headers_sha256'"),
         prebuilt_sha256,
@@ -137,53 +144,138 @@ fn link_prebuilt_dir(dir: &Path, target: &str) {
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
 
-/// Path 4 (default): fetch a Zed-published prebuilt archive. The artifact
-/// pipeline that publishes these archives has not landed yet, so today this
-/// path always explains how to build instead; the sha256 lookup is already
-/// wired so publishing artifacts only requires stamping the pin manifest.
+/// Path 4 (default): fetch the Zed-published prebuilt archive for this
+/// target from the `prebuilt_repo` release and verify it against the sha256
+/// pinned in `ghostty_pin.toml` before unpacking. The unpacked archive is
+/// cached in OUT_DIR keyed by its hash, so `cargo clean` costs one
+/// re-download and a pin bump invalidates the cache automatically.
 fn fetch_prebuilt(pin: &Pin, target: &str) {
-    match pin.prebuilt_sha256.get(target) {
-        None => {
-            // Interim state until the artifact pipeline publishes its first
-            // release: an entirely empty sha256 table means "no artifacts
-            // exist yet", and falling back to a pinned source build keeps
-            // plain `cargo build` green on this branch. The first stamped
-            // hash makes this branch unreachable and the contract strict.
-            if pin.prebuilt_sha256.is_empty() {
-                println!(
-                    "cargo:warning=no prebuilt libghostty-vt artifacts are published yet; \
-                     falling back to building from source at the pinned ghostty commit \
-                     (requires zig 0.15.x and network). This fallback disappears once the \
-                     artifact pipeline lands. See {DOCS_URL}."
-                );
-                build_from_source(SourceCheckout::PinnedFetch, pin, target);
-                return;
-            }
-            let available = pin
-                .prebuilt_sha256
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            panic!(
-                "ghostty-vt-sys: no prebuilt libghostty-vt for target {target} \
-                 (available: {available}). Build from source with GHOSTTY_VT_FROM_SOURCE=1 \
-                 (requires zig 0.15.x on PATH), or set GHOSTTY_VT_LIB_DIR to a directory \
-                 containing {archive}. See {DOCS_URL}.",
-                archive = static_archive_name(target),
-            );
+    let Some(expected_sha256) = pin.prebuilt_sha256.get(target) else {
+        let available = pin
+            .prebuilt_sha256
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        panic!(
+            "ghostty-vt-sys: no prebuilt libghostty-vt for target {target} \
+             (available: {available}). Build from source with GHOSTTY_VT_FROM_SOURCE=1 \
+             (requires zig 0.15.x on PATH), or set GHOSTTY_VT_LIB_DIR to a directory \
+             containing {archive}. See {DOCS_URL}.",
+            archive = static_archive_name(target),
+        );
+    };
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
+    let commit10 = pin.commit.get(..10).unwrap_or_else(|| {
+        panic!(
+            "ghostty-vt-sys: 'commit' in ghostty_pin.toml must be a full 40-char commit \
+             (got '{}')",
+            pin.commit
+        )
+    });
+    let archive = static_archive_name(target);
+    let asset_name = format!("libghostty-vt-{commit10}-{target}.tar.gz");
+    let unpack_dir = out_dir.join("ghostty-prebuilt");
+    let stamp = unpack_dir.join(".sha256-stamp");
+
+    let cache_is_valid = std::fs::read_to_string(&stamp)
+        .is_ok_and(|existing| existing.trim() == expected_sha256)
+        && unpack_dir.join(archive).exists();
+    if !cache_is_valid {
+        let url = format!(
+            "https://github.com/{repo}/releases/download/{release}/{asset_name}",
+            repo = pin.prebuilt_repo,
+            release = pin.release,
+        );
+        if unpack_dir.exists() {
+            std::fs::remove_dir_all(&unpack_dir).unwrap_or_else(|error| {
+                panic!(
+                    "ghostty-vt-sys: failed to remove {}: {error}",
+                    unpack_dir.display()
+                )
+            });
         }
-        Some(_sha256) => {
-            // The download-and-verify implementation lands with the artifact
-            // pipeline (it owns the release URL scheme).
+        std::fs::create_dir_all(&unpack_dir).unwrap_or_else(|error| {
             panic!(
-                "ghostty-vt-sys: ghostty_pin.toml pins a prebuilt archive for {target}, but \
-                 the prebuilt fetch is not implemented yet (it lands with the artifact \
-                 pipeline). Build from source with GHOSTTY_VT_FROM_SOURCE=1, or set \
-                 GHOSTTY_VT_LIB_DIR. See {DOCS_URL}."
-            );
+                "ghostty-vt-sys: failed to create {}: {error}",
+                unpack_dir.display()
+            )
+        });
+
+        let archive_path = out_dir.join(&asset_name);
+        eprintln!("ghostty-vt-sys: downloading {url} ...");
+        let download_failure = |cause: &dyn std::fmt::Display| -> ! {
+            panic!(
+                "ghostty-vt-sys: failed to download prebuilt libghostty-vt for {target} from \
+                 {url}: {cause}. If you are offline, set GHOSTTY_VT_LIB_DIR to a directory \
+                 containing {archive}, or build from source with GHOSTTY_VT_FROM_SOURCE=1 \
+                 (requires zig 0.15.x). See {DOCS_URL}."
+            )
+        };
+        // curl shell-out, following the ConPTY-download precedent in
+        // crates/zed/build.rs; bsdtar on macOS/Windows 10+ handles the same
+        // invocation for the later platform gates.
+        let output = Command::new("curl")
+            .arg("-fsSL")
+            .arg("--retry")
+            .arg("3")
+            .arg("-o")
+            .arg(&archive_path)
+            .arg(&url)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => download_failure(&format!(
+                "curl exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => download_failure(&format!("failed to execute curl: {error}")),
         }
+
+        let archive_bytes = std::fs::read(&archive_path).unwrap_or_else(|error| {
+            panic!(
+                "ghostty-vt-sys: failed to read downloaded archive {}: {error}",
+                archive_path.display()
+            )
+        });
+        let actual_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
+        assert!(
+            actual_sha256 == *expected_sha256,
+            "ghostty-vt-sys: prebuilt libghostty-vt for {target} failed checksum verification \
+             (expected {expected_sha256}, got {actual_sha256}). Refusing to link. Delete {} \
+             and retry; if this persists, the release asset or the pin in ghostty_pin.toml \
+             is wrong.",
+            archive_path.display()
+        );
+
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&unpack_dir)
+            .status()
+            .unwrap_or_else(|error| {
+                panic!("ghostty-vt-sys: failed to execute tar: {error}");
+            });
+        assert!(
+            status.success(),
+            "ghostty-vt-sys: tar failed (status {status}) unpacking {}",
+            archive_path.display()
+        );
+        assert!(
+            unpack_dir.join(archive).exists(),
+            "ghostty-vt-sys: expected {archive} in {} after unpacking {asset_name}",
+            unpack_dir.display()
+        );
+
+        std::fs::write(&stamp, expected_sha256)
+            .unwrap_or_else(|error| panic!("ghostty-vt-sys: failed to write stamp: {error}"));
     }
+
+    println!("cargo:rustc-link-search=native={}", unpack_dir.display());
+    println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
 
 enum SourceCheckout {
@@ -406,9 +498,11 @@ fn check_zig_version() {
     );
 }
 
-/// Decide which zig `OptimizeMode` to pass. `LIBGHOSTTY_VT_SYS_OPTIMIZE`
-/// overrides unconditionally; otherwise the cargo profile decides (dev →
-/// Debug, opt-level s/z → ReleaseSmall, else ReleaseFast).
+/// Decide which zig `OptimizeMode` to pass. Always ReleaseFast regardless of
+/// cargo profile — zig-Debug cores degrade `vt_write` ~3000× with non-empty
+/// scrollback (docs/ghostty-migration/spike-findings.md), so a plain dev
+/// build must never silently link a Debug core. `LIBGHOSTTY_VT_SYS_OPTIMIZE`
+/// is the explicit override for debugging inside ghostty.
 fn zig_optimize_mode() -> &'static str {
     if let Ok(mode) = env::var("LIBGHOSTTY_VT_SYS_OPTIMIZE") {
         return match mode.as_str() {
@@ -422,13 +516,7 @@ fn zig_optimize_mode() -> &'static str {
             ),
         };
     }
-    if env::var("DEBUG").as_deref() == Ok("true") {
-        return "Debug";
-    }
-    match env::var("OPT_LEVEL").as_deref() {
-        Ok("s") | Ok("z") => "ReleaseSmall",
-        _ => "ReleaseFast",
-    }
+    "ReleaseFast"
 }
 
 /// Clone ghostty at the pinned commit into OUT_DIR/ghostty-src, reusing an

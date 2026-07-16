@@ -250,6 +250,11 @@ let
 
         NIX_OUTPATH_USED_AS_RANDOM_SEED = "norebuilds";
       }
+      # ghostty_vt_sys is a Linux-only target-specific dependency during the
+      # migration (docs/ghostty-migration/SPEC.md §5).
+      // lib.optionalAttrs stdenv'.hostPlatform.isLinux {
+        GHOSTTY_VT_LIB_DIR = pkgs.callPackage ./ghostty-vt/package.nix { };
+      }
       // lib.optionalAttrs stdenv'.hostPlatform.isDarwin {
         # Link with lld on Darwin. nixpkgs' classic open-source ld64 fails to insert
         # ARM64 branch thunks for this binary, producing `b(l) ARM64 branch out of range`.
