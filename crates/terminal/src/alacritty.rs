@@ -24,20 +24,19 @@ use alacritty_terminal::{
     tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
-        ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
-        NamedPrivateMode, PrivateMode,
+        ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler,
+        NamedPrivateMode, PrivateMode, Processor, StdSyncHandler,
     },
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
-use vte::ansi::{Handler, Processor, StdSyncHandler};
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
-    Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
-    PtyEvent, Range, RenderableCells, Rgb, Scroll, Search, Selection, SelectionRange,
+    Cell, CellExtra, CellFlags, Color, Content, Cursor, CursorShape, Hyperlink, IndexedCell, Modes,
+    Point, PtyEvent, Range, RenderableCells, Rgb, Scroll, Search, Selection, SelectionRange,
     SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
@@ -49,9 +48,7 @@ pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
 pub(super) type AlacrittyTermLock = FairMutex<AlacrittyTerm>;
-pub(super) type AlacrittyCell = AlacCell;
 pub(super) type AlacrittyGridIterator<'a> = GridIterator<'a, AlacCell>;
-pub(super) type AlacrittyHyperlink = AlacHyperlink;
 
 #[derive(Clone)]
 pub(super) struct ZedListener(UnboundedSender<PtyEvent>);
@@ -264,7 +261,7 @@ impl TerminalBackend {
     }
 
     pub(super) fn color(&self, index: usize) -> Option<Rgb> {
-        self.term.lock().colors()[index]
+        self.term.lock().colors()[index].map(Rgb::from_vte)
     }
 
     pub(super) fn resize(&mut self, bounds: TerminalBounds) {
@@ -272,11 +269,15 @@ impl TerminalBackend {
     }
 
     pub(super) fn scroll_display(&mut self, scroll: Scroll) {
-        self.term.lock_unfair().scroll_display(scroll.to_alacritty());
+        self.term
+            .lock_unfair()
+            .scroll_display(scroll.to_alacritty());
     }
 
     pub(super) fn scroll_to_point(&mut self, point: Point) {
-        self.term.lock_unfair().scroll_to_point(point.to_alacritty());
+        self.term
+            .lock_unfair()
+            .scroll_to_point(point.to_alacritty());
     }
 
     pub(super) fn clear(&mut self) {
@@ -511,7 +512,9 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
             AlacTermEvent::ResetTitle => Self::ResetTitle,
             AlacTermEvent::ClipboardStore(_, data) => Self::ClipboardStore(data),
             AlacTermEvent::ClipboardLoad(_, format) => Self::ClipboardLoad(format),
-            AlacTermEvent::ColorRequest(index, format) => Self::ColorRequest(index, format),
+            AlacTermEvent::ColorRequest(index, format) => {
+                Self::ColorRequest(index, Arc::new(move |color: Rgb| format(color.to_vte())))
+            }
             AlacTermEvent::PtyWrite(output) => Self::PtyWrite(output),
             AlacTermEvent::TextAreaSizeRequest(format) => {
                 Self::TextAreaSizeRequest(Arc::new(move |bounds| {
@@ -615,136 +618,49 @@ impl Selection {
     }
 }
 
-impl Hyperlink {
-    pub fn new<T: ToString>(id: Option<T>, uri: String) -> Self {
-        Self {
-            data: HyperlinkData::Owned {
-                id: id.map(|id| Arc::from(id.to_string())),
-                uri: Arc::from(uri),
-            },
-        }
-    }
-
-    pub fn id(&self) -> Option<&str> {
-        match &self.data {
-            HyperlinkData::Alacritty(hyperlink) => Some(hyperlink.id()),
-            HyperlinkData::Owned { id, .. } => id.as_deref(),
-        }
-    }
-
-    pub fn uri(&self) -> &str {
-        match &self.data {
-            HyperlinkData::Alacritty(hyperlink) => hyperlink.uri(),
-            HyperlinkData::Owned { uri, .. } => uri,
-        }
-    }
-
-    fn from_alacritty(hyperlink: AlacHyperlink) -> Self {
-        Self {
-            data: HyperlinkData::Alacritty(hyperlink),
-        }
-    }
-}
-
 fn terminal_hyperlink_from_alacritty(hyperlink: AlacHyperlink) -> Hyperlink {
-    Hyperlink::from_alacritty(hyperlink)
-}
-
-impl From<Hyperlink> for AlacHyperlink {
-    fn from(hyperlink: Hyperlink) -> Self {
-        match hyperlink.data {
-            HyperlinkData::Alacritty(hyperlink) => hyperlink,
-            HyperlinkData::Owned { id, uri } => Self::new(id.as_deref(), uri.to_string()),
-        }
-    }
+    Hyperlink::new(Some(hyperlink.id()), hyperlink.uri().to_string())
 }
 
 fn terminal_cell_from_alacritty(cell: &AlacCell) -> Cell {
-    Cell { cell: cell.clone() }
+    let zerowidth = cell.zerowidth().unwrap_or_default();
+    let hyperlink = cell.hyperlink().map(terminal_hyperlink_from_alacritty);
+    let extra = (!zerowidth.is_empty() || hyperlink.is_some()).then(|| {
+        Arc::new(CellExtra {
+            zerowidth: zerowidth.to_vec(),
+            hyperlink,
+        })
+    });
+
+    Cell {
+        c: cell.c,
+        fg: Color::from_vte(cell.fg),
+        bg: Color::from_vte(cell.bg),
+        flags: terminal_cell_flags_from_alacritty(cell.flags),
+        extra,
+    }
 }
 
-impl Cell {
-    #[inline]
-    pub fn character(&self) -> char {
-        self.cell.c
+fn terminal_cell_flags_from_alacritty(flags: Flags) -> CellFlags {
+    let mut cell_flags = CellFlags::empty();
+    for (alacritty_flag, cell_flag) in [
+        (Flags::INVERSE, CellFlags::INVERSE),
+        (Flags::BOLD, CellFlags::BOLD),
+        (Flags::ITALIC, CellFlags::ITALIC),
+        (Flags::DIM, CellFlags::DIM),
+        (Flags::STRIKEOUT, CellFlags::STRIKEOUT),
+        (Flags::WIDE_CHAR_SPACER, CellFlags::WIDE_CHAR_SPACER),
+        (Flags::UNDERLINE, CellFlags::UNDERLINE),
+        (Flags::DOUBLE_UNDERLINE, CellFlags::DOUBLE_UNDERLINE),
+        (Flags::UNDERCURL, CellFlags::UNDERCURL),
+        (Flags::DOTTED_UNDERLINE, CellFlags::DOTTED_UNDERLINE),
+        (Flags::DASHED_UNDERLINE, CellFlags::DASHED_UNDERLINE),
+    ] {
+        if flags.contains(alacritty_flag) {
+            cell_flags.insert(cell_flag);
+        }
     }
-
-    #[cfg(test)]
-    pub(crate) fn set_character(&mut self, character: char) {
-        self.cell.c = character;
-    }
-
-    #[inline]
-    pub fn foreground(&self) -> Color {
-        self.cell.fg
-    }
-
-    #[inline]
-    pub fn background(&self) -> Color {
-        self.cell.bg
-    }
-
-    #[inline]
-    pub fn zerowidth(&self) -> Option<&[char]> {
-        self.cell.zerowidth()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push_zerowidth(&mut self, character: char) {
-        self.cell.push_zerowidth(character);
-    }
-
-    #[inline]
-    pub fn hyperlink(&self) -> Option<Hyperlink> {
-        self.cell.hyperlink().map(terminal_hyperlink_from_alacritty)
-    }
-
-    #[inline]
-    pub fn is_inverse(&self) -> bool {
-        self.cell.flags.contains(Flags::INVERSE)
-    }
-
-    #[inline]
-    pub fn is_wide_char_spacer(&self) -> bool {
-        self.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-    }
-
-    #[inline]
-    pub fn is_dim(&self) -> bool {
-        self.cell.flags.intersects(Flags::DIM)
-    }
-
-    #[inline]
-    pub fn has_underline(&self) -> bool {
-        self.cell.flags.intersects(Flags::ALL_UNDERLINES)
-    }
-
-    #[inline]
-    pub fn has_undercurl(&self) -> bool {
-        self.cell.flags.contains(Flags::UNDERCURL)
-    }
-
-    #[inline]
-    pub fn has_strikeout(&self) -> bool {
-        self.cell.flags.intersects(Flags::STRIKEOUT)
-    }
-
-    #[inline]
-    pub fn is_bold(&self) -> bool {
-        self.cell.flags.intersects(Flags::BOLD)
-    }
-
-    #[inline]
-    pub fn is_italic(&self) -> bool {
-        self.cell.flags.intersects(Flags::ITALIC)
-    }
-
-    #[inline]
-    pub fn has_visible_style_modifier(&self) -> bool {
-        self.cell
-            .flags
-            .intersects(Flags::ALL_UNDERLINES | Flags::INVERSE | Flags::STRIKEOUT)
-    }
+    cell_flags
 }
 
 impl<'a> RenderableCells<'a> {
@@ -1153,31 +1069,31 @@ fn all_search_matches<'a, T>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
+    // The former `terminal_hyperlink_from_alacritty_keeps_alacritty_storage` and
+    // `terminal_cell_from_alacritty_shares_extra_storage` tests asserted that
+    // conversion shared alacritty's Arc storage; owned domain types copy at
+    // snapshot build instead. Retired via
+    // docs/ghostty-migration/divergence-ledger.md (P2-001, P2-002); the
+    // semantic halves of those round-trips continue below.
     #[test]
-    fn terminal_hyperlink_from_alacritty_keeps_alacritty_storage() {
+    fn terminal_hyperlink_from_alacritty_preserves_id_and_uri() {
         let hyperlink = AlacHyperlink::new(Some("id"), "https://example.com".to_string());
         let hyperlink = terminal_hyperlink_from_alacritty(hyperlink);
 
-        assert!(matches!(&hyperlink.data, HyperlinkData::Alacritty(_)));
         assert_eq!(hyperlink.id(), Some("id"));
         assert_eq!(hyperlink.uri(), "https://example.com");
     }
 
     #[test]
-    fn terminal_cell_from_alacritty_shares_extra_storage() {
+    fn terminal_cell_from_alacritty_preserves_zerowidth() {
         let mut cell = AlacCell::default();
         cell.push_zerowidth('a');
 
         let converted = terminal_cell_from_alacritty(&cell);
 
-        match (&cell.extra, &converted.cell.extra) {
-            (Some(extra), Some(converted_extra)) => assert!(Arc::ptr_eq(extra, converted_extra)),
-            _ => panic!("expected extra storage on both cells"),
-        }
+        assert_eq!(converted.zerowidth(), Some(&['a'][..]));
     }
 
     #[test]

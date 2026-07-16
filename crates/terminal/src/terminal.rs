@@ -50,7 +50,6 @@ use std::{
 };
 use thiserror::Error;
 use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
-pub use vte::ansi::{Color, NamedColor, Rgb};
 
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
@@ -61,10 +60,10 @@ use gpui::{
 #[cfg(not(windows))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
-    AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, HyperlinkMatch,
-    PtySender, RegexSearches, StreamIngest, TerminalBackend, open_pty, pty_options,
+    AlacrittyGridIterator, AlacrittySearch, HyperlinkMatch, PtySender, RegexSearches, StreamIngest,
+    TerminalBackend, open_pty, pty_options,
 };
-use crate::mappings::colors::to_vte_rgb;
+use crate::mappings::colors::to_rgb;
 use crate::mappings::keys::to_esc_str;
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
@@ -168,6 +167,125 @@ impl Selection {
     }
 }
 
+/// Zed-owned mirror of the ANSI color contract (SPEC.md §4.2, #31): identical
+/// in shape to the vte types it replaces so downstream crates compile
+/// unmodified, but independent of any terminal core. Backends convert into
+/// these at snapshot build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Color {
+    Named(NamedColor),
+    Spec(Rgb),
+    Indexed(u8),
+}
+
+/// Standard colors.
+///
+/// The order here matters since the enum should be castable to a `usize` for
+/// indexing a color list.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum NamedColor {
+    Black = 0,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    Foreground = 256,
+    Background,
+    Cursor,
+    DimBlack,
+    DimRed,
+    DimGreen,
+    DimYellow,
+    DimBlue,
+    DimMagenta,
+    DimCyan,
+    DimWhite,
+    BrightForeground,
+    DimForeground,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    pub(crate) fn from_vte(color: vte::ansi::Color) -> Self {
+        match color {
+            vte::ansi::Color::Named(named) => Self::Named(NamedColor::from_vte(named)),
+            vte::ansi::Color::Spec(rgb) => Self::Spec(Rgb::from_vte(rgb)),
+            vte::ansi::Color::Indexed(index) => Self::Indexed(index),
+        }
+    }
+}
+
+impl NamedColor {
+    pub(crate) fn from_vte(color: vte::ansi::NamedColor) -> Self {
+        match color {
+            vte::ansi::NamedColor::Black => Self::Black,
+            vte::ansi::NamedColor::Red => Self::Red,
+            vte::ansi::NamedColor::Green => Self::Green,
+            vte::ansi::NamedColor::Yellow => Self::Yellow,
+            vte::ansi::NamedColor::Blue => Self::Blue,
+            vte::ansi::NamedColor::Magenta => Self::Magenta,
+            vte::ansi::NamedColor::Cyan => Self::Cyan,
+            vte::ansi::NamedColor::White => Self::White,
+            vte::ansi::NamedColor::BrightBlack => Self::BrightBlack,
+            vte::ansi::NamedColor::BrightRed => Self::BrightRed,
+            vte::ansi::NamedColor::BrightGreen => Self::BrightGreen,
+            vte::ansi::NamedColor::BrightYellow => Self::BrightYellow,
+            vte::ansi::NamedColor::BrightBlue => Self::BrightBlue,
+            vte::ansi::NamedColor::BrightMagenta => Self::BrightMagenta,
+            vte::ansi::NamedColor::BrightCyan => Self::BrightCyan,
+            vte::ansi::NamedColor::BrightWhite => Self::BrightWhite,
+            vte::ansi::NamedColor::Foreground => Self::Foreground,
+            vte::ansi::NamedColor::Background => Self::Background,
+            vte::ansi::NamedColor::Cursor => Self::Cursor,
+            vte::ansi::NamedColor::DimBlack => Self::DimBlack,
+            vte::ansi::NamedColor::DimRed => Self::DimRed,
+            vte::ansi::NamedColor::DimGreen => Self::DimGreen,
+            vte::ansi::NamedColor::DimYellow => Self::DimYellow,
+            vte::ansi::NamedColor::DimBlue => Self::DimBlue,
+            vte::ansi::NamedColor::DimMagenta => Self::DimMagenta,
+            vte::ansi::NamedColor::DimCyan => Self::DimCyan,
+            vte::ansi::NamedColor::DimWhite => Self::DimWhite,
+            vte::ansi::NamedColor::BrightForeground => Self::BrightForeground,
+            vte::ansi::NamedColor::DimForeground => Self::DimForeground,
+        }
+    }
+}
+
+impl Rgb {
+    pub(crate) fn from_vte(rgb: vte::ansi::Rgb) -> Self {
+        Self {
+            r: rgb.r,
+            g: rgb.g,
+            b: rgb.b,
+        }
+    }
+
+    pub(crate) fn to_vte(self) -> vte::ansi::Rgb {
+        vte::ansi::Rgb {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+        }
+    }
+}
+
 pub fn is_default_background_color(color: Color) -> bool {
     matches!(color, Color::Named(NamedColor::Background))
 }
@@ -268,10 +386,10 @@ impl Handler for StyledAnsiTextHandler {
     fn terminal_attribute(&mut self, attr: Attr) {
         match attr {
             Attr::Foreground(color) => {
-                self.break_foreground_span(Some(color));
+                self.break_foreground_span(Some(Color::from_vte(color)));
             }
             Attr::Background(color) => {
-                self.break_background_span(Some(color));
+                self.break_background_span(Some(Color::from_vte(color)));
             }
             Attr::Reset => {
                 self.break_foreground_span(None);
@@ -309,18 +427,192 @@ impl Handler for PlainAnsiTextHandler {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Hyperlink {
-    data: HyperlinkData,
+    id: Option<Arc<str>>,
+    uri: Arc<str>,
 }
 
+impl Hyperlink {
+    pub fn new<T: ToString>(id: Option<T>, uri: String) -> Self {
+        Self {
+            id: id.map(|id| Arc::from(id.to_string())),
+            uri: Arc::from(uri),
+        }
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+/// Zed-owned terminal cell (SPEC.md §4.2, S2): plain owned storage with the
+/// rare per-cell data (grapheme tail, hyperlink) behind one shared allocation.
+/// Backends materialize these at snapshot build.
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum HyperlinkData {
-    Alacritty(AlacrittyHyperlink),
-    Owned { id: Option<Arc<str>>, uri: Arc<str> },
+pub struct Cell {
+    pub(crate) c: char,
+    pub(crate) fg: Color,
+    pub(crate) bg: Color,
+    pub(crate) flags: CellFlags,
+    pub(crate) extra: Option<Arc<CellExtra>>,
 }
 
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
-pub struct Cell {
-    cell: AlacrittyCell,
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            c: ' ',
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: CellFlags::empty(),
+            extra: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CellExtra {
+    pub(crate) zerowidth: Vec<char>,
+    pub(crate) hyperlink: Option<Hyperlink>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CellFlags(u16);
+
+impl CellFlags {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const INVERSE: Self = Self(1 << 0);
+    pub(crate) const BOLD: Self = Self(1 << 1);
+    pub(crate) const ITALIC: Self = Self(1 << 2);
+    pub(crate) const DIM: Self = Self(1 << 3);
+    pub(crate) const STRIKEOUT: Self = Self(1 << 4);
+    pub(crate) const WIDE_CHAR_SPACER: Self = Self(1 << 5);
+    pub(crate) const UNDERLINE: Self = Self(1 << 6);
+    pub(crate) const DOUBLE_UNDERLINE: Self = Self(1 << 7);
+    pub(crate) const UNDERCURL: Self = Self(1 << 8);
+    pub(crate) const DOTTED_UNDERLINE: Self = Self(1 << 9);
+    pub(crate) const DASHED_UNDERLINE: Self = Self(1 << 10);
+    pub(crate) const ALL_UNDERLINES: Self = Self(
+        Self::UNDERLINE.0
+            | Self::DOUBLE_UNDERLINE.0
+            | Self::UNDERCURL.0
+            | Self::DOTTED_UNDERLINE.0
+            | Self::DASHED_UNDERLINE.0,
+    );
+
+    pub(crate) const fn empty() -> Self {
+        Self::NONE
+    }
+
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub(crate) const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub(crate) fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl Cell {
+    #[inline]
+    pub fn character(&self) -> char {
+        self.c
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_character(&mut self, character: char) {
+        self.c = character;
+    }
+
+    #[inline]
+    pub fn foreground(&self) -> Color {
+        self.fg
+    }
+
+    #[inline]
+    pub fn background(&self) -> Color {
+        self.bg
+    }
+
+    #[inline]
+    pub fn zerowidth(&self) -> Option<&[char]> {
+        self.extra
+            .as_deref()
+            .map(|extra| extra.zerowidth.as_slice())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_zerowidth(&mut self, character: char) {
+        let extra = self.extra.get_or_insert_with(Default::default);
+        Arc::make_mut(extra).zerowidth.push(character);
+    }
+
+    #[inline]
+    pub fn hyperlink(&self) -> Option<Hyperlink> {
+        self.extra
+            .as_deref()
+            .and_then(|extra| extra.hyperlink.clone())
+    }
+
+    #[inline]
+    pub fn is_inverse(&self) -> bool {
+        self.flags.contains(CellFlags::INVERSE)
+    }
+
+    #[inline]
+    pub fn is_wide_char_spacer(&self) -> bool {
+        self.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+    }
+
+    #[inline]
+    pub fn is_dim(&self) -> bool {
+        self.flags.intersects(CellFlags::DIM)
+    }
+
+    #[inline]
+    pub fn has_underline(&self) -> bool {
+        self.flags.intersects(CellFlags::ALL_UNDERLINES)
+    }
+
+    #[inline]
+    pub fn has_undercurl(&self) -> bool {
+        self.flags.contains(CellFlags::UNDERCURL)
+    }
+
+    #[inline]
+    pub fn has_strikeout(&self) -> bool {
+        self.flags.intersects(CellFlags::STRIKEOUT)
+    }
+
+    #[inline]
+    pub fn is_bold(&self) -> bool {
+        self.flags.intersects(CellFlags::BOLD)
+    }
+
+    #[inline]
+    pub fn is_italic(&self) -> bool {
+        self.flags.intersects(CellFlags::ITALIC)
+    }
+
+    #[inline]
+    pub fn has_visible_style_modifier(&self) -> bool {
+        self.flags
+            .intersects(CellFlags::ALL_UNDERLINES | CellFlags::INVERSE | CellFlags::STRIKEOUT)
+    }
+}
+
+impl BitOr for CellFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
 }
 
 pub struct RenderableCells<'a> {
@@ -577,7 +869,7 @@ mod domain_tests {
 
         let clone = cell.clone();
 
-        match (&cell.cell.extra, &clone.cell.extra) {
+        match (&cell.extra, &clone.extra) {
             (Some(extra), Some(clone_extra)) => assert!(Arc::ptr_eq(extra, clone_extra)),
             _ => panic!("expected extra storage on both cells"),
         }
@@ -1573,7 +1865,7 @@ impl Terminal {
                 let color = self
                     .backend
                     .color(index)
-                    .unwrap_or_else(|| to_vte_rgb(get_color_at_index(index, cx.theme().as_ref())));
+                    .unwrap_or_else(|| to_rgb(get_color_at_index(index, cx.theme().as_ref())));
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
