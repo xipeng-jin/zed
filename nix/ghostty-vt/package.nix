@@ -16,6 +16,8 @@ let
   sha256s = {
     "x86_64-unknown-linux-gnu" = "47896301eb32f113169385815b469a7534cc90b32ac6136aaa744e0d4fd38530";
     "aarch64-unknown-linux-gnu" = "fbe83b84646c8100e5e1580f4daf20a6eb3a85ece838c137bc7c0d55c0082412";
+    "x86_64-unknown-linux-musl" = "2f5c46ced9f497421f925a446eec7196d286177f1f6b180ff5314a864ae4333b";
+    "aarch64-unknown-linux-musl" = "053a1be4760e3bbd8be865b72f07fb8d51a5b636123b991ef635961b927cb3b4";
   };
 in
 stdenvNoCC.mkDerivation {

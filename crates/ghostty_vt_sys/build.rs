@@ -113,8 +113,15 @@ fn parse_pin(contents: &str) -> Pin {
         }
     }
 
+    let commit = commit.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'commit'");
+    assert!(
+        commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "ghostty-vt-sys: 'commit' in ghostty_pin.toml must be a full 40-char hex commit \
+         (got '{commit}')"
+    );
+
     Pin {
-        commit: commit.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'commit'"),
+        commit,
         release: release.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'release'"),
         prebuilt_repo: prebuilt_repo
             .expect("ghostty-vt-sys: ghostty_pin.toml is missing 'prebuilt_repo'"),
@@ -140,6 +147,10 @@ fn link_prebuilt_dir(dir: &Path, target: &str) {
         "ghostty-vt-sys: GHOSTTY_VT_LIB_DIR is set to {} but it does not contain {archive}",
         dir.display()
     );
+    emit_link_directives(dir);
+}
+
+fn emit_link_directives(dir: &Path) {
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
@@ -167,13 +178,10 @@ fn fetch_prebuilt(pin: &Pin, target: &str) {
     };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
-    let commit10 = pin.commit.get(..10).unwrap_or_else(|| {
-        panic!(
-            "ghostty-vt-sys: 'commit' in ghostty_pin.toml must be a full 40-char commit \
-             (got '{}')",
-            pin.commit
-        )
-    });
+    let commit10 = pin
+        .commit
+        .get(..10)
+        .expect("commit length is validated in parse_pin");
     let archive = static_archive_name(target);
     let asset_name = format!("libghostty-vt-{commit10}-{target}.tar.gz");
     let unpack_dir = out_dir.join("ghostty-prebuilt");
@@ -274,8 +282,7 @@ fn fetch_prebuilt(pin: &Pin, target: &str) {
             .unwrap_or_else(|error| panic!("ghostty-vt-sys: failed to write stamp: {error}"));
     }
 
-    println!("cargo:rustc-link-search=native={}", unpack_dir.display());
-    println!("cargo:rustc-link-lib=static=ghostty-vt");
+    emit_link_directives(&unpack_dir);
 }
 
 enum SourceCheckout {
