@@ -6660,7 +6660,7 @@ dependencies = [
 [[package]]
 name = "filedescriptor"
 version = "0.8.3"
-source = "git+https://github.com/wezterm/wezterm?rev=8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56#8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56"
+source = "git+https://github.com/xipeng-jin/wezterm?rev=9440d988003e8ed15e170988b503815fbd61498c#9440d988003e8ed15e170988b503815fbd61498c"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
@@ -13807,12 +13807,12 @@ dependencies = [
 [[package]]
 name = "portable-pty"
 version = "0.9.0"
-source = "git+https://github.com/wezterm/wezterm?rev=8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56#8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56"
+source = "git+https://github.com/xipeng-jin/wezterm?rev=9440d988003e8ed15e170988b503815fbd61498c#9440d988003e8ed15e170988b503815fbd61498c"
 dependencies = [
  "anyhow",
  "bitflags 1.3.2",
  "downcast-rs",
- "filedescriptor 0.8.3 (git+https://github.com/wezterm/wezterm?rev=8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56)",
+ "filedescriptor 0.8.3 (git+https://github.com/xipeng-jin/wezterm?rev=9440d988003e8ed15e170988b503815fbd61498c)",
  "lazy_static",
  "libc",
  "log",

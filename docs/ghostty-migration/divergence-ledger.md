@@ -249,19 +249,25 @@ found by inspection, per the P3 precedent.
   task") exercises this; if it bites, the documented exit is a raw-cmdline
   patch in the portable-pty fork-or-vendor path (D1's exit strategy).
   `util::shell::ShellKind::tty_escape_args` is dead code until then.
-- **P4 CI evidence (2026-07-17)**: on `windows-latest`, `cmd.exe /C …`
-  under this ConPTY spawn path wedges regardless of quoting — with a
-  quoted spaced argument *and* with split space-free arguments
-  (`/C exit 42`), the session emitted only a VT preamble, the command
-  never executed, and the child stayed alive indefinitely; after
-  `TerminateProcess` a wedged session also withheld reader EOF past
-  pseudoconsole close (instrumented `pty_integration` runs `d6d58ce20a`,
-  `59dbb19b8e`). Interactive `cmd.exe` and directly-spawned executables
-  (`ping.exe` with args) behave normally, and the PTY suite uses only
-  those. Whether this reproduces outside the GitHub runner image is a
-  §8.2 gate question; until it resolves, `ShellKind::Cmd` task spawning
-  should be assumed broken on Windows and the raw-cmdline/fork exit
-  (D1's exit strategy) is the standing remedy.
+- **P4 CI evidence and root cause (2026-07-17)**: the `pty_integration`
+  ConPTY suite initially wedged for every child that writes through its
+  std handles (`cmd.exe /C …` quoted or not, direct `ping.exe`): only a VT
+  preamble arrived, the command never executed, and a terminated wedged
+  session also withheld reader EOF past pseudoconsole close (instrumented
+  runs `d6d58ce20a` … `7173dd4384`). Root cause — not the quoting:
+  portable-pty's `psuedocon.rs` spawns ConPTY children with
+  `STARTF_USESTDHANDLES` + `INVALID_HANDLE_VALUE` std handles, which under
+  the kernel32 `CreatePseudoConsole` path (no sideloaded conpty.dll —
+  i.e. every stock Windows machine) leaves the child with unusable std
+  handles; wezterm never sees this because it always sideloads its own
+  OpenConsole. Alacritty sets the same flag with **null** handles, which
+  both blocks handle inheritance and lets the pseudoconsole supply the
+  console handles. **Fixed via D1's exit strategy**: portable-pty is now
+  pinned to the Zed fork (`xipeng-jin/wezterm@9440d98800` = wezterm#7709
+  merge + the null-std-handles patch), restoring alacritty-parity spawn
+  behavior; upstreaming the patch rides with the crates.io-return
+  post-removal item. The original quoting divergence above still stands
+  for the §8.2 gate.
 
 ## P4-002 — Missing or invalid working directory falls back to `$HOME` (unix)
 
