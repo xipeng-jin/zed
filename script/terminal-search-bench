@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs the max-scrollback grid-search extraction benchmark (SPEC.md §4.4,
+# ticket #35 §4) in release mode: bulk extract + wrap-flag line map at the
+# maximum configured scrollback, plus the regex and byte↔cell map stages.
+# The extraction number is the foreground-stall figure that gates any future
+# cache retrofit.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo test -p terminal --release --lib -- --ignored --nocapture \
+    ghostty::grid_search::tests::max_scrollback_extraction_benchmark

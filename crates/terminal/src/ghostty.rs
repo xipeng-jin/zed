@@ -4,6 +4,8 @@
 //! swap only re-points one import and the construction call. The P6 gap
 //! fills (grid search, hover pipeline, vi mode) extend this surface.
 
+mod grid_search;
+
 use std::{
     cell::{Cell as StdCell, RefCell},
     collections::VecDeque,
@@ -560,6 +562,20 @@ impl TerminalBackend {
             modes.insert(Modes::VI);
         }
         modes
+    }
+
+    /// The foreground extract stage of the `find_matches` sandwich
+    /// (SPEC.md §4.4): one bulk buffer extract plus the wrap-flag line map,
+    /// packaged with the query so the regex stage can leave the thread.
+    pub(super) fn prepare_search(&self, query: grid_search::SearchQuery) -> grid_search::PreparedSearch {
+        grid_search::PreparedSearch::new(query, grid_search::extract_logical_lines(&self.terminal))
+    }
+
+    /// The foreground map stage of the `find_matches` sandwich: byte↔cell
+    /// walks over match rows only, with matches leaving Screen space for the
+    /// grid convention at this exit (S3).
+    pub(super) fn search_matches(&self, found: grid_search::FoundMatches) -> Vec<Range> {
+        grid_search::resolve_matches(&self.terminal, found)
     }
 
     /// Jump to the far cell of a wide character, mirroring alacritty's
