@@ -1,9 +1,13 @@
 # P4 acceptance gate (docs/ghostty-migration/SPEC.md §6): the PTY integration
 # suite (spawn/resize/kill/exit) must be green on Linux and Windows CI,
 # including the §8.2 ConPTY shutdown/exit/kill tests. Linux runs the full
-# terminal crate suite (the Class B proof rides along). The Windows job is
-# temporarily narrowed to paired direct portable-pty controls to determine
-# whether GitHub-hosted ConPTY fails independently of GPUI and the PTY seam.
+# terminal crate suite (the Class B proof rides along).
+#
+# The Windows job is advisory on this fork. GitHub-hosted Windows runners
+# starve inside portable-pty even in a standalone crate that does not link
+# GPUI (xipeng-jin/zed Actions run 29603970998). Binding Windows acceptance
+# must run on upstream's self-hosted Windows runners and the SPEC §8.2
+# real-hardware gate. Do not treat this allowed-to-fail job as gate evidence.
 #
 # Hand-written (not xtask-generated): it must run on this fork, where the
 # xtask-generated workflows are guarded to zed-industries and use Namespace
@@ -42,9 +46,11 @@ jobs:
           key: pty-integration-linux-${{ hashFiles('Cargo.lock') }}
       - name: run terminal crate tests (includes the PTY integration suite)
         run: cargo test -p terminal --lib
-  conpty_controls_windows:
+  conpty_tests_windows_advisory:
+    name: ConPTY suite (advisory on GitHub-hosted Windows)
     runs-on: windows-latest
-    timeout-minutes: 35
+    continue-on-error: true
+    timeout-minutes: 45
     env:
       # cargo's bundled libgit2 cannot handle > MAX_PATH checkout paths (the
       # python-environment-tools test fixtures exceed it); the git CLI with
@@ -69,14 +75,9 @@ jobs:
             ~/.cargo/git
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
-      - name: run direct portable-pty control in the terminal test binary
-        timeout-minutes: 15
-        run: "cargo test -p terminal --lib pty::tests::conpty_direct_portable_pty_control -- --exact --nocapture"
-        shell: pwsh
-      - name: run direct portable-pty control without GPUI
-        if: always()
-        timeout-minutes: 15
-        run: "cargo test -p conpty_control --lib tests::conpty_direct_portable_pty_control -- --exact --nocapture"
+      - name: run PTY seam suite against ConPTY (advisory)
+        timeout-minutes: 30
+        run: "cargo test -p terminal --lib pty::"
         shell: pwsh
       - name: cleanup cargo config
         if: always()
