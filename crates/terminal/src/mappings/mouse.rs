@@ -7,11 +7,15 @@ use gpui::{Modifiers, MouseButton, Pixels, Point as GpuiPoint, ScrollWheelEvent,
 
 use crate::{Modes, Point, SelectionSide, TerminalBounds};
 
+// Alacritty-era wire formats: production on macOS/Windows, contract-test
+// oracle on Linux. Deleted at P10.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 enum MouseFormat {
     Sgr,
     Normal(bool),
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl MouseFormat {
     fn from_mode(mode: Modes) -> Self {
         if mode.contains(Modes::SGR_MOUSE) {
@@ -83,14 +87,8 @@ pub(crate) fn scroll_report(
     mode: Modes,
 ) -> Option<impl Iterator<Item = Vec<u8>>> {
     if mode.intersects(Modes::MOUSE_MODE) {
-        mouse_report(
-            point,
-            MouseButtonCode::from_scroll(e),
-            true,
-            e.modifiers,
-            MouseFormat::from_mode(mode),
-        )
-        .map(|report| repeat(report).take(scroll_lines.unsigned_abs() as usize))
+        mouse_report(point, MouseButtonCode::from_scroll(e), true, e.modifiers, mode)
+            .map(|report| repeat(report).take(scroll_lines.unsigned_abs() as usize))
     } else {
         None
     }
@@ -119,6 +117,324 @@ mod tests {
         assert_eq!(reports.len(), 3);
     }
 
+    /// Permanent byte-level contract suite on the mouse wire formats
+    /// (SPEC.md §4.3): expectations are the alacritty-era bytes. On Linux
+    /// this exercises the ghostty `mouse::Encoder`; elsewhere the legacy
+    /// formats, so the expectations hold everywhere by construction.
+    mod contract {
+        use super::*;
+        use gpui::MouseButton;
+
+        const CLICK: Modes = Modes::MOUSE_REPORT_CLICK;
+
+        fn sgr(mode: Modes) -> Modes {
+            mode | Modes::SGR_MOUSE
+        }
+
+        fn utf8(mode: Modes) -> Modes {
+            mode | Modes::UTF8_MOUSE
+        }
+
+        #[track_caller]
+        fn assert_button_report(
+            point: Point,
+            button: MouseButton,
+            modifiers: Modifiers,
+            pressed: bool,
+            mode: Modes,
+            expected: Option<&[u8]>,
+        ) {
+            let actual = mouse_button_report(point, button, modifiers, pressed, mode);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "button {button:?} pressed {pressed} at {point:?} in {mode:?}"
+            );
+        }
+
+        fn shift() -> Modifiers {
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn normal_format_press_release() {
+            let point = Point::new(3, 5);
+            // 32+button, 32+1+column, 32+1+line
+            assert_button_report(
+                point,
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                CLICK,
+                Some(b"\x1b[M &$"),
+            );
+            assert_button_report(
+                point,
+                MouseButton::Left,
+                Modifiers::default(),
+                false,
+                CLICK,
+                Some(b"\x1b[M#&$"),
+            );
+            assert_button_report(
+                point,
+                MouseButton::Middle,
+                Modifiers::default(),
+                true,
+                CLICK,
+                Some(b"\x1b[M!&$"),
+            );
+            assert_button_report(
+                point,
+                MouseButton::Right,
+                shift(),
+                true,
+                CLICK,
+                Some(b"\x1b[M&&$"),
+            );
+            let ctrl_alt = Modifiers {
+                control: true,
+                alt: true,
+                ..Default::default()
+            };
+            // middle (1) + alt (8) + ctrl (16) = 25; 32+25 = '9'
+            assert_button_report(
+                point,
+                MouseButton::Middle,
+                ctrl_alt,
+                true,
+                CLICK,
+                Some(b"\x1b[M9&$"),
+            );
+        }
+
+        #[test]
+        fn no_report_without_mouse_mode() {
+            assert_button_report(
+                Point::new(3, 5),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                Modes::NONE,
+                None,
+            );
+        }
+
+        #[test]
+        fn no_report_above_viewport() {
+            assert_button_report(
+                Point::new(-1, 5),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                CLICK,
+                None,
+            );
+        }
+
+        #[test]
+        fn normal_format_coordinate_cap() {
+            // Columns/lines at 222 encode as the last single byte (255);
+            // beyond the cap no report is produced.
+            let at_cap = Point::new(3, 222);
+            let report = mouse_button_report(
+                at_cap,
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                CLICK,
+            )
+            .unwrap();
+            assert_eq!(report, vec![0x1b, b'[', b'M', 32, 255, 36]);
+
+            let beyond = Point::new(3, 223);
+            assert_button_report(
+                beyond,
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                CLICK,
+                None,
+            );
+        }
+
+        #[test]
+        fn utf8_format_wide_coordinates() {
+            // Below 95 stays single-byte...
+            let report = mouse_button_report(
+                Point::new(3, 94),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                utf8(CLICK),
+            )
+            .unwrap();
+            assert_eq!(report, vec![0x1b, b'[', b'M', 32, 0x7f, 36]);
+
+            // ...from 95 the coordinate is two-byte encoded.
+            let report = mouse_button_report(
+                Point::new(3, 100),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                utf8(CLICK),
+            )
+            .unwrap();
+            assert_eq!(report, vec![0x1b, b'[', b'M', 32, 0xc2, 0x85, 36]);
+
+            // The two-byte range tops out at 2014...
+            let report = mouse_button_report(
+                Point::new(3, 2014),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                utf8(CLICK),
+            );
+            assert!(report.is_some());
+
+            // ...beyond it the alacritty-era format dropped the report, while
+            // ghostty continues with three-byte UTF-8 (adjudicated divergence
+            // P3-009 in the divergence ledger).
+            let beyond = mouse_button_report(
+                Point::new(3, 2015),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                utf8(CLICK),
+            );
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                beyond.as_deref(),
+                Some([0x1b, b'[', b'M', 32, 0xe0, 0xa0, 0x80, 36].as_slice())
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(beyond, None);
+        }
+
+        #[test]
+        fn sgr_format() {
+            let point = Point::new(3, 5);
+            assert_button_report(
+                point,
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                sgr(CLICK),
+                Some(b"\x1b[<0;6;4M"),
+            );
+            assert_button_report(
+                point,
+                MouseButton::Left,
+                Modifiers::default(),
+                false,
+                sgr(CLICK),
+                Some(b"\x1b[<0;6;4m"),
+            );
+            assert_button_report(
+                point,
+                MouseButton::Right,
+                shift(),
+                true,
+                sgr(CLICK),
+                Some(b"\x1b[<6;6;4M"),
+            );
+            // SGR has no coordinate cap.
+            assert_button_report(
+                Point::new(4000, 5000),
+                MouseButton::Left,
+                Modifiers::default(),
+                true,
+                sgr(CLICK),
+                Some(b"\x1b[<0;5001;4001M"),
+            );
+        }
+
+        #[test]
+        fn motion_reports() {
+            let point = Point::new(3, 5);
+            // Motion with a held button: 32 + 32.
+            assert_eq!(
+                mouse_moved_report(
+                    point,
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                    Modes::MOUSE_MOTION,
+                )
+                .as_deref(),
+                Some(b"\x1b[M@&$".as_slice()),
+            );
+            // Motion without a button: code 35.
+            assert_eq!(
+                mouse_moved_report(point, None, Modifiers::default(), Modes::MOUSE_MOTION)
+                    .as_deref(),
+                Some(b"\x1b[MC&$".as_slice()),
+            );
+            assert_eq!(
+                mouse_moved_report(
+                    point,
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                    sgr(Modes::MOUSE_MOTION),
+                )
+                .as_deref(),
+                Some(b"\x1b[<32;6;4M".as_slice()),
+            );
+            // Drag mode only reports motion while a button is held.
+            assert_eq!(
+                mouse_moved_report(point, None, Modifiers::default(), Modes::MOUSE_DRAG),
+                None,
+            );
+            assert_eq!(
+                mouse_moved_report(
+                    point,
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                    Modes::MOUSE_DRAG,
+                )
+                .as_deref(),
+                Some(b"\x1b[M@&$".as_slice()),
+            );
+        }
+
+        #[test]
+        fn scroll_wire_format() {
+            use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+
+            let up_event = ScrollWheelEvent {
+                delta: ScrollDelta::Lines(point(0., 1.)),
+                touch_phase: TouchPhase::Moved,
+                ..Default::default()
+            };
+            let down_event = ScrollWheelEvent {
+                delta: ScrollDelta::Lines(point(0., -1.)),
+                touch_phase: TouchPhase::Moved,
+                ..Default::default()
+            };
+            let grid_point = Point::new(3, 5);
+
+            // Wheel buttons are 64/65.
+            let reports: Vec<Vec<u8>> = scroll_report(grid_point, 2, &up_event, CLICK)
+                .unwrap()
+                .collect();
+            assert_eq!(reports, vec![b"\x1b[M`&$".to_vec(), b"\x1b[M`&$".to_vec()]);
+
+            let reports: Vec<Vec<u8>> = scroll_report(grid_point, -1, &down_event, sgr(CLICK))
+                .unwrap()
+                .collect();
+            assert_eq!(reports, vec![b"\x1b[<65;6;4M".to_vec()]);
+        }
+
+        #[test]
+        fn alt_scroll_arrows() {
+            assert_eq!(alt_scroll(3), b"\x1bOA\x1bOA\x1bOA".to_vec());
+            assert_eq!(alt_scroll(-2), b"\x1bOB\x1bOB".to_vec());
+            assert_eq!(alt_scroll(0), Vec::<u8>::new());
+        }
+    }
+
     #[test]
     fn scroll_report_repeats_for_positive_scroll_lines() {
         let grid_point = Point::new(0, 0);
@@ -139,6 +455,17 @@ mod tests {
 }
 
 pub(crate) fn alt_scroll(scroll_lines: i32) -> Vec<u8> {
+    #[cfg(target_os = "linux")]
+    if let Some(arrow) = super::keys::ghostty_scroll_arrow_bytes(scroll_lines > 0) {
+        return arrow.repeat(scroll_lines.unsigned_abs() as usize);
+    }
+
+    legacy_alt_scroll(scroll_lines)
+}
+
+// Alacritty-era path; on Linux only the fallback for encoder-construction
+// failure. Deleted at P10.
+fn legacy_alt_scroll(scroll_lines: i32) -> Vec<u8> {
     let cmd = if scroll_lines > 0 { b'A' } else { b'B' };
 
     let mut content = Vec::with_capacity(scroll_lines.unsigned_abs() as usize * 3);
@@ -159,13 +486,7 @@ pub(crate) fn mouse_button_report(
 ) -> Option<Vec<u8>> {
     let button = MouseButtonCode::from_button(button);
     if !button.is_other() && mode.intersects(Modes::MOUSE_MODE) {
-        mouse_report(
-            point,
-            button,
-            pressed,
-            modifiers,
-            MouseFormat::from_mode(mode),
-        )
+        mouse_report(point, button, pressed, modifiers, mode)
     } else {
         None
     }
@@ -184,7 +505,7 @@ pub(crate) fn mouse_moved_report(
         if mode.contains(Modes::MOUSE_DRAG) && matches!(button, MouseButtonCode::NoneMove) {
             None
         } else {
-            mouse_report(point, button, true, modifiers, MouseFormat::from_mode(mode))
+            mouse_report(point, button, true, modifiers, mode)
         }
     } else {
         None
@@ -236,17 +557,128 @@ pub(crate) fn grid_point_and_side(
 }
 
 ///Generate the bytes to send to the terminal, from the cell location, a mouse event, and the terminal mode
+///
+/// Zed keeps the policy layer (mode gating, grid math, jitter/dedup); on
+/// Linux the wire bytes come from ghostty's `mouse::Encoder` (SPEC.md §4.3),
+/// elsewhere from the alacritty-era formats until the §8 platform gates open.
 fn mouse_report(
+    point: Point,
+    button: MouseButtonCode,
+    pressed: bool,
+    modifiers: Modifiers,
+    mode: Modes,
+) -> Option<Vec<u8>> {
+    if point.line < 0 {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ghostty_mouse_report(point, button, pressed, modifiers, mode)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        legacy_mouse_report(point, button, pressed, modifiers, MouseFormat::from_mode(mode))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ghostty_mouse_report(
+    point: Point,
+    button: MouseButtonCode,
+    pressed: bool,
+    modifiers: Modifiers,
+    mode: Modes,
+) -> Option<Vec<u8>> {
+    use ghostty_vt::{key, mouse};
+    use util::ResultExt as _;
+
+    let (action, mouse_button) = match button {
+        MouseButtonCode::LeftButton if pressed => (mouse::Action::Press, Some(mouse::Button::Left)),
+        MouseButtonCode::LeftButton => (mouse::Action::Release, Some(mouse::Button::Left)),
+        MouseButtonCode::MiddleButton if pressed => {
+            (mouse::Action::Press, Some(mouse::Button::Middle))
+        }
+        MouseButtonCode::MiddleButton => (mouse::Action::Release, Some(mouse::Button::Middle)),
+        MouseButtonCode::RightButton if pressed => {
+            (mouse::Action::Press, Some(mouse::Button::Right))
+        }
+        MouseButtonCode::RightButton => (mouse::Action::Release, Some(mouse::Button::Right)),
+        MouseButtonCode::LeftMove => (mouse::Action::Motion, Some(mouse::Button::Left)),
+        MouseButtonCode::MiddleMove => (mouse::Action::Motion, Some(mouse::Button::Middle)),
+        MouseButtonCode::RightMove => (mouse::Action::Motion, Some(mouse::Button::Right)),
+        MouseButtonCode::NoneMove => (mouse::Action::Motion, None),
+        MouseButtonCode::ScrollUp => (mouse::Action::Press, Some(mouse::Button::Four)),
+        MouseButtonCode::ScrollDown => (mouse::Action::Press, Some(mouse::Button::Five)),
+        MouseButtonCode::Other => return None,
+    };
+
+    let mut mods = key::Mods::empty();
+    mods.set(key::Mods::SHIFT, modifiers.shift);
+    mods.set(key::Mods::ALT, modifiers.alt);
+    mods.set(key::Mods::CTRL, modifiers.control);
+
+    // Zed's grid math is authoritative: 1×1-pixel cells make the encoder's
+    // pixel→cell conversion the identity, so `point` passes through as-is.
+    let mut encoder = mouse::Encoder::new().log_err()?;
+    encoder
+        .set_tracking_mode(if mode.contains(Modes::MOUSE_MOTION) {
+            mouse::TrackingMode::Any
+        } else if mode.contains(Modes::MOUSE_DRAG) {
+            mouse::TrackingMode::Button
+        } else {
+            mouse::TrackingMode::Normal
+        })
+        // SGR-Pixels (mode 1016) is unreachable during the shim window: the
+        // alacritty core doesn't track it, so `Modes` has no flag for it. It
+        // arrives with `set_options_from_terminal` at P8.
+        .set_format(if mode.contains(Modes::SGR_MOUSE) {
+            mouse::Format::Sgr
+        } else if mode.contains(Modes::UTF8_MOUSE) {
+            mouse::Format::Utf8
+        } else {
+            mouse::Format::X10
+        })
+        // Screen dimensions far above any real grid, so the encoder never
+        // clamps a coordinate Zed's own math produced.
+        .set_size(mouse::EncoderSize {
+            screen_width: 100_000,
+            screen_height: 100_000,
+            cell_width: 1,
+            cell_height: 1,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        })
+        .set_any_button_pressed(mouse_button.is_some())
+        .set_track_last_cell(false);
+
+    let mut event = mouse::Event::new().log_err()?;
+    event
+        .set_action(action)
+        .set_button(mouse_button)
+        .set_mods(mods)
+        .set_position(mouse::Position {
+            x: point.column as f32,
+            y: point.line as f32,
+        });
+
+    let mut bytes = Vec::new();
+    encoder.encode_to_vec(&event, &mut bytes).log_err()?;
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+// Alacritty-era wire formats: production on macOS/Windows, contract-test
+// oracle on Linux. Deleted at P10.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn legacy_mouse_report(
     point: Point,
     button: MouseButtonCode,
     pressed: bool,
     modifiers: Modifiers,
     format: MouseFormat,
 ) -> Option<Vec<u8>> {
-    if point.line < 0 {
-        return None;
-    }
-
     let mut mods = 0;
     if modifiers.shift {
         mods += 4;
@@ -272,6 +704,7 @@ fn mouse_report(
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn normal_mouse_report(point: Point, button: u8, utf8: bool) -> Option<Vec<u8>> {
     let max_point = if utf8 { 2015 } else { 223 };
 
@@ -303,6 +736,7 @@ fn normal_mouse_report(point: Point, button: u8, utf8: bool) -> Option<Vec<u8>> 
     Some(msg)
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn sgr_mouse_report(point: Point, button: u8, pressed: bool) -> String {
     let c = if pressed { 'M' } else { 'm' };
 

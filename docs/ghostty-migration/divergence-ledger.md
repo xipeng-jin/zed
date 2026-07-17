@@ -59,3 +59,161 @@ Entry ID format: `<phase>-<sequence>`.
   re-pointed to the owned field (`cell.extra`). Its expectation —
   `Arc::ptr_eq` across `Cell::clone` — is unchanged and still passes; no
   behavioral delta.
+
+---
+
+P3 entries (ghostty input encoders, ticket #44) are Linux-only for the
+duration of the §5 cfg window: macOS/Windows keep the alacritty-era paths
+until their §8 gates open, at which point these adjudications apply there
+too. "Old behavior" below means the alacritty-era `to_esc_str` /
+`mappings/mouse.rs` / `Terminal::paste` output; "new behavior" the ghostty
+encoder path. Entries adjudicated **fixed in the seam** produce today's
+bytes and are pinned by the permanent contract suites in
+`mappings/keys.rs` / `mappings/mouse.rs` / `mappings/paste.rs`; entries
+adjudicated **accepted** are pinned by the `adjudicated_divergences` /
+ledger-referencing tests in the same files.
+
+## P3-001 — F13–F20 sequences supplied by the seam
+
+- **Phase / change**: P3 (ghostty input encoders, ticket #44). Keys route
+  through ghostty `key::Encoder` (SPEC.md §4.3).
+- **Triggering input**: F13–F20, plain and modified (e.g. `f13`,
+  `alt-f13`).
+- **Old behavior**: xterm sequences `\x1b[25~` … `\x1b[34~` (modified:
+  `\x1b[25;N~` …).
+- **New behavior (raw encoder)**: ghostty's legacy encoder emits nothing
+  for F13+ (its legacy table stops at F12; kitty-protocol codes exist but
+  kitty flags are structurally off until P8).
+- **Adjudication**: **fixed in the seam**. `legacy_fill` in
+  `mappings/keys.rs` supplies the alacritty-era sequences, keeping the
+  contract suite byte-identical. A deliberate, bounded exception to the
+  "no hand-written escape sequences" seam rule, carried until kitty
+  keyboard support gives applications a first-class F13+ path; revisit at
+  P8/P10.
+
+## P3-002 — ctrl-sequence fills: `ctrl-[`, `ctrl-_`, `ctrl-?`, `ctrl-i`, `ctrl-m`
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: `ctrl-[`, `ctrl-_`, `ctrl-?`, `ctrl-i`/`ctrl-m`
+  (incl. ctrl-shift variants of the letters).
+- **Old behavior**: `0x1b`, `0x1f`, `0x7f`, `0x09`, `0x0d`.
+- **New behavior (raw encoder)**: nothing. Ghostty keys its ctrl table off
+  the *physical* key (GPUI delivers the shifted character, so `_` maps to
+  the Minus key, `?` to Slash), relies on host-supplied utf8 text for
+  `ctrl-[` (which Zed does not pass — the binding API forbids C0 text),
+  and deliberately reserves `ctrl-i`/`ctrl-m` so kitty-aware applications
+  can distinguish them from tab/enter.
+- **Adjudication**: **fixed in the seam**. `legacy_fill` supplies the
+  single control bytes (control characters, not escape sequences — the
+  seam rule is untouched). Contract suite byte-identical.
+
+## P3-003 — alt + multi-character key names no longer leak the name
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: alt + a named non-text key that the legacy tables
+  missed: `alt-tab`, `alt-escape`, `alt-space`, `alt-back`.
+- **Old behavior**: the alt-as-meta branch formatted `\x1b` + the *GPUI
+  key name string*: `alt-tab` → `\x1btab` (4 bytes), `alt-space` →
+  `\x1bspace`.
+- **New behavior**: proper encodings: `\x1b\x09`, `\x1b\x1b`, `\x1b ` (and
+  `alt-back` → `\x1b\x7f`).
+- **Adjudication**: **accepted** — the old output was an unambiguous
+  mapping bug (typed the key name into the shell). Pinned by
+  `adjudicated_divergences::alt_named_keys`.
+
+## P3-004 — modified-key table gaps now encode
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: modified `f5` (any modifier) and modified
+  `delete`, e.g. `shift-f5`, `shift-delete`.
+- **Old behavior**: none — the legacy modified table listed `"F5"`
+  (capital, never delivered by GPUI) and omitted `delete` entirely, so
+  these fell through to the text path (usually a no-op).
+- **New behavior**: `\x1b[15;N~`, `\x1b[3;N~`.
+- **Adjudication**: **accepted** — table typo/omission; the new output is
+  standard xterm. Pinned by
+  `adjudicated_divergences::modified_key_table_gaps`.
+
+## P3-005 — super modifier encodes as kitty-style 8
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: super/cmd + an encodable named key, e.g.
+  `cmd-up`.
+- **Old behavior**: `\x1b[1;1A` — the super modifier forced the modified
+  form but contributed nothing to the code, producing the malformed
+  modifier code 1 ("no modifiers").
+- **New behavior**: `\x1b[1;9A` — kitty's super bit (8).
+- **Adjudication**: **accepted** — the old form was malformed; ghostty's
+  is the convention modern terminals share. Pinned by
+  `adjudicated_divergences::super_modifier`.
+
+## P3-006 — previously-silent combos emit xterm CSI 27 encodings
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: modifier+key combos with no legacy sequence:
+  `ctrl-enter`, `ctrl-tab`, `shift-escape`, `ctrl-shift-tab`, ….
+- **Old behavior**: nothing (fell through; typically a no-op).
+- **New behavior**: xterm "other keys" encodings, e.g. `ctrl-enter` →
+  `\x1b[27;5;13~`.
+- **Adjudication**: **accepted** — an incidental capability gain in the
+  #32 resolution's sense: bytes where none were sent before, using the
+  xterm-standard form; shells that don't bind them ignore the sequence.
+  Watch during the P9 soak. Pinned by
+  `adjudicated_divergences::csi_27_combos`.
+
+## P3-007 — paste sanitization is a superset
+
+- **Phase / change**: P3 (ghostty `paste::encode` owns paste bytes).
+- **Triggering input**: pasted text containing ESC / NUL / DEL.
+- **Old behavior**: bracketed — ESC characters *removed*, NUL/DEL passed
+  through; unbracketed — all three passed through raw.
+- **New behavior**: unsafe control bytes are replaced with spaces in both
+  modes (defusing bracketed-paste-end injection even unbracketed).
+- **Adjudication**: **accepted** — verified superset per the #32
+  resolution, which assigned paste sanitization to ghostty wholesale. The
+  `\r\n`→`\r` collapse contract is preserved by pre-normalizing
+  `\r\n`→`\n` before encoding (the resolution's one required check).
+  Pinned by `paste::tests::ghostty_sanitization_superset`.
+
+## P3-008 — modified F3 uses `CSI 13;N~`
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: F3 with any modifier, e.g. `shift-f3`.
+- **Old behavior**: `\x1b[1;2R`.
+- **New behavior**: `\x1b[13;2~`.
+- **Adjudication**: **accepted** — `CSI 1;N R` collides with the cursor
+  position report; xterm moved modified F3 to `CSI 13;N~` and ghostty
+  follows. Pinned by `adjudicated_divergences::modified_f3`.
+
+## P3-009 — UTF-8 mouse coordinates beyond 2014 encode instead of dropping
+
+- **Phase / change**: P3 (ghostty `mouse::Encoder` owns mouse wire
+  formats).
+- **Triggering input**: mode 1005 (UTF-8 mouse) report with a coordinate
+  ≥ 2015 — requires a terminal grid wider/taller than 2015 cells.
+- **Old behavior**: the report was dropped entirely.
+- **New behavior**: the coordinate is encoded as three-byte UTF-8.
+- **Adjudication**: **accepted** — valid UTF-8 the peer can decode, in a
+  configuration that cannot occur in practice; dropping input was the
+  worse behavior. X10-format caps (drop beyond 222) are unchanged and
+  byte-identical. Pinned in
+  `mouse::tests::contract::utf8_format_wide_coordinates`.
+
+## P3-010 — ctrl-shift-letter encodes the caret code
+
+- **Phase / change**: P3, as above.
+- **Triggering input**: `ctrl-shift-a` … `ctrl-shift-z`.
+- **Old behavior**: nothing. The legacy table's ctrl-shift rows keyed on
+  *uppercase* keys (`("A", CtrlShift)`), but GPUI's canonical keystroke
+  form is lowercase key + shift modifier, so those rows never matched —
+  ctrl-shift-letter fell through to the text path (a no-op). The upstream
+  `test_ctrl_codes` suite asserted only that `ctrl-shift-x` equals
+  `ctrl-X`, which held vacuously as `None == None`; that ported
+  expectation still holds on the new path (both now the caret byte).
+- **New behavior**: the same caret code as plain ctrl-letter (`0x01` …
+  `0x1a`), matching xterm and every mainstream terminal. The seam strips
+  shift before handing letters to ghostty's ctrl mapping (and
+  `legacy_fill` does the same for its `ctrl-i`/`ctrl-m` bytes).
+- **Adjudication**: **accepted** — the old silence was an artifact of the
+  dead uppercase rows, not a behavioral choice. Pinned by
+  `adjudicated_divergences::ctrl_shift_letters`.

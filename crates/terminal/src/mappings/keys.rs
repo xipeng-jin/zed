@@ -44,6 +44,29 @@ impl TerminalModifiers {
     }
 }
 
+/// Encode a keystroke into the bytes to write to the PTY.
+///
+/// On Linux the escape bytes come from ghostty's `key::Encoder` (SPEC.md
+/// §4.3); macOS and Windows keep the alacritty-era `to_esc_str` path until
+/// their platform gates open (SPEC.md §5, §8).
+pub(crate) fn encode_keystroke(
+    keystroke: &Keystroke,
+    mode: Modes,
+    option_as_meta: bool,
+) -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        ghostty_encode_keystroke(keystroke, mode, option_as_meta)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        to_esc_str(keystroke, mode, option_as_meta).map(|esc| esc.into_owned().into_bytes())
+    }
+}
+
+// Alacritty-era path: production on macOS/Windows, contract-test oracle on
+// Linux. Deleted at P10.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn to_esc_str(
     keystroke: &Keystroke,
     mode: Modes,
@@ -253,6 +276,296 @@ fn modifier_code(keystroke: &Keystroke) -> u32 {
     modifier_code + 1
 }
 
+#[cfg(target_os = "linux")]
+fn ghostty_encode_keystroke(
+    keystroke: &Keystroke,
+    mode: Modes,
+    option_as_meta: bool,
+) -> Option<Vec<u8>> {
+    use ghostty_vt::key::{Action, Event, Mods};
+    use util::ResultExt as _;
+
+    let modifiers = &keystroke.modifiers;
+    let shift_only =
+        modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.platform;
+
+    // Zed input policy: shift-enter types a literal newline (multi-line shell
+    // input); a plain control byte, not an escape sequence, so it stays
+    // upstream of the encoder like vi-mode interception.
+    if keystroke.key == "enter" && shift_only {
+        return Some(b"\n".to_vec());
+    }
+
+    if let Some(bytes) = legacy_fill(keystroke) {
+        return Some(bytes);
+    }
+
+    // Zed policy decides which keystrokes the terminal owns at all (the rest
+    // fall through to the IME/text path); ghostty encodes the bytes for the
+    // ones it does.
+    let (key, mods, utf8, unshifted) = if let Some(key) = named_key(&keystroke.key) {
+        let mut mods = Mods::empty();
+        mods.set(Mods::SHIFT, modifiers.shift);
+        mods.set(Mods::ALT, modifiers.alt);
+        mods.set(Mods::CTRL, modifiers.control);
+        mods.set(Mods::SUPER, modifiers.platform);
+        (key, mods, None, None)
+    } else {
+        let character = char_of_key(&keystroke.key)?;
+        let unshifted = character.to_ascii_lowercase();
+        if modifiers.control && !modifiers.alt && !modifiers.platform {
+            // The caret-notation set the alacritty-era table encoded; other
+            // ctrl combos (ctrl-1, ctrl-alt AltGr chords, …) keep falling
+            // through to the text path.
+            let qualifies = character.is_ascii_alphabetic()
+                || (!modifiers.shift && matches!(character, '@' | '\\' | ']' | '^' | ' '));
+            if !qualifies {
+                return None;
+            }
+            (key_for_char(character), Mods::CTRL, None, Some(unshifted))
+        } else if modifiers.alt
+            && character.is_ascii()
+            && (modifiers.shift || (!modifiers.control && !modifiers.platform))
+        {
+            // Alt-as-meta: ESC-prefixed text. Ctrl/super are dropped here to
+            // match the alacritty-era table, which ignored them on this path.
+            let mut mods = Mods::ALT;
+            let text = if modifiers.shift {
+                mods |= Mods::SHIFT;
+                character.to_ascii_uppercase()
+            } else {
+                character
+            };
+            (
+                key_for_char(character),
+                mods,
+                Some(text.to_string()),
+                Some(unshifted),
+            )
+        } else {
+            return None;
+        }
+    };
+
+    let mut encoder = key_encoder(mode, option_as_meta)?;
+    let mut event = Event::new().log_err()?;
+    event
+        .set_action(Action::Press)
+        .set_key(key)
+        .set_mods(mods)
+        .set_utf8(utf8);
+    if let Some(unshifted) = unshifted {
+        event.set_unshifted_codepoint(unshifted);
+    }
+    let mut bytes = Vec::new();
+    encoder.encode_to_vec(&event, &mut bytes).log_err()?;
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+/// The temporary Zed-`Modes` → encoder-options shim (SPEC.md §4.3): feeds
+/// ghostty's encoder from the alacritty core's mode snapshot. Replaced by
+/// `set_options_from_terminal` at P8.
+#[cfg(target_os = "linux")]
+fn key_encoder(
+    mode: Modes,
+    option_as_meta: bool,
+) -> Option<ghostty_vt::key::Encoder<'static>> {
+    use ghostty_vt::key::{Encoder, KittyKeyFlags, OptionAsAlt};
+    use util::ResultExt as _;
+
+    let mut encoder = Encoder::new().log_err()?;
+    encoder
+        .set_cursor_key_application(mode.contains(Modes::APP_CURSOR))
+        .set_keypad_key_application(mode.contains(Modes::APP_KEYPAD))
+        // Zed's `Modes` does not track DEC 1036; the alacritty-era path
+        // unconditionally ESC-prefixed alt on Linux.
+        .set_alt_esc_prefix(true)
+        .set_modify_other_keys_state_2(false)
+        // Structurally off until the core swap (P8): the alacritty core never
+        // answers the kitty progressive-enhancement query.
+        .set_kitty_flags(KittyKeyFlags::DISABLED)
+        .set_macos_option_as_alt(if option_as_meta {
+            OptionAsAlt::True
+        } else {
+            OptionAsAlt::False
+        });
+    Some(encoder)
+}
+
+/// Sequences ghostty's legacy encoder deliberately does not produce, supplied
+/// by the seam to preserve today's bytes (divergence ledger P3-001, P3-002):
+/// F13–F20 xterm codes, ctrl-punctuation control bytes ghostty keys off the
+/// physical key rather than the delivered character, and ctrl-i / ctrl-m,
+/// which ghostty reserves so applications can tell them apart from tab/enter.
+#[cfg(target_os = "linux")]
+fn legacy_fill(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control && !modifiers.alt && !modifiers.platform {
+        if !modifiers.shift {
+            match keystroke.key.as_str() {
+                "[" => return Some(vec![0x1b]),
+                "_" => return Some(vec![0x1f]),
+                "?" => return Some(vec![0x7f]),
+                _ => {}
+            }
+        }
+        // Shift is allowed for letters, matching the alacritty-era
+        // ctrl-shift caret rows.
+        match keystroke.key.to_ascii_lowercase().as_str() {
+            "i" => return Some(vec![0x09]),
+            "m" => return Some(vec![0x0d]),
+            _ => {}
+        }
+    }
+
+    let code = match keystroke.key.to_ascii_lowercase().as_str() {
+        "f13" => 25,
+        "f14" => 26,
+        "f15" => 28,
+        "f16" => 29,
+        "f17" => 31,
+        "f18" => 32,
+        "f19" => 33,
+        "f20" => 34,
+        _ => return None,
+    };
+    let modifier_code = modifier_code(keystroke);
+    let sequence = if modifier_code == 1 {
+        format!("\x1b[{}~", code)
+    } else {
+        format!("\x1b[{};{}~", code, modifier_code)
+    };
+    Some(sequence.into_bytes())
+}
+
+#[cfg(target_os = "linux")]
+fn named_key(key: &str) -> Option<ghostty_vt::key::Key> {
+    use ghostty_vt::key::Key;
+
+    // F13–F20 are handled by `legacy_fill` above.
+    Some(match key.to_ascii_lowercase().as_str() {
+        "tab" => Key::Tab,
+        "escape" => Key::Escape,
+        "enter" => Key::Enter,
+        "backspace" | "back" => Key::Backspace,
+        "up" => Key::ArrowUp,
+        "down" => Key::ArrowDown,
+        "left" => Key::ArrowLeft,
+        "right" => Key::ArrowRight,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "insert" => Key::Insert,
+        "delete" => Key::Delete,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn char_of_key(key: &str) -> Option<char> {
+    if key == "space" {
+        return Some(' ');
+    }
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(character), None) => Some(character),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn key_for_char(character: char) -> ghostty_vt::key::Key {
+    use ghostty_vt::key::Key;
+
+    match character.to_ascii_lowercase() {
+        'a' => Key::A,
+        'b' => Key::B,
+        'c' => Key::C,
+        'd' => Key::D,
+        'e' => Key::E,
+        'f' => Key::F,
+        'g' => Key::G,
+        'h' => Key::H,
+        'i' => Key::I,
+        'j' => Key::J,
+        'k' => Key::K,
+        'l' => Key::L,
+        'm' => Key::M,
+        'n' => Key::N,
+        'o' => Key::O,
+        'p' => Key::P,
+        'q' => Key::Q,
+        'r' => Key::R,
+        's' => Key::S,
+        't' => Key::T,
+        'u' => Key::U,
+        'v' => Key::V,
+        'w' => Key::W,
+        'x' => Key::X,
+        'y' => Key::Y,
+        'z' => Key::Z,
+        '0' | ')' => Key::Digit0,
+        '1' | '!' => Key::Digit1,
+        '2' | '@' => Key::Digit2,
+        '3' | '#' => Key::Digit3,
+        '4' | '$' => Key::Digit4,
+        '5' | '%' => Key::Digit5,
+        '6' | '^' => Key::Digit6,
+        '7' | '&' => Key::Digit7,
+        '8' | '*' => Key::Digit8,
+        '9' | '(' => Key::Digit9,
+        '-' | '_' => Key::Minus,
+        '=' | '+' => Key::Equal,
+        '[' | '{' => Key::BracketLeft,
+        ']' | '}' => Key::BracketRight,
+        '\\' | '|' => Key::Backslash,
+        ';' | ':' => Key::Semicolon,
+        '\'' | '"' => Key::Quote,
+        ',' | '<' => Key::Comma,
+        '.' | '>' => Key::Period,
+        '/' | '?' => Key::Slash,
+        '`' | '~' => Key::Backquote,
+        ' ' => Key::Space,
+        _ => Key::Unidentified,
+    }
+}
+
+/// Alternate-scroll arrow bytes for [`super::mouse::alt_scroll`]: Zed
+/// synthesizes the arrow-key events, ghostty encodes them. The alt screen
+/// scroll always uses the application-cursor form (parity with the
+/// alacritty-era hardcoded `\x1bO` prefix).
+#[cfg(target_os = "linux")]
+pub(super) fn ghostty_scroll_arrow_bytes(up: bool) -> Option<Vec<u8>> {
+    use ghostty_vt::key::{Action, Encoder, Event, Key, KittyKeyFlags, Mods};
+    use util::ResultExt as _;
+
+    let mut encoder = Encoder::new().log_err()?;
+    encoder
+        .set_cursor_key_application(true)
+        .set_kitty_flags(KittyKeyFlags::DISABLED);
+    let mut event = Event::new().log_err()?;
+    event
+        .set_action(Action::Press)
+        .set_key(if up { Key::ArrowUp } else { Key::ArrowDown })
+        .set_mods(Mods::empty());
+    let mut bytes = Vec::new();
+    encoder.encode_to_vec(&event, &mut bytes).log_err()?;
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
 #[cfg(test)]
 mod test {
     use gpui::Modifiers;
@@ -391,6 +704,272 @@ mod test {
 
         // Regular enter should still send carriage return
         assert_eq!(to_esc_str(&regular_enter, mode, false), Some("\x0d".into()));
+    }
+
+    /// Permanent contract suite on the encoding path (SPEC.md §4.3): same
+    /// keystroke + modes ⇒ byte-identical output to the alacritty-era
+    /// `to_esc_str`. On Linux this exercises the ghostty `key::Encoder`
+    /// behind the `Modes` shim; elsewhere the legacy path, so the
+    /// expectations hold everywhere by construction.
+    mod contract {
+        use super::*;
+
+        #[track_caller]
+        fn assert_bytes(keystroke: &str, mode: Modes, expected: &[u8]) {
+            let keystroke = Keystroke::parse(keystroke).unwrap();
+            let actual = encode_keystroke(&keystroke, mode, false);
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "keystroke {keystroke} in mode {mode:?}: got {:?}, expected {:?}",
+                actual.as_deref().map(String::from_utf8_lossy),
+                String::from_utf8_lossy(expected),
+            );
+        }
+
+        #[track_caller]
+        fn assert_no_bytes(keystroke: &str, mode: Modes) {
+            let keystroke = Keystroke::parse(keystroke).unwrap();
+            let actual = encode_keystroke(&keystroke, mode, false);
+            assert_eq!(
+                actual, None,
+                "keystroke {keystroke} in mode {mode:?} should fall through to the text path",
+            );
+        }
+
+        #[test]
+        fn special_keys() {
+            let none = Modes::NONE;
+            assert_bytes("tab", none, b"\x09");
+            assert_bytes("shift-tab", none, b"\x1b[Z");
+            assert_bytes("escape", none, b"\x1b");
+            assert_bytes("enter", none, b"\x0d");
+            assert_bytes("shift-enter", none, b"\x0a");
+            assert_bytes("alt-enter", none, b"\x1b\x0d");
+            assert_bytes("backspace", none, b"\x7f");
+            assert_bytes("ctrl-backspace", none, b"\x08");
+            assert_bytes("alt-backspace", none, b"\x1b\x7f");
+            assert_bytes("shift-backspace", none, b"\x7f");
+            assert_bytes("ctrl-space", none, b"\x00");
+            assert_bytes("insert", none, b"\x1b[2~");
+            assert_bytes("delete", none, b"\x1b[3~");
+            assert_bytes("pageup", none, b"\x1b[5~");
+            assert_bytes("pagedown", none, b"\x1b[6~");
+        }
+
+        #[test]
+        fn application_modes() {
+            let none = Modes::NONE;
+            let app_cursor = Modes::APP_CURSOR;
+
+            for (key, csi, ss3) in [
+                ("up", b"\x1b[A".as_slice(), b"\x1bOA".as_slice()),
+                ("down", b"\x1b[B", b"\x1bOB"),
+                ("right", b"\x1b[C", b"\x1bOC"),
+                ("left", b"\x1b[D", b"\x1bOD"),
+                ("home", b"\x1b[H", b"\x1bOH"),
+                ("end", b"\x1b[F", b"\x1bOF"),
+            ] {
+                assert_bytes(key, none, csi);
+                assert_bytes(key, app_cursor, ss3);
+            }
+
+            assert_bytes("shift-up", none, b"\x1b[1;2A");
+            assert_bytes("shift-down", none, b"\x1b[1;2B");
+            assert_bytes("shift-home", none, b"\x1b[1;2H");
+            assert_bytes("shift-end", none, b"\x1b[1;2F");
+            // Modified keys ignore application cursor mode.
+            assert_bytes("shift-up", app_cursor, b"\x1b[1;2A");
+        }
+
+        #[test]
+        fn modifier_codes() {
+            for (keystroke, code) in [
+                ("shift-up", 2),
+                ("alt-up", 3),
+                ("shift-alt-up", 4),
+                ("ctrl-up", 5),
+                ("shift-ctrl-up", 6),
+                ("alt-ctrl-up", 7),
+                ("shift-alt-ctrl-up", 8),
+            ] {
+                assert_bytes(keystroke, Modes::NONE, format!("\x1b[1;{code}A").as_bytes());
+            }
+        }
+
+        #[test]
+        fn function_keys() {
+            let none = Modes::NONE;
+            for (key, plain) in [
+                ("f1", "\x1bOP"),
+                ("f2", "\x1bOQ"),
+                ("f3", "\x1bOR"),
+                ("f4", "\x1bOS"),
+                ("f5", "\x1b[15~"),
+                ("f6", "\x1b[17~"),
+                ("f7", "\x1b[18~"),
+                ("f8", "\x1b[19~"),
+                ("f9", "\x1b[20~"),
+                ("f10", "\x1b[21~"),
+                ("f11", "\x1b[23~"),
+                ("f12", "\x1b[24~"),
+                ("f13", "\x1b[25~"),
+                ("f14", "\x1b[26~"),
+                ("f15", "\x1b[28~"),
+                ("f16", "\x1b[29~"),
+                ("f17", "\x1b[31~"),
+                ("f18", "\x1b[32~"),
+                ("f19", "\x1b[33~"),
+                ("f20", "\x1b[34~"),
+            ] {
+                assert_bytes(key, none, plain.as_bytes());
+            }
+
+            assert_bytes("shift-f1", none, b"\x1b[1;2P");
+            assert_bytes("ctrl-f2", none, b"\x1b[1;5Q");
+            // Modified F3 is a ledgered divergence (P3-008), tested below.
+            assert_bytes("shift-f4", none, b"\x1b[1;2S");
+            assert_bytes("ctrl-f6", none, b"\x1b[17;5~");
+            assert_bytes("shift-f12", none, b"\x1b[24;2~");
+            assert_bytes("alt-f13", none, b"\x1b[25;3~");
+            assert_bytes("ctrl-f20", none, b"\x1b[34;5~");
+            assert_bytes("shift-insert", none, b"\x1b[2;2~");
+            assert_bytes("ctrl-pageup", none, b"\x1b[5;5~");
+            assert_bytes("shift-pagedown", none, b"\x1b[6;2~");
+        }
+
+        #[test]
+        fn ctrl_caret_codes() {
+            let none = Modes::NONE;
+            for (index, letter) in ('a'..='z').enumerate() {
+                let byte = [index as u8 + 1];
+                assert_bytes(&format!("ctrl-{letter}"), none, &byte);
+                // ctrl-shift-{letter} is a ledgered divergence (P3-010),
+                // tested below: GPUI's canonical keystroke is lowercase key +
+                // shift, which the legacy uppercase CtrlShift rows never
+                // matched, so the alacritty-era path encoded nothing.
+            }
+            assert_bytes("ctrl-@", none, b"\x00");
+            assert_bytes("ctrl-[", none, b"\x1b");
+            assert_bytes("ctrl-\\", none, b"\x1c");
+            assert_bytes("ctrl-]", none, b"\x1d");
+            assert_bytes("ctrl-^", none, b"\x1e");
+            assert_bytes("ctrl-_", none, b"\x1f");
+            assert_bytes("ctrl-?", none, b"\x7f");
+        }
+
+        #[test]
+        fn alt_is_meta() {
+            for character in '!'..='~' {
+                assert_bytes(
+                    &format!("alt-{character}"),
+                    Modes::NONE,
+                    format!("\x1b{character}").as_bytes(),
+                );
+            }
+            assert_bytes("alt-shift-a", Modes::NONE, b"\x1bA");
+        }
+
+        #[test]
+        fn text_path_fallthrough() {
+            let none = Modes::NONE;
+            // Plain and shift-modified text belongs to the IME/text path.
+            assert_no_bytes("a", none);
+            assert_no_bytes("shift-a", none);
+            assert_no_bytes("space", none);
+            assert_no_bytes("cmd-a", none);
+            // Ctrl chords without a caret mapping keep falling through
+            // (ctrl-alt chords double as AltGr on some layouts).
+            assert_no_bytes("ctrl-1", none);
+            assert_no_bytes("ctrl-;", none);
+            assert_no_bytes("ctrl-alt-a", none);
+            let multigrapheme = Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "🖖🏻".to_string(),
+                key_char: None,
+            };
+            assert_eq!(encode_keystroke(&multigrapheme, none, false), None);
+        }
+    }
+
+    /// Adjudicated behavior changes on the ghostty encoding path, recorded in
+    /// docs/ghostty-migration/divergence-ledger.md. Linux-only: other
+    /// platforms keep the alacritty-era behavior until their gates open.
+    #[cfg(target_os = "linux")]
+    mod adjudicated_divergences {
+        use super::*;
+
+        #[track_caller]
+        fn assert_bytes(keystroke: &str, expected: &[u8]) {
+            let keystroke = Keystroke::parse(keystroke).unwrap();
+            let actual = encode_keystroke(&keystroke, Modes::NONE, false);
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "keystroke {keystroke}: got {:?}",
+                actual.as_deref().map(String::from_utf8_lossy),
+            );
+        }
+
+        // P3-003: alt + multi-character key names previously leaked the name
+        // into the output ("\x1btab"); now properly encoded.
+        #[test]
+        fn alt_named_keys() {
+            assert_bytes("alt-tab", b"\x1b\x09");
+            assert_bytes("alt-escape", b"\x1b\x1b");
+            assert_bytes("alt-space", b"\x1b ");
+        }
+
+        // P3-004: keys missing from the legacy modified-key table (the "F5"
+        // typo, delete) previously fell through; now encoded.
+        #[test]
+        fn modified_key_table_gaps() {
+            assert_bytes("shift-f5", b"\x1b[15;2~");
+            assert_bytes("ctrl-f5", b"\x1b[15;5~");
+            assert_bytes("shift-delete", b"\x1b[3;2~");
+        }
+
+        // P3-005: super-modified keys previously emitted a malformed
+        // modifier code 1; now the kitty-style super encoding (8).
+        #[test]
+        fn super_modifier() {
+            assert_bytes("cmd-up", b"\x1b[1;9A");
+        }
+
+        // P3-006: previously-silent combos now emit xterm "other keys"
+        // (CSI 27) encodings.
+        #[test]
+        fn csi_27_combos() {
+            assert_bytes("ctrl-enter", b"\x1b[27;5;13~");
+            assert_bytes("ctrl-tab", b"\x1b[27;5;9~");
+            assert_bytes("shift-escape", b"\x1b[27;2;27~");
+        }
+
+        // P3-008: modified F3 previously used `CSI 1;N R`, which collides
+        // with the cursor position report; now xterm's modern `CSI 13;N~`.
+        #[test]
+        fn modified_f3() {
+            assert_bytes("shift-f3", b"\x1b[13;2~");
+            assert_bytes("alt-f3", b"\x1b[13;3~");
+        }
+
+        // P3-010: ctrl-shift-letter previously encoded nothing (the legacy
+        // table's CtrlShift rows keyed on uppercase keys, which GPUI's
+        // canonical lowercase-plus-shift keystrokes never matched); now the
+        // caret code, matching ctrl-letter like every other terminal.
+        #[test]
+        fn ctrl_shift_letters() {
+            for (index, letter) in ('a'..='z').enumerate() {
+                let byte = [index as u8 + 1];
+                let keystroke = format!("ctrl-shift-{letter}");
+                let keystroke = Keystroke::parse(&keystroke).unwrap();
+                assert_eq!(
+                    encode_keystroke(&keystroke, Modes::NONE, false).as_deref(),
+                    Some(byte.as_slice()),
+                    "ctrl-shift-{letter}",
+                );
+            }
+        }
     }
 
     #[test]

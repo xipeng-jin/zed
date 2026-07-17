@@ -47,6 +47,11 @@ vte.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
 
+# Temporary Linux-only dependency during the libghostty migration window
+# (SPEC.md §5); widened per-platform at the §8 gates, unconditional by P10.
+[target.'cfg(target_os = "linux")'.dependencies]
+ghostty_vt.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 

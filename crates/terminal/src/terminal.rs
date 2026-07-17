@@ -64,7 +64,7 @@ use crate::alacritty::{
     TerminalBackend, open_pty, pty_options,
 };
 use crate::mappings::colors::to_rgb;
-use crate::mappings::keys::to_esc_str;
+use crate::mappings::{focus::focus_report, keys::encode_keystroke, paste::encode_paste};
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -2491,12 +2491,8 @@ impl Terminal {
         }
 
         // Keep default terminal behavior
-        let esc = to_esc_str(keystroke, self.last_content.mode, option_as_meta);
-        if let Some(esc) = esc {
-            match esc {
-                Cow::Borrowed(string) => self.input(string.as_bytes()),
-                Cow::Owned(string) => self.input(string.into_bytes()),
-            };
+        if let Some(bytes) = encode_keystroke(keystroke, self.last_content.mode, option_as_meta) {
+            self.input(bytes);
             true
         } else {
             false
@@ -2523,13 +2519,8 @@ impl Terminal {
 
     ///Paste text into the terminal
     pub fn paste(&mut self, text: &str) {
-        let paste_text = if self.last_content.mode.contains(Modes::BRACKETED_PASTE) {
-            format!("{}{}{}", "\x1b[200~", text.replace('\x1b', ""), "\x1b[201~")
-        } else {
-            text.replace("\r\n", "\r").replace('\n', "\r")
-        };
-
-        self.input(paste_text.into_bytes());
+        let bracketed = self.last_content.mode.contains(Modes::BRACKETED_PASTE);
+        self.input(encode_paste(text, bracketed));
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2555,13 +2546,13 @@ impl Terminal {
 
     pub fn focus_in(&self) {
         if self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
-            self.write_to_pty("\x1b[I".as_bytes());
+            self.write_to_pty(focus_report(true));
         }
     }
 
     pub fn focus_out(&mut self) {
         if self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
-            self.write_to_pty("\x1b[O".as_bytes());
+            self.write_to_pty(focus_report(false));
         }
     }
 
@@ -4039,6 +4030,44 @@ mod tests {
         assert!(
             content_after.contains("from_injection"),
             "expected injected output to appear, got: {content_after}"
+        );
+    }
+
+    /// End-to-end check on the encoder seam (SPEC.md §4.3): keystrokes and
+    /// pastes must reach the child process byte-exact through a real PTY.
+    /// The child runs `cat -v` on a raw, echo-less tty, so every control
+    /// byte it receives comes back as visible caret notation.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_keystrokes_and_paste_reach_child_byte_exact(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (terminal, _completion_rx) =
+            build_test_terminal(cx, "stty raw -echo && printf 'READY:' && cat -v", &[]).await;
+        assert_content_eventually(&terminal, "READY:", cx).await;
+
+        terminal.update(cx, |term, _| {
+            assert!(term.try_keystroke(&Keystroke::parse("up").unwrap(), false));
+            assert!(term.try_keystroke(&Keystroke::parse("ctrl-a").unwrap(), false));
+            assert!(term.try_keystroke(&Keystroke::parse("alt-x").unwrap(), false));
+            term.paste("one\r\ntwo");
+        });
+        // Up arrow `\x1b[A`, ctrl-a `\x01`, alt-x `\x1bx`, and the paste with
+        // `\r\n` collapsed to `\r`, exactly in send order.
+        assert_content_eventually(&terminal, "^[[A^A^[xone^Mtwo", cx).await;
+
+        terminal.update(cx, |term, _| {
+            term.last_content.mode.insert(Modes::BRACKETED_PASTE);
+            term.paste("safe\x1btext");
+        });
+        // Bracketed paste wraps the text; the ESC byte is sanitized out
+        // rather than forwarded raw.
+        assert_content_eventually(&terminal, "^[[200~safe", cx).await;
+        assert_content_eventually(&terminal, "text^[[201~", cx).await;
+        let content = terminal.update(cx, |term, _| term.get_content());
+        assert!(
+            !content.contains("^[[200~safe^[text"),
+            "paste must not forward a raw ESC byte, got: {content}"
         );
     }
 
