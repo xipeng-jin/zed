@@ -362,7 +362,10 @@ now because the backend suite pins the behavior.
   Exact line-count parity is structurally unavailable without forking the
   core. Pinned by
   `ghostty::tests::creation_contract_bounds_scrollback` (zero exact,
-  non-zero bounded).
+  non-zero bounded) and, from P7, by the differential corpus row
+  `scrollback_trim_past_limit` (ghostty retains more; alacritty's
+  extraction is a suffix of ghostty's; viewport and recent-line probes
+  exact).
 
 ## P5-002 — Selection text trims trailing spaces at a mid-row selection cut
 
@@ -477,3 +480,266 @@ pins the behavior. No ported-test expectation changed in the hover re-host
   differential tests pin. A tracked-grid-ref cursor would follow content
   but diverge from alacritty's viewport-clamp behavior instead. Revisit if
   the P7 differential corpus surfaces a user-visible delta.
+
+---
+
+P7 entries come from the differential harness itself (ticket #50): identical
+transcripts fed to both backends inside one test binary, seam snapshots
+compared after every event (`crates/terminal/src/differential.rs`). Every
+divergence below is pinned by a corpus `Waiver` naming its entry id — a
+waiver that stops firing fails the run, so these adjudications cannot go
+stale silently. Two comparator normalizations are pre-adjudicated by the
+spec and implemented in the harness rather than entered here: `Indexed(0–15)`
+compares equal to the same-named ANSI color (SPEC.md §9 accepted information
+loss; Zed renders both through the identical theme slot), and OSC title
+events compare through the `terminal.rs` glue state (`Title("")` and
+`ResetTitle` both produce an empty breadcrumb).
+
+## P7-001 — Tab characters occupy cells on alacritty, blanks on ghostty
+
+- **Phase / change**: P7 (differential harness, ticket #50). Recorded by
+  the harness; no code change.
+- **Triggering input**: any `\t` reaching the emulator (corpus row
+  `tab_stops`).
+- **Old behavior**: alacritty's `put_tab` writes `'\t'` into the tab-origin
+  cell; extraction (`bounds_to_string`) reproduces the tab and skips the
+  fill cells up to the next tab stop (`"\ta"`).
+- **New behavior**: ghostty advances the cursor over blank cells; the
+  renderer sees spaces and extraction yields the equivalent spaces
+  (`"        a"`, same visual width).
+- **Adjudication**: **accepted**. Rendering is identical (a `'\t'` cell
+  draws as blank); the delta is copy/extraction bytes of equal width, and
+  ghostty the terminal ships this representation. Cursor-probe equality in
+  the same row still pins tab-stop *positions* (HTS/TBC/CBT/CHT). Pinned by
+  `tab_stops` waivers.
+
+## P7-002 — Legacy alt-screen modes ?47/?1047 are implemented by ghostty only
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: `CSI ? 47 h/l`, `CSI ? 1047 h/l` (corpus row
+  `alt_screen_legacy_modes`).
+- **Old behavior**: Zed's alacritty fork ignores both modes — writes land on
+  the primary screen and no buffer swap happens.
+- **New behavior**: ghostty performs the standard legacy buffer swap.
+- **Adjudication**: **accepted** — a capability restoration; applications
+  using the legacy modes get the behavior every other terminal gives them.
+  The primary path Zed's ecosystem uses (?1049) is byte-identical
+  (`alt_screen_enter_exit` runs clean). Pinned by
+  `alt_screen_legacy_modes` waivers.
+
+## P7-003 — Destructive clears rotate lines into scrollback on alacritty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: `CSI 2 J`, and `CSI Ps M` (DL) with the scroll
+  region at the top of the screen (corpus rows `erase_operations`,
+  `insert_delete_chars_lines`).
+- **Old behavior**: alacritty implements these via grid rotation, pushing
+  the cleared/deleted top lines into scrollback (`total_lines` grows; the
+  pre-clear screen remains reachable by scrolling up).
+- **New behavior**: ghostty erases/deletes in place (xterm semantics);
+  nothing enters scrollback.
+- **Adjudication**: **accepted**. Ghostty matches the xterm behavior;
+  the user-visible delta is that a bare `ESC[2J` no longer leaves the old
+  screen in history (the `clear` command is unaffected — it sends `3J`,
+  and the G5 seam clear pins its own semantics). Watch during the P9 soak.
+  Pinned by checked waivers (ghostty history never exceeds alacritty's;
+  ghostty's extracted text is a suffix of alacritty's).
+
+## P7-004 — IL/DL home the cursor column on ghostty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: `CSI Ps L` / `CSI Ps M` with the cursor mid-row
+  (corpus row `scroll_region_decstbm`).
+- **Old behavior**: alacritty leaves the cursor column untouched.
+- **New behavior**: ghostty moves the cursor to column 1, per the DEC/xterm
+  specification for IL/DL.
+- **Adjudication**: **accepted** — ghostty is standard; the delta is one
+  cursor-position frame until the application repositions (full-screen
+  programs always do). Pinned by the `ghostty_homed_cursor_column` check
+  (same line, column 0).
+
+## P7-005 — Column-shrink reflow rotates overflow into scrollback on alacritty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: a column-shrinking resize while a wrapped line
+  grows taller with rows below it (corpus row `reflow_shrink_and_grow`).
+- **Old behavior**: alacritty anchors the cursor's screen row by rotating
+  the extra wrapped rows into scrollback: content shifts up, history grows,
+  the cursor keeps its viewport-relative row.
+- **New behavior**: ghostty reflows in place: content keeps its position,
+  history does not grow, the cursor rides its content line downward.
+- **Adjudication**: **accepted**. Both are legitimate reflow strategies;
+  the logical content is identical (the waiver check asserts full extracted
+  text equality modulo trailing blank rows) and ghostty the terminal ships
+  this behavior. Pinned by `reflow_shrink_and_grow` checked waivers.
+
+## P7-006 — Mouse protocol/encoding mode flags are not mutually exclusive on ghostty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: setting more than one of modes 1000/1002/1003, or
+  both 1005 and 1006 (corpus rows `modes_toggle_all`,
+  `mouse_mode_exclusivity`).
+- **Old behavior**: alacritty makes the three protocol modes (and the two
+  encoding modes) mutually exclusive — setting one clears the others, so
+  un-setting the active one leaves *no* mouse mode.
+- **New behavior**: ghostty tracks each flag independently; the seam's
+  `Modes` rebuild reports every set flag, and un-setting 1003 can reveal a
+  still-set 1000.
+- **Adjudication**: **accepted**. Zed's mouse policy takes the strongest
+  set protocol and SGR over UTF-8, which matches alacritty's outcome for
+  every escalating sequence real applications send; only a deliberate
+  protocol *downgrade* without clearing (unobserved in the wild) differs.
+  Pinned by the `ghostty_mouse_flags_superset` check (non-mouse bits
+  identical, alacritty's bits a subset).
+
+## P7-007 — ANSI-mode DECRQM goes unanswered by ghostty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: `CSI Ps $ p` (ANSI form, e.g. IRM `CSI 4 $ p`;
+  corpus row `decrqm_ansi_mode_reports`). The private form
+  (`CSI ? Ps $ p`) is byte-identical on both.
+- **Old behavior**: alacritty reports, e.g. `CSI 4;2 $ y`.
+- **New behavior**: ghostty sends no reply — the querying application sees
+  the same silence an unsupporting terminal produces.
+- **Adjudication**: **accepted** — degraded-but-standard: DECRQM clients
+  must (and do) handle no-reply. Pinned by the
+  `alacritty_extra_is_ansi_decrpm` check.
+
+## P7-008 — Ghostty answers the kitty keyboard progressive-enhancement query
+
+- **Phase / change**: P7, as above. The forced finding of the #32
+  input-encoding resolution, now pinned differentially.
+- **Triggering input**: `CSI ? u` (and push/pop `CSI > flags u`,
+  `CSI < u`; corpus row `kitty_keyboard_query`).
+- **Old behavior**: silence (the fork's kitty support is compile-time off).
+- **New behavior**: ghostty's core answers (`CSI ? 0 u`, tracking pushed
+  flags).
+- **Adjudication**: **accepted** — SPEC.md §1 explicitly accepts kitty
+  keyboard arriving via ghostty as an incidental capability gain; #32
+  found legacy-only encoding was never parity-neutral. Pinned by the
+  `ghostty_extra_is_kitty_report` check.
+
+## P7-009 — Secondary DA firmware stamp matched to the alacritty era
+
+- **Phase / change**: P7, as above; seam change in
+  `crates/terminal/src/ghostty.rs` (`on_device_attributes`).
+- **Triggering input**: `CSI > c` (vim sends it as t_RV on startup; corpus
+  row `secondary_device_attributes`).
+- **Old behavior**: alacritty answers `CSI > 0;2601;1 c`
+  (`version_number("0.26.1")` of the pinned fork).
+- **New behavior (before the fix)**: the dark backend's registration
+  answered `CSI > 0;0;0 c`.
+- **Adjudication**: **fixed in the seam** — the registration now stamps
+  `0;2601;1`, byte-identical to today, so version-sniffing applications see
+  no change at the swap. The corpus row also catches future fork pin bumps
+  changing the stamp.
+
+## P7-010 — `content_text` trailing blank rows
+
+- **Phase / change**: P7, as above; seam change in
+  `crates/terminal/src/ghostty.rs` (`content_text`).
+- **Triggering input**: any `Terminal::get_content()` call — alacritty's
+  `bounds_to_string` emits one newline per blank row below the last
+  occupied row (minus the single trailing newline it strips), ghostty's
+  formatter trimmed them all.
+- **Adjudication**: **fixed in the seam** — the ghostty backend counts
+  trailing blank rows (alacritty's `line_length` notion of occupancy) and
+  re-appends the newlines, making the public extraction byte-identical.
+  Pinned by every corpus row's full-probe `ContentText` comparison.
+
+## P7-011 — BCE background lost from erased cells (dark-backend bug)
+
+- **Phase / change**: P7, as above; seam fix in
+  `crates/terminal/src/ghostty.rs` (`collect_viewport_cells`).
+- **Triggering input**: EL/ED under an active SGR background — e.g. a tmux
+  status bar (`recorded_tmux_split_scroll`; corpus row
+  `bce_erase_with_background`).
+- **Old behavior**: alacritty fills erased cells with the current
+  background.
+- **New behavior (before the fix)**: the snapshot read only the style
+  layer, but ghostty stores an erased cell's background as cell *content*
+  (`BgColorPalette`/`BgColorRgb` content tags) — the seam surfaced default
+  backgrounds, visually dropping status-bar fills.
+- **Adjudication**: **fixed in the seam** — the snapshot now reads the
+  bg-color content tags. A P5 latent bug caught by the first recorded
+  transcript; exactly the class the differential harness exists for.
+
+## P7-012 — Ghostty answers the color-scheme report and XTVERSION
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: `CSI ? 996 n` and `CSI > 0 q` (tmux probes both on
+  startup; `recorded_tmux_split_scroll`).
+- **Old behavior**: silence on both.
+- **New behavior**: ghostty reports the color scheme (`CSI ? 997 ; s n`,
+  answered from the seam's registered scheme) and XTVERSION
+  (`DCS > | libghostty ST` — the core substitutes its own name; an empty
+  callback return cannot suppress the reply).
+- **Adjudication**: **accepted** — both are standard, capability-signaling
+  replies; the color-scheme report is a wanted integration (theme-aware
+  applications), and XTVERSION identifies the core truthfully. Pinned by
+  the `ghostty_extra_is_ignored_query_response` check.
+
+## P7-013 — Erased cells keep active SGR attribute flags on alacritty
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: EL/ED while attribute SGRs (inverse, bold) are
+  active — `top`'s header bars (`recorded_top_process_viewer`).
+- **Old behavior**: alacritty stamps the full SGR template into the fill,
+  so erased blanks carry INVERSE/BOLD flags (an inverse blank renders as a
+  visible block).
+- **New behavior**: ghostty erases attribute-free, carrying only the
+  background color (xterm semantics).
+- **Adjudication**: **accepted** — ghostty matches xterm; full-screen
+  programs overdraw these cells immediately. Pinned by the
+  `erased_cells_drop_attribute_flags` check (colors and text identical,
+  ghostty flags empty).
+
+## P7-014 — Cursor column after a column-grow resize with pending wrap
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: a resize that widens the grid while the cursor sits
+  in the pending-wrap state after filling a full row
+  (`recorded_top_process_viewer`, 80→110 columns).
+- **Old behavior**: alacritty un-wraps and places the cursor one past the
+  old row end (column 80).
+- **New behavior**: ghostty keeps it on the last written column (79).
+- **Adjudication**: **accepted** — a one-column delta in a state the
+  application always exits by repositioning; in the observed sessions the
+  cursor is hidden throughout (the waiver check requires both cursors
+  hidden). Revisit only if a visible-cursor variant surfaces.
+
+## P7-015 — Alt-screen resize anchoring differs until the application redraws
+
+- **Phase / change**: P7, as above.
+- **Triggering input**: resizing while the alternate screen is active —
+  vi's 100×30 → 70×20 shrink and tmux's 110×30 → 80×24 shrink
+  (`recorded_vi_editing_session`, `recorded_tmux_split_scroll`).
+- **Old behavior**: alacritty keeps the top rows (truncating from the
+  bottom) on alt-screen row shrink.
+- **New behavior**: ghostty anchors near the cursor/bottom, so a different
+  row window survives the shrink.
+- **Adjudication**: **accepted**. The divergent frames are transient: every
+  alt-screen application redraws on SIGWINCH, and both backends converge
+  on the very next output chunk (the recorded transcripts show exactly
+  this). No steady state differs. Pinned by the recorded-session waivers,
+  which the following redraw steps bound.
+
+## P7-016 — Non-gating fuzz lane: outstanding finding classes
+
+- **Phase / change**: P7, as above. The structured VT fuzzer
+  (`differential::fuzz`, `#[ignore]`d, run by CI with continue-on-error)
+  applies the checked adjudications above corpus-wide; what remains are
+  open findings, recorded here per §3.3 so none is silently lost. At P7
+  the lane reports findings in these classes:
+  - combining-mark attachment (zerowidth placement after CJK, at row
+    starts, and across wrap boundaries);
+  - CSI parameter overflow clamping (e.g. `CSI 99999999999999999999 A`);
+  - truncated/malformed CSI recovery (how many following bytes are
+    consumed);
+  - NUL and C0-in-sequence handling;
+  - wide-char placement interactions after the above desynchronize the
+    cursor.
+- **Adjudication**: **open** — fuzzing is non-gating at P7 by decision
+  (SPEC.md §7). Each confirmed real divergence gets promoted into the
+  synthetic corpus and its own entry as it is triaged during the P8–P10
+  window; the P10 gate requires zero unadjudicated fuzz findings.

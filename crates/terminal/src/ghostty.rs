@@ -23,7 +23,7 @@ use ghostty_vt::{
     error::Error as GhosttyError,
     fmt::Format,
     render::{CellIterator, CursorVisualStyle, Dirty, RowIterator},
-    screen::{CellWide, Screen, TrackedGridRef},
+    screen::{CellContentTag, CellWide, Screen, TrackedGridRef},
     selection::{
         FormatOptions, SelectLineOptions, SelectWordOptions, Selection as GhosttySelection,
     },
@@ -356,8 +356,73 @@ impl TerminalBackend {
     }
 
     pub(super) fn content_text(&self) -> String {
-        self.format_range_text(GridDimensions::of(self).full_range())
-            .unwrap_or_default()
+        let formatted = self
+            .format_range_text(GridDimensions::of(self).full_range())
+            .unwrap_or_default();
+        // Alacritty's `bounds_to_string` emits one newline per blank row
+        // below the last occupied row (minus the one trailing newline it
+        // strips); ghostty's formatter trims them all — except a styled
+        // blank row, which can leave a stray trailing newline. Normalize the
+        // tail, then re-append so the public extraction stays byte-identical.
+        let formatted = formatted.trim_end_matches('\n');
+        let trailing_blank_rows = self.trailing_blank_rows();
+        if formatted.is_empty() {
+            "\n".repeat(trailing_blank_rows.saturating_sub(1))
+        } else {
+            formatted.to_string() + &"\n".repeat(trailing_blank_rows)
+        }
+    }
+
+    /// Count rows below the last occupied row, where "occupied" follows
+    /// alacritty's `line_length`: a wrapped row counts whole, and a cell
+    /// counts when it holds a non-space character or a grapheme cluster
+    /// (a space carrying zerowidth marks is occupied).
+    fn trailing_blank_rows(&self) -> usize {
+        let columns = self.columns();
+        let mut blank_rows = 0;
+        for row in (0..self.total_lines() as u32).rev() {
+            if !self.screen_row_is_blank(row, columns) {
+                break;
+            }
+            blank_rows += 1;
+        }
+        blank_rows
+    }
+
+    fn screen_row_is_blank(&self, row: u32, columns: usize) -> bool {
+        let Some(grid_ref) = self
+            .terminal
+            .grid_ref(GhosttyPoint::Screen(PointCoordinate { x: 0, y: row }))
+            .log_err()
+        else {
+            return true;
+        };
+        let Some(row_state) = grid_ref.row().log_err() else {
+            return true;
+        };
+        if row_state.is_wrapped().log_err().unwrap_or(false)
+            || row_state.has_grapheme_cluster().log_err().unwrap_or(false)
+        {
+            return false;
+        }
+        for column in 0..columns {
+            let occupied = self
+                .terminal
+                .grid_ref(GhosttyPoint::Screen(PointCoordinate {
+                    x: column as u16,
+                    y: row,
+                }))
+                .and_then(|grid_ref| {
+                    let cell = grid_ref.cell()?;
+                    Ok(!matches!(cell.codepoint()?, 0 | 0x20))
+                })
+                .log_err()
+                .unwrap_or(false);
+            if occupied {
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) fn full_content_range(&self) -> Range {
@@ -928,6 +993,19 @@ impl TerminalBackend {
                     flags.insert(CellFlags::WIDE_CHAR_SPACER);
                 }
 
+                // Cells erased under an SGR background carry their color as
+                // cell *content* (bg-color content tags), not as a style
+                // entry — reading the style alone drops the background of
+                // BCE-filled cells (e.g. a tmux status bar's EL fill).
+                let bg = match raw_cell.content_tag()? {
+                    CellContentTag::BgColorPalette => color_from_style(
+                        StyleColor::Palette(raw_cell.bg_color_palette()?),
+                        NamedColor::Background,
+                    ),
+                    CellContentTag::BgColorRgb => Color::Spec(zed_rgb(raw_cell.bg_color_rgb()?)),
+                    _ => color_from_style(style.bg_color, NamedColor::Background),
+                };
+
                 let extra = (!zerowidth.is_empty() || hyperlink.is_some()).then(|| {
                     Arc::new(CellExtra {
                         zerowidth,
@@ -941,7 +1019,7 @@ impl TerminalBackend {
                     cell: Cell {
                         c: if character == '\0' { ' ' } else { character },
                         fg: color_from_style(style.fg_color, NamedColor::Foreground),
-                        bg: color_from_style(style.bg_color, NamedColor::Background),
+                        bg,
                         flags,
                         extra,
                     },
@@ -1299,8 +1377,10 @@ fn register_callbacks(
                 events.borrow_mut().push_back(event);
             }
         })?
-        // Parity: the alacritty-era core never answers XTVERSION, so the
-        // mandatory registration responds with a silent ignore.
+        // The alacritty-era core never answers XTVERSION, but ghostty
+        // substitutes its own core name when the callback yields nothing —
+        // the response cannot be suppressed through this API (divergence
+        // ledger P7-012, accepted).
         .on_xtversion(|_| None)?
         .on_size({
             let bounds = bounds.clone();
@@ -1321,10 +1401,16 @@ fn register_callbacks(
         .on_device_attributes(|_| {
             Some(DeviceAttributes {
                 primary: PRIMARY_DEVICE_ATTRIBUTES,
+                // Byte-identical to the alacritty-era secondary DA response
+                // `\x1b[>0;2601;1c` (alacritty_terminal 0.26.1's
+                // `version_number` stamp), so applications keying on it see
+                // no change at the swap (divergence ledger P7-009). The
+                // differential corpus row `secondary_device_attributes`
+                // pins this and catches fork pin bumps.
                 secondary: SecondaryDeviceAttributes {
                     device_type: DeviceType::VT100,
-                    firmware_version: 0,
-                    rom_cartridge: 0,
+                    firmware_version: 2601,
+                    rom_cartridge: 1,
                 },
                 tertiary: TertiaryDeviceAttributes { unit_id: 0 },
             })
@@ -1552,7 +1638,7 @@ fn color_from_style(color: StyleColor, default: NamedColor) -> Color {
     }
 }
 
-fn named_ansi_color(index: u8) -> NamedColor {
+pub(super) fn named_ansi_color(index: u8) -> NamedColor {
     match index {
         0 => NamedColor::Black,
         1 => NamedColor::Red,

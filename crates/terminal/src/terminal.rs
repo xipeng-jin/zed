@@ -1,6 +1,10 @@
 mod mappings;
 
 mod alacritty;
+// The differential harness (SPEC.md §6 P7, §7): transcript-driven
+// comparison of both backends plus the alacritty perf-baseline scenarios.
+#[cfg(test)]
+mod differential;
 // The dark ghostty backend (SPEC.md §6 P5): compiled and tested on Linux,
 // unused by production until the P8 swap re-points the backend import.
 #[cfg(target_os = "linux")]

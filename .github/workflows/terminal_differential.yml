@@ -1,0 +1,39 @@
+# The P7 differential oracle (docs/ghostty-migration/SPEC.md §6 P7, §7):
+# feeds identical transcripts — recorded sessions + per-parity-matrix-row
+# synthetic sequences — to both terminal backends in one test binary and
+# compares seam-level snapshots. The corpus job GATES: it must run
+# divergence-free modulo the adjudications in
+# docs/ghostty-migration/divergence-ledger.md. The fuzz lane is NON-GATING
+# by decision (verification-strategy.md §3.3): findings are surfaced for
+# adjudication, not enforced, until the P10 removal gate.
+#
+# Hand-written (not xtask-generated): it must run on this fork, where the
+# xtask-generated workflows are guarded to zed-industries and use Namespace
+# runners. Fold into run_tests.rs when the migration upstreams.
+name: terminal_differential
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+      - migration/libghostty
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  differential_corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: run the differential corpus (gating)
+        run: cargo test -p terminal --lib differential::
+      - name: run the differential fuzz lane (non-gating)
+        continue-on-error: true
+        run: cargo test -p terminal --lib -- --ignored --nocapture differential::fuzz

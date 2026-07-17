@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Record a raw PTY transcript in the ZTRX v1 binary format consumed by the
+terminal crate's differential harness (docs/ghostty-migration/SPEC.md §6 P7;
+verification-strategy.md §3.1).
+
+A transcript is an ordered event stream of raw output chunks and resize
+events — exactly what the terminal emulator sees. The file starts with the
+magic b"ZTRX\\x01" followed by events:
+
+  0x01 <u32le length> <bytes>   raw PTY output chunk
+  0x02 <u16le cols> <u16le rows> resize (the first event records the initial size)
+
+Interactive mode (default) proxies the current terminal to the child and
+records output and window resizes from a live session:
+
+  script/terminal-record-transcript out.ztrx -- vi notes.txt
+
+Scripted mode drives the child from a JSON step list instead, for
+reproducible fixture recording:
+
+  script/terminal-record-transcript out.ztrx --steps steps.json -- bash -i
+
+where steps.json is a list of objects: {"send": "text"}, {"resize": [cols,
+rows]}, or {"wait_ms": 250}. Output is drained and recorded continuously
+between steps.
+"""
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import tty
+
+MAGIC = b"ZTRX\x01"
+TAG_BYTES = 0x01
+TAG_RESIZE = 0x02
+READ_SIZE = 65536
+
+
+class Writer:
+    def __init__(self, path):
+        self.file = open(path, "wb")
+        self.file.write(MAGIC)
+
+    def bytes_event(self, chunk):
+        self.file.write(struct.pack("<BI", TAG_BYTES, len(chunk)))
+        self.file.write(chunk)
+
+    def resize_event(self, cols, rows):
+        self.file.write(struct.pack("<BHH", TAG_RESIZE, cols, rows))
+
+    def close(self):
+        self.file.close()
+
+
+def set_winsize(fd, cols, rows):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def get_winsize(fd):
+    rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+    return cols, rows
+
+
+def drain(master_fd, writer, timeout):
+    """Read and record whatever the child has produced within `timeout`
+    seconds of quiet. Returns False once the child side reports EOF."""
+    while True:
+        try:
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+        except InterruptedError:
+            continue
+        if not ready:
+            return True
+        try:
+            chunk = os.read(master_fd, READ_SIZE)
+        except OSError as error:
+            if error.errno == errno.EIO:  # child side closed
+                return False
+            raise
+        if not chunk:
+            return False
+        writer.bytes_event(chunk)
+
+
+def run_scripted(master_fd, writer, steps):
+    alive = True
+    for step in steps:
+        if not alive:
+            break
+        if "send" in step:
+            os.write(master_fd, step["send"].encode())
+            alive = drain(master_fd, writer, 0.25)
+        elif "resize" in step:
+            cols, rows = step["resize"]
+            # Record the resize where it happened in the output stream, as
+            # the emulator would observe it.
+            writer.resize_event(cols, rows)
+            set_winsize(master_fd, cols, rows)
+            alive = drain(master_fd, writer, 0.25)
+        elif "wait_ms" in step:
+            alive = drain(master_fd, writer, step["wait_ms"] / 1000.0)
+        else:
+            raise ValueError(f"unknown step: {step}")
+    if alive:
+        drain(master_fd, writer, 1.0)
+
+
+def run_interactive(master_fd, writer):
+    stdin_fd = sys.stdin.fileno()
+    resized = []
+
+    def on_winch(_signum, _frame):
+        resized.append(get_winsize(sys.stdout.fileno()))
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    saved = termios.tcgetattr(stdin_fd)
+    tty.setraw(stdin_fd)
+    try:
+        while True:
+            while resized:
+                cols, rows = resized.pop(0)
+                writer.resize_event(cols, rows)
+                set_winsize(master_fd, cols, rows)
+            try:
+                ready, _, _ = select.select([stdin_fd, master_fd], [], [])
+            except InterruptedError:
+                continue
+            if master_fd in ready:
+                try:
+                    chunk = os.read(master_fd, READ_SIZE)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                writer.bytes_event(chunk)
+                os.write(sys.stdout.fileno(), chunk)
+            if stdin_fd in ready:
+                data = os.read(stdin_fd, READ_SIZE)
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", help="transcript file to write (.ztrx)")
+    parser.add_argument("--cols", type=int, default=None)
+    parser.add_argument("--rows", type=int, default=None)
+    parser.add_argument("--steps", help="JSON step list; drives the session instead of stdin")
+    parser.add_argument("command", nargs="*", help="command to run (default: $SHELL)")
+    args = parser.parse_args()
+
+    command = args.command or [os.environ.get("SHELL", "/bin/sh")]
+    cols, rows = args.cols, args.rows
+    if cols is None or rows is None:
+        if args.steps is None and sys.stdout.isatty():
+            cols, rows = get_winsize(sys.stdout.fileno())
+        else:
+            cols, rows = cols or 80, rows or 24
+
+    steps = None
+    if args.steps:
+        with open(args.steps) as file:
+            steps = json.load(file)
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.environ.setdefault("TERM", "xterm-256color")
+        os.execvp(command[0], command)
+
+    set_winsize(master_fd, cols, rows)
+    writer = Writer(args.output)
+    writer.resize_event(cols, rows)
+    try:
+        if steps is not None:
+            run_scripted(master_fd, writer, steps)
+        else:
+            run_interactive(master_fd, writer)
+    finally:
+        writer.close()
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        os.close(master_fd)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    print(f"wrote {args.output}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

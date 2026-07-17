@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Runs the alacritty terminal perf-baseline scenarios (SPEC.md §7;
+# verification-strategy.md §6) on a release build: colored dump, wide-char/CJK,
+# alt-screen churn, and sustained scroll, headless through the seam. The fifth
+# scenario — sustained flood through the full PTY seam — is
+# script/terminal-flood-bench (landed at P4).
+#
+# Baseline numbers are recorded in docs/ghostty-migration/perf-baseline.md.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo test -p terminal --release --lib -- --ignored --nocapture \
+    differential::perf::perf_baseline
