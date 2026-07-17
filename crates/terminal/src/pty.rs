@@ -341,8 +341,17 @@ fn spawn_reader_thread(
         .spawn(move || {
             let mut buffer = vec![0u8; READ_BATCH_SIZE];
             let mut receiver_alive = true;
+            let mut reads = 0u32;
             loop {
-                match reader.read(&mut buffer) {
+                let read_result = reader.read(&mut buffer);
+                if cfg!(test) && reads < 4 {
+                    reads += 1;
+                    eprintln!(
+                        "[pty-reader] read #{reads}: {:?}",
+                        read_result.as_ref().map(|count| *count)
+                    );
+                }
+                match read_result {
                     // portable-pty maps the Linux slave-hangup EIO to a clean
                     // EOF already.
                     Ok(0) => break,
@@ -368,7 +377,11 @@ fn spawn_reader_thread(
 
             // `None` means the Windows exit poller observed and reported the
             // exit first; nothing left to do.
-            if let Some(status) = reap_child(&child)
+            let status = reap_child(&child);
+            if cfg!(test) {
+                eprintln!("[pty-reader] eof; reaped: {status:?}");
+            }
+            if let Some(status) = status
                 && receiver_alive
             {
                 for event in exit_event_sequence(status) {
@@ -464,15 +477,27 @@ fn spawn_exit_poller(
 ) -> Task<()> {
     let timer_executor = executor.clone();
     executor.spawn(async move {
+        if cfg!(test) {
+            eprintln!("[exit-poller] started");
+        }
+        let mut ticks = 0u32;
         loop {
             timer_executor.timer(EXIT_POLL_INTERVAL).await;
+            ticks += 1;
             let status = {
                 let mut guard = child.lock();
                 let Some(live_child) = guard.as_mut() else {
                     // The reader thread reaped first (master already dropped).
+                    if cfg!(test) {
+                        eprintln!("[exit-poller] tick {ticks}: child already reaped");
+                    }
                     return;
                 };
-                match live_child.try_wait() {
+                let polled = live_child.try_wait();
+                if cfg!(test) && (ticks <= 3 || !matches!(polled, Ok(None))) {
+                    eprintln!("[exit-poller] tick {ticks}: {polled:?}");
+                }
+                match polled {
                     Ok(None) => continue,
                     Ok(Some(status)) => {
                         guard.take();
@@ -488,6 +513,9 @@ fn spawn_exit_poller(
                 if output_tx.send(PtyOutput::Event(event)).await.is_err() {
                     return;
                 }
+            }
+            if cfg!(test) {
+                eprintln!("[exit-poller] exit reported after {ticks} ticks");
             }
             return;
         }
@@ -579,30 +607,22 @@ mod tests {
         }
     }
 
-    /// Waits until the session has demonstrably produced output containing
-    /// `marker` — on Windows, acting on a ConPTY session before conhost is
-    /// fully up races its startup, so the §8.2 tests establish liveness first.
+    /// Waits until the session has demonstrably produced output — on Windows,
+    /// acting on a ConPTY session before conhost is fully up races its
+    /// startup, so the §8.2 tests establish liveness first. Deliberately does
+    /// not match on content: ConPTY output is a VT stream whose text framing
+    /// is not guaranteed.
     #[cfg(windows)]
-    async fn wait_for_output_containing(
-        marker: &str,
+    async fn wait_for_first_output(
         output_rx: &async_channel::Receiver<PtyOutput>,
         executor: &BackgroundExecutor,
     ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        loop {
-            match recv_output(output_rx, executor).await {
-                PtyOutput::Bytes(batch) => {
-                    bytes.extend_from_slice(&batch);
-                    if String::from_utf8_lossy(&bytes).contains(marker) {
-                        return bytes;
-                    }
-                }
-                // An exit event before the marker means the session ended
-                // byte-less; surface that instead of timing out opaquely.
-                PtyOutput::Event(event) => panic!(
-                    "session ended before producing {marker:?}: got {event:?}; output so far: {:?}",
-                    String::from_utf8_lossy(&bytes)
-                ),
+        match recv_output(output_rx, executor).await {
+            PtyOutput::Bytes(batch) => batch,
+            // An exit event before any bytes means the session ended
+            // byte-less; surface that instead of timing out opaquely.
+            PtyOutput::Event(event) => {
+                panic!("session ended before producing output: got {event:?}")
             }
         }
     }
@@ -771,7 +791,7 @@ mod tests {
         // Acting on a ConPTY session before conhost is up races its startup;
         // wait for the cmd banner first (the passing shutdown test's shape).
         eprintln!("[conpty-resize] spawned; waiting for banner");
-        wait_for_output_containing("Microsoft", &output_rx, &executor).await;
+        wait_for_first_output(&output_rx, &executor).await;
 
         let bounds = TerminalBounds::new(
             gpui::px(10.),
@@ -821,11 +841,7 @@ mod tests {
         .expect("failed to spawn pty");
 
         // Wait for the cmd banner so the session is fully up.
-        loop {
-            if let PtyOutput::Bytes(_) = recv_output(&output_rx, &executor).await {
-                break;
-            }
-        }
+        wait_for_first_output(&output_rx, &executor).await;
 
         let SpawnedPty { handle, .. } = spawned;
         handle.shutdown();
@@ -864,7 +880,7 @@ mod tests {
         .expect("failed to spawn pty");
 
         eprintln!("[conpty-exit] spawned; waiting for echo");
-        wait_for_output_containing("conpty-live", &output_rx, &executor).await;
+        wait_for_first_output(&output_rx, &executor).await;
         eprintln!("[conpty-exit] session live; waiting for exit observation");
 
         // The master (and with it the pseudoconsole) stays open for the whole
@@ -895,7 +911,7 @@ mod tests {
         // Kill only once the session has demonstrably started (ping's first
         // line); killing into a half-started ConPTY races conhost startup.
         eprintln!("[conpty-kill] spawned; waiting for ping output");
-        wait_for_output_containing("127.0.0.1", &output_rx, &executor).await;
+        wait_for_first_output(&output_rx, &executor).await;
 
         spawned.handle.shutdown();
         eprintln!("[conpty-kill] shut down; waiting for exit report");
