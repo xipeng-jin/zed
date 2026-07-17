@@ -937,6 +937,101 @@ fn all_search_matches<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Content, terminal_settings::CursorShape as SettingsCursorShape};
+    use gpui::{Bounds, px, size};
+
+    fn test_backend(columns: usize, screen_lines: usize, scrollback: usize) -> TerminalBackend {
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let bounds = TerminalBounds::new(
+            px(16.),
+            px(8.),
+            Bounds {
+                origin: Default::default(),
+                size: size(px(8. * columns as f32), px(16. * screen_lines as f32)),
+            },
+        );
+        TerminalBackend::new(
+            scrollback,
+            SettingsCursorShape::Block,
+            bounds,
+            events_tx,
+            crate::terminal_settings::AlternateScroll::On,
+        )
+    }
+
+    fn screen_rows(content: &Content, columns: usize, screen_lines: usize) -> Vec<String> {
+        let mut rows = vec![vec![' '; columns]; screen_lines];
+        for cell in &content.cells {
+            if (0..screen_lines as i32).contains(&cell.point.line)
+                && cell.point.column < columns
+            {
+                rows[cell.point.line as usize][cell.point.column] = cell.cell.character();
+            }
+        }
+        rows.into_iter()
+            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    /// The G5 clear seam test (SPEC.md §4.5): pins `clear()`'s
+    /// prompt-preserving behavior against the alacritty backend. The ghostty
+    /// backend carries a twin of this test with byte-identical inputs and
+    /// expectations (crates/terminal/src/ghostty.rs); the two must never
+    /// diverge.
+    #[test]
+    fn clear_preserves_prompt_line_and_erases_scrollback() {
+        let mut backend = test_backend(20, 5, 100);
+        backend.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\nprompt> ");
+
+        // 8 lines on a 5-row screen: 3 lines are in scrollback.
+        assert_eq!(backend.total_lines(), 8);
+        assert_eq!(backend.screen_lines(), 5);
+
+        backend.clear();
+
+        assert_eq!(backend.total_lines(), 5, "scrollback should be erased");
+        assert_eq!(backend.display_offset(), 0);
+
+        let content = backend.make_content(&Content::default());
+        assert_eq!(content.cursor.point, crate::Point::new(0, 8));
+        assert_eq!(
+            screen_rows(&content, 20, 5),
+            vec![
+                "prompt>".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new()
+            ],
+        );
+        assert!(content.scrolled_to_bottom);
+    }
+
+    /// Companion to the G5 clear test: clearing while content sits below the
+    /// cursor erases that content too (the cursor line alone survives).
+    #[test]
+    fn clear_erases_content_below_cursor() {
+        let mut backend = test_backend(20, 5, 100);
+        // Draw two lines, then move the cursor back up to the end of the
+        // first one (CUP row 1, column 6): "below" remains under the cursor.
+        backend.write(b"one> \r\nbelow\x1b[1;6H");
+
+        backend.clear();
+
+        assert_eq!(backend.total_lines(), 5);
+        let content = backend.make_content(&Content::default());
+        assert_eq!(content.cursor.point, crate::Point::new(0, 5));
+        assert_eq!(
+            screen_rows(&content, 20, 5),
+            vec![
+                "one>".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new()
+            ],
+        );
+    }
 
     // The former `terminal_hyperlink_from_alacritty_keeps_alacritty_storage` and
     // `terminal_cell_from_alacritty_shares_extra_storage` tests asserted that

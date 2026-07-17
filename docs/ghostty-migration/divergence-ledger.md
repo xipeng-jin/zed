@@ -326,3 +326,66 @@ found by inspection, per the P3 precedent.
   ≤ 623 µs mean 264 µs during flood; interactive rows re-verified on the
   `:99` harness. Coalescing knobs remain a post-removal tuning rider
   (SPEC.md §6) if a real regression appears.
+
+---
+
+P5 entries (dark ghostty backend core, ticket #46) describe the dark
+`ghostty::TerminalBackend` only — production stays on alacritty until P8, so
+nothing here is user-observable during the dark window. Entries are recorded
+now because the backend suite pins the behavior.
+
+## P5-001 — Scrollback limit is page-granular, not an exact line count
+
+- **Phase / change**: P5 (dark ghostty backend core, ticket #46). The
+  creation contract sets `Options.max_scrollback` from Zed's
+  `scrolling_history` setting (SPEC.md §3).
+- **Triggering input**: any terminal whose scrollback grows past the
+  configured line limit (e.g. `max_scroll_history_lines: 2` followed by
+  thousands of output lines).
+- **Old behavior**: alacritty's grid caps history at *exactly* the
+  configured number of lines; the oldest line disappears as soon as line
+  N+1 scrolls off.
+- **New behavior**: ghostty's `max_scrollback` is a byte limit over its
+  page storage, rounded up to whole 512 KiB pages (despite the C header
+  documenting "lines"; `Screen.init` documents bytes). The seam converts
+  lines → whole standard pages (`lines.div_ceil(215) × 512 KiB`, a
+  standard page holding 215 rows at up to 215 columns), so at least the
+  configured line count is retained in the common case, and pruning
+  happens at page granularity. A terminal may retain *more* history than
+  configured (up to the page boundary), and rows with very wide grids or
+  heavy grapheme/style data may retain slightly less. Zero remains exact:
+  scrollback fully disabled.
+- **Adjudication**: **accepted**. The setting's intent is a memory bound
+  with an approximate history horizon, which the page conversion
+  preserves; ghostty's own scrollback-limit config has identical
+  semantics, storage is allocated lazily, and historical pages compress.
+  Exact line-count parity is structurally unavailable without forking the
+  core. Pinned by
+  `ghostty::tests::creation_contract_bounds_scrollback` (zero exact,
+  non-zero bounded).
+
+## P5-002 — Selection text trims trailing spaces at a mid-row selection cut
+
+- **Phase / change**: P5 (dark ghostty backend core, ticket #46).
+  `selection_text` / `Content::selection_text` format through ghostty's
+  selection formatter (plain, unwrap, trim), matching ghostty's own
+  `Screen.selectionString` copy semantics.
+- **Triggering input**: a selection whose end lands on space cells that are
+  *interior* to the row — e.g. selecting `b ` out of `a世b 世世x` (the row
+  continues with text after the selected space).
+- **Old behavior**: alacritty's `bounds_to_string` cuts each row at
+  `min(row.line_length(), selection end + 1)`; because the row's last
+  non-space cell lies beyond the selection, the selected space survives:
+  `"b "`.
+- **New behavior**: ghostty's formatter trims trailing whitespace per
+  formatted line, so the selection-trailing space is dropped: `"b"`.
+  Row-trailing whitespace (typed or unwritten) is trimmed identically by
+  both backends, so the delta is exactly the mid-row cut case.
+- **Adjudication**: **accepted**. Neither formatter flag reproduces
+  alacritty's per-row `line_length` cut (`trim` drops the interior space,
+  `no-trim` keeps unwritten trailing blanks alacritty removes), and an
+  exact seam reconstruction would re-derive row content lengths around the
+  unwrap join for a cosmetic whitespace difference in copied text. Ghostty
+  the terminal ships this exact behavior for its own copy path. Pinned by
+  `ghostty::tests::simple_selection_over_wide_chars_matches_alacritty`
+  (case 3 asserts both behaviors, ledger-referenced).

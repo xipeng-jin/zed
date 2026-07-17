@@ -1,6 +1,11 @@
 mod mappings;
 
 mod alacritty;
+// The dark ghostty backend (SPEC.md §6 P5): compiled and tested on Linux,
+// unused by production until the P8 swap re-points the backend import.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod ghostty;
 mod pty;
 mod pty_info;
 pub mod terminal_settings;
