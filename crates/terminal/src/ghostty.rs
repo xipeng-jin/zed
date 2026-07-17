@@ -6,6 +6,7 @@
 
 mod grid_search;
 mod hyperlinks;
+mod vi_mode;
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
@@ -39,7 +40,7 @@ use util::{ResultExt, paths::PathStyle};
 use crate::{
     Cell, CellExtra, CellFlags, Color, Content, Cursor, CursorShape, Hyperlink, IndexedCell,
     Modes, NamedColor, Point, PtyEvent, Range, Rgb, Scroll, Selection, SelectionRange,
-    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
+    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
@@ -139,9 +140,13 @@ pub(super) struct TerminalBackend {
     /// clear, or a dirty-full frame (SPEC.md §4.2 S3).
     display_offset: StdCell<Option<usize>>,
     selection: Option<SeamSelection>,
-    /// Zed-side vi-mode state surfaced as `Modes::VI`; driven by the P6 vi
-    /// port, always `false` until then.
+    /// Zed-side vi-mode state surfaced as `Modes::VI` (SPEC.md §4.2),
+    /// toggled by `toggle_vi_mode`.
     vi_mode: bool,
+    /// The vi cursor in the grid convention; alacritty keeps its
+    /// `vi_mode_cursor` alive the same way, so this stays meaningful (and
+    /// viewport-clamped) even while `vi_mode` is off.
+    vi_cursor: Point,
     prev_cursor_blinking: Option<bool>,
     prev_mouse_mode: Option<bool>,
 }
@@ -237,6 +242,7 @@ impl TerminalBackend {
             display_offset: StdCell::new(None),
             selection: None,
             vi_mode: false,
+            vi_cursor: Point::new(0, 0),
             prev_cursor_blinking: None,
             prev_mouse_mode: None,
         }
@@ -419,6 +425,14 @@ impl TerminalBackend {
         self.selection = None;
         self.terminal.set_selection(None).log_err();
         self.display_offset.set(None);
+        // Alacritty's resize also shifts the vi cursor with the content
+        // delta and clamps it to the viewport; the delta shift happens
+        // below the seam (ledger P6-004), the clamps port directly.
+        self.clamp_vi_cursor_to_viewport();
+        self.vi_cursor.column = self
+            .vi_cursor
+            .column
+            .min(GridDimensions::of(self).last_column());
     }
 
     pub(super) fn scroll_display(&mut self, scroll: Scroll) {
@@ -433,6 +447,18 @@ impl TerminalBackend {
         };
         self.terminal.scroll_viewport(scroll_viewport);
         self.display_offset.set(None);
+        // Alacritty's scroll_display clamps the vi cursor into the new
+        // viewport (the scroll-follow in `update_vi_cursor_for_scroll`
+        // starts from the clamped point) and re-anchors a vi-dragged
+        // selection to it.
+        self.clamp_vi_cursor_to_viewport();
+        self.vi_mode_recompute_selection();
+    }
+
+    fn clamp_vi_cursor_to_viewport(&mut self) {
+        let viewport_start = -(self.display_offset() as i32);
+        let viewport_end = viewport_start + self.screen_lines() as i32 - 1;
+        self.vi_cursor.line = self.vi_cursor.line.clamp(viewport_start, viewport_end);
     }
 
     pub(super) fn scroll_to_point(&mut self, point: Point) {
@@ -544,6 +570,97 @@ impl TerminalBackend {
         Some(text)
     }
 
+    pub(super) fn toggle_vi_mode(&mut self) {
+        self.vi_mode = !self.vi_mode;
+        if self.vi_mode {
+            let display_offset = self.display_offset() as i32;
+            let bottommost_line = self.screen_lines() as i32 - 1;
+            let cursor_line = self.terminal.cursor_y().log_err().unwrap_or(0) as i32;
+            let cursor_column = self.terminal.cursor_x().log_err().unwrap_or(0) as usize;
+            self.vi_cursor = if cursor_line > bottommost_line - display_offset {
+                // Start at the viewport's top-left when the terminal
+                // cursor is scrolled out of view.
+                Point::new(-display_offset, 0)
+            } else {
+                Point::new(cursor_line, cursor_column)
+            };
+        }
+        // Parity: alacritty's toggle notifies a cursor-blinking state
+        // change.
+        self.send_event(TerminalBackendEvent::CursorBlinkingChange);
+    }
+
+    pub(super) fn vi_motion(&mut self, motion: ViMotion) {
+        if !self.vi_mode {
+            return;
+        }
+        let point = vi_mode::motion(self, self.vi_cursor, motion);
+        self.vi_cursor = point_clamp(GridDimensions::of(self), PointBoundary::Grid, point);
+        self.scroll_to_point(self.vi_cursor);
+        self.vi_mode_recompute_selection();
+    }
+
+    pub(super) fn vi_goto_point(&mut self, point: Point) {
+        self.scroll_to_point(point);
+        self.vi_cursor = point;
+        self.vi_mode_recompute_selection();
+    }
+
+    pub(super) fn update_vi_cursor_for_scroll(&mut self, scroll: Scroll) {
+        self.vi_cursor = match scroll {
+            Scroll::Delta(delta) => vi_mode::scroll(self, self.vi_cursor, delta),
+            Scroll::PageUp => vi_mode::scroll(self, self.vi_cursor, self.screen_lines() as i32),
+            Scroll::PageDown => {
+                vi_mode::scroll(self, self.vi_cursor, -(self.screen_lines() as i32))
+            }
+            Scroll::Top => Point::new(GridDimensions::of(self).topmost_line, 0),
+            Scroll::Bottom => Point::new(GridDimensions::of(self).bottommost_line(), 0),
+        };
+    }
+
+    pub(super) fn update_selection_to_vi_cursor(&mut self) -> Option<Point> {
+        let point = self.vi_cursor;
+        let screen_point = self.ghostty_screen_point(point);
+        let selection = self.selection.as_mut()?;
+        selection.end.set(&mut self.terminal, screen_point).log_err();
+        selection.end_side = SelectionSide::Right;
+        self.sync_selection_to_terminal();
+        Some(point)
+    }
+
+    /// Alacritty's `vi_mode_recompute_selection`: while vi mode is on, a
+    /// non-empty selection follows the vi cursor — the end anchor moves to
+    /// the cursor and both sides expand to fully include the anchor cells
+    /// (`Selection::include_all`, non-block arm).
+    fn vi_mode_recompute_selection(&mut self) {
+        if !self.vi_mode || self.selection_range().is_none() {
+            return;
+        }
+        // The anchor move, the side computation, and the sync need
+        // disjoint borrows of the selection and the terminal, hence the
+        // staged updates.
+        let screen_point = self.ghostty_screen_point(self.vi_cursor);
+        if let Some(selection) = self.selection.as_mut() {
+            selection.end.set(&mut self.terminal, screen_point).log_err();
+        }
+        let sides = self.selection.as_ref().and_then(|selection| {
+            let start = self.tracked_grid_point(&selection.start)?;
+            let end = self.tracked_grid_point(&selection.end)?;
+            if start > end {
+                Some((SelectionSide::Right, SelectionSide::Left))
+            } else {
+                Some((SelectionSide::Left, SelectionSide::Right))
+            }
+        });
+        if let Some((start_side, end_side)) = sides
+            && let Some(selection) = self.selection.as_mut()
+        {
+            selection.start_side = start_side;
+            selection.end_side = end_side;
+        }
+        self.sync_selection_to_terminal();
+    }
+
     /// The per-snapshot `Modes` bitfield rebuilt from typed getters
     /// (parity matrix §K).
     pub(super) fn modes(&self) -> Modes {
@@ -634,6 +751,54 @@ impl TerminalBackend {
             .log_err()
     }
 
+    fn character_at(&self, point: Point) -> char {
+        self.terminal
+            .grid_ref(self.ghostty_screen_point(point))
+            .and_then(|grid_ref| grid_ref.cell())
+            .and_then(|cell| cell.codepoint())
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|&character| character != '\0')
+            .unwrap_or(' ')
+    }
+
+    fn row_wrapped(&self, line: i32) -> bool {
+        self.terminal
+            .grid_ref(self.ghostty_screen_point(Point::new(line, 0)))
+            .and_then(|grid_ref| grid_ref.row())
+            .and_then(|row| row.is_wrapped())
+            .log_err()
+            .unwrap_or(false)
+    }
+
+    /// Whether a cell is empty in the sense of alacritty's
+    /// `Cell::is_empty` (the vi paragraph motions): a whitespace character
+    /// with default colors and no inverse/underline/strikeout, not part of
+    /// a wide cell. Upstream's zerowidth check is unreachable through the
+    /// parser for whitespace cells and is not ported.
+    fn cell_is_empty(&self, point: Point) -> bool {
+        self.terminal
+            .grid_ref(self.ghostty_screen_point(point))
+            .and_then(|grid_ref| {
+                let cell = grid_ref.cell()?;
+                let character = char::from_u32(cell.codepoint()?).unwrap_or(' ');
+                if !matches!(character, '\0' | ' ' | '\t') {
+                    return Ok(false);
+                }
+                if cell.wide()? != CellWide::Narrow {
+                    return Ok(false);
+                }
+                let style = grid_ref.style()?;
+                Ok(matches!(style.fg_color, StyleColor::None)
+                    && matches!(style.bg_color, StyleColor::None)
+                    && !style.inverse
+                    && !style.strikethrough
+                    && matches!(style.underline, Underline::None))
+            })
+            .log_err()
+            .unwrap_or(true)
+    }
+
     fn try_make_content(&mut self, last_content: &Content) -> Result<Content, GhosttyError> {
         let collected = self.collect_viewport_cells()?;
 
@@ -664,22 +829,20 @@ impl TerminalBackend {
         }
         self.prev_mouse_mode = Some(mouse_mode);
 
-        let cursor_point = Point::new(
-            self.terminal.cursor_y()? as i32,
-            self.terminal.cursor_x()? as usize,
-        );
-        let cursor_char = self
-            .terminal
-            .grid_ref(GhosttyPoint::Active(PointCoordinate {
-                x: cursor_point.column as u16,
-                y: cursor_point.line as u32,
-            }))
-            .and_then(|grid_ref| grid_ref.cell())
-            .and_then(|cell| cell.codepoint())
-            .ok()
-            .and_then(char::from_u32)
-            .filter(|&character| character != '\0')
-            .unwrap_or(' ');
+        let mut cursor_point = if self.vi_mode {
+            self.vi_cursor
+        } else {
+            Point::new(
+                self.terminal.cursor_y()? as i32,
+                self.terminal.cursor_x()? as usize,
+            )
+        };
+        if self.vi_mode && self.wide_at(cursor_point) == Some(CellWide::SpacerTail) {
+            // RenderableCursor parity for the vi cursor: landing on a
+            // wide-char spacer renders on the wide char itself.
+            cursor_point.column = cursor_point.column.saturating_sub(1);
+        }
+        let cursor_char = self.character_at(cursor_point);
 
         let selection = self.sync_selection_to_terminal();
         let selection_text = if selection.is_some() {
@@ -727,7 +890,9 @@ impl TerminalBackend {
         let columns = snapshot.cols()? as usize;
         let screen_lines = snapshot.rows()? as usize;
         let cursor_blinking = snapshot.cursor_blinking()?;
-        let cursor_shape = if snapshot.cursor_visible()? {
+        // In vi mode the cursor is never hidden (RenderableCursor parity:
+        // the vi cursor shows regardless of DECTCEM).
+        let cursor_shape = if snapshot.cursor_visible()? || self.vi_mode {
             cursor_shape_from_ghostty(snapshot.cursor_visual_style()?)
         } else {
             CursorShape::Hidden
@@ -1446,7 +1611,7 @@ mod tests {
     use futures::channel::mpsc::UnboundedReceiver;
     use gpui::{Bounds, px, size};
 
-    fn test_bounds(columns: usize, screen_lines: usize) -> TerminalBounds {
+    pub(super) fn test_bounds(columns: usize, screen_lines: usize) -> TerminalBounds {
         TerminalBounds::new(
             px(16.),
             px(8.),
@@ -1457,7 +1622,7 @@ mod tests {
         )
     }
 
-    fn test_backend(
+    pub(super) fn test_backend(
         columns: usize,
         screen_lines: usize,
         scrollback: usize,
@@ -1473,7 +1638,7 @@ mod tests {
         (backend, events_rx)
     }
 
-    fn content(backend: &mut TerminalBackend) -> Content {
+    pub(super) fn content(backend: &mut TerminalBackend) -> Content {
         backend.make_content(&Content::default())
     }
 

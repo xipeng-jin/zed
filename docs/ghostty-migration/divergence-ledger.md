@@ -447,3 +447,33 @@ pins the behavior. No ported-test expectation changed in the hover re-host
   a URL whose identity depends on unnormalized combining marks is
   pathological. No ported expectation changed; the `iri` scenarios
   (single-codepoint wide chars) run byte-identical.
+
+## P6-004 — The vi cursor does not ride content rotation during live output
+
+- **Phase / change**: P6 (vi mode port, ticket #49). The seam keeps the vi
+  cursor as a plain grid-convention point on `ghostty::TerminalBackend`;
+  alacritty's `vi_mode_cursor` lives inside `Term`, where
+  `scroll_up_relative` / `scroll_down_relative` shift it with rotating
+  content and `Term::resize` shifts it by the content delta before the
+  viewport clamp. Those rotations happen below the seam in ghostty (inside
+  `vt_write` / `resize`), where the seam has no hook. Recorded by
+  inspection, per the P4 precedent — no ported-test expectation changed
+  (upstream's vi suite only exercises static grids).
+- **Triggering input**: vi mode active while the program keeps emitting
+  scrolling output (e.g. entering vi mode during a running build), or a
+  window resize that moves rows between screen and history while the vi
+  cursor is set.
+- **Old behavior**: the vi cursor sticks to the content line it was on,
+  following it toward/into scrollback as new lines arrive (clamped to the
+  viewport top when display-pinned), and rides the resize content delta.
+- **New behavior**: the vi cursor keeps its viewport-relative grid
+  coordinates while content rotates beneath it; the ported seam clamps it
+  to the viewport on `scroll_display` and `resize` exactly as alacritty
+  does, so it never leaves the visible region or the grid.
+- **Adjudication**: **accepted**. Vi mode is a navigation mode over
+  quiescent output; every Zed-dispatched interaction (motions,
+  scroll-follow, selection drag, goto) recomputes the cursor through the
+  ported paths, which the upstream-seeded suite and the alacritty
+  differential tests pin. A tracked-grid-ref cursor would follow content
+  but diverge from alacritty's viewport-clamp behavior instead. Revisit if
+  the P7 differential corpus surfaces a user-visible delta.
