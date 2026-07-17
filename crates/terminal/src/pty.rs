@@ -92,7 +92,7 @@ pub(super) struct SpawnedPty {
 /// delivers reader EOF on Windows), the writer-thread input channel, and a
 /// killer for the child.
 pub(super) struct PtyHandle {
-    /// `Some` until drop takes it (see the `Drop` impl).
+    /// Wrapping the master lets `Drop` move it onto the Windows closer thread.
     master: Option<Box<dyn MasterPty + Send>>,
     input_tx: async_channel::Sender<Cow<'static, [u8]>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
