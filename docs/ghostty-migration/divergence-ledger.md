@@ -262,12 +262,17 @@ found by inspection, per the P3 precedent.
   handles; wezterm never sees this because it always sideloads its own
   OpenConsole. Alacritty sets the same flag with **null** handles, which
   both blocks handle inheritance and lets the pseudoconsole supply the
-  console handles. **Fixed via D1's exit strategy**: portable-pty is now
-  pinned to the Zed fork (`xipeng-jin/wezterm@9440d98800` = wezterm#7709
-  merge + the null-std-handles patch), restoring alacritty-parity spawn
-  behavior; upstreaming the patch rides with the crates.io-return
-  post-removal item. The original quoting divergence above still stands
-  for the §8.2 gate.
+  console handles. An alacritty-parity null-std-handles patch
+  (`xipeng-jin/wezterm@zed-conpty-null-std-handles`, D1's fork exit
+  strategy) did **not** unwedge argument-bearing children on the runner
+  and coincided with reader-EOF joins regressing there, so the pin stays
+  on upstream `8afe0ad307` and the patch is held as §8.2 gate material.
+  The full diagnosis — whether stock-Windows (kernel32, no sideload)
+  spawning of argument-bearing children through this seam works at all —
+  is a **hard §8.2 gate item on real Windows hardware**; the CI suite
+  covers shutdown/exit/kill/resize via interactive `cmd.exe` sessions,
+  which the runner's in-box ConPTY does handle. The original quoting
+  divergence above also still stands for the gate.
 
 ## P4-002 — Missing or invalid working directory falls back to `$HOME` (unix)
 

@@ -607,25 +607,38 @@ mod tests {
         }
     }
 
-    /// Waits until the session has demonstrably produced output — on Windows,
-    /// acting on a ConPTY session before conhost is fully up races its
-    /// startup, so the §8.2 tests establish liveness first. Deliberately does
-    /// not match on content: ConPTY output is a VT stream whose text framing
-    /// is not guaranteed.
+    /// Waits until the session has demonstrably produced `min_total` bytes of
+    /// output — on Windows, acting on a ConPTY session before conhost is
+    /// fully up races its startup, so the §8.2 tests establish liveness
+    /// first. Sized in bytes rather than matched on content: ConPTY output is
+    /// a VT stream whose text framing is not guaranteed, and its startup
+    /// preamble (~20 bytes across two reads on the CI runner) precedes any
+    /// child text such as the cmd banner.
     #[cfg(windows)]
-    async fn wait_for_first_output(
+    async fn wait_for_output_bytes(
+        min_total: usize,
         output_rx: &async_channel::Receiver<PtyOutput>,
         executor: &BackgroundExecutor,
     ) -> Vec<u8> {
-        match recv_output(output_rx, executor).await {
-            PtyOutput::Bytes(batch) => batch,
-            // An exit event before any bytes means the session ended
-            // byte-less; surface that instead of timing out opaquely.
-            PtyOutput::Event(event) => {
-                panic!("session ended before producing output: got {event:?}")
+        let mut bytes = Vec::new();
+        while bytes.len() < min_total {
+            match recv_output(output_rx, executor).await {
+                PtyOutput::Bytes(batch) => bytes.extend_from_slice(&batch),
+                // An exit event first means the session ended early; surface
+                // that instead of timing out opaquely.
+                PtyOutput::Event(event) => panic!(
+                    "session ended after {} bytes, before reaching {min_total}: got {event:?}",
+                    bytes.len()
+                ),
             }
         }
+        bytes
     }
+
+    /// The ConPTY startup preamble alone is ~20 bytes; the cmd banner pushes
+    /// a session past this.
+    #[cfg(windows)]
+    const SESSION_LIVE_BYTES: usize = 40;
 
     /// Waits for a thread to finish while draining the output channel, so a
     /// producer blocked on the bounded channel can always make progress.
@@ -789,9 +802,9 @@ mod tests {
         .expect("failed to spawn pty");
 
         // Acting on a ConPTY session before conhost is up races its startup;
-        // wait for the cmd banner first (the passing shutdown test's shape).
+        // wait for the cmd banner first.
         eprintln!("[conpty-resize] spawned; waiting for banner");
-        wait_for_first_output(&output_rx, &executor).await;
+        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
 
         let bounds = TerminalBounds::new(
             gpui::px(10.),
@@ -841,7 +854,7 @@ mod tests {
         .expect("failed to spawn pty");
 
         // Wait for the cmd banner so the session is fully up.
-        wait_for_first_output(&output_rx, &executor).await;
+        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
 
         let SpawnedPty { handle, .. } = spawned;
         handle.shutdown();
@@ -867,32 +880,30 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // ping.exe directly, exiting on its own with a known code (0) after
-        // ~1 s of real output. cmd.exe under `/C` never executes at all on
-        // this ConPTY path (ledger P4-001), so it cannot carry this test.
+        // Interactive cmd with `exit 42` typed through the writer thread once
+        // the banner has arrived. Typing must come after the banner: input
+        // written during conhost startup wedges the session, and children
+        // spawned *with arguments* never execute at all on this runner's
+        // in-box ConPTY (ledger P4-001), so interactive cmd is the one
+        // reliable vehicle for a natural exit here.
         let spawned = spawn_pty(
-            PtyOptions {
-                shell: Some((
-                    "ping".to_string(),
-                    vec!["-n".to_string(), "2".to_string(), "127.0.0.1".to_string()],
-                )),
-                working_directory: None,
-                env: HashMap::default(),
-                window_id: 0,
-            },
+            cmd_options(&[]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
-        eprintln!("[conpty-exit] spawned; waiting for exit observation");
+
+        eprintln!("[conpty-exit] spawned; waiting for banner");
+        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
+        eprintln!("[conpty-exit] banner up; typing exit");
+        spawned.handle.notify(&b"exit 42\r"[..]);
 
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
         // EOF, which ConPTY may withhold until the pseudoconsole is dropped.
-        let (bytes, status) = drain_until_exit(&output_rx, &executor).await;
-        assert!(!bytes.is_empty(), "ping should produce output");
-        assert_eq!(status.code(), Some(0));
+        let (_, status) = drain_until_exit(&output_rx, &executor).await;
+        assert_eq!(status.code(), Some(42));
         drop(spawned);
     }
 
@@ -905,18 +916,11 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // ping.exe directly — every argument is space-free, so the command
-        // line carries no MSVC quoting for anything to mis-parse (P4-001).
+        // Interactive cmd as the long-running child (children spawned with
+        // arguments never execute on this runner's in-box ConPTY — ledger
+        // P4-001 — and an idle interactive cmd runs until killed).
         let spawned = spawn_pty(
-            PtyOptions {
-                shell: Some((
-                    "ping".to_string(),
-                    vec!["-n".to_string(), "120".to_string(), "127.0.0.1".to_string()],
-                )),
-                working_directory: None,
-                env: HashMap::default(),
-                window_id: 0,
-            },
+            cmd_options(&[]),
             TerminalBounds::default(),
             output_tx,
             &executor,
@@ -925,8 +929,8 @@ mod tests {
 
         // Kill only once the session has demonstrably started; killing into a
         // half-started ConPTY races conhost startup.
-        eprintln!("[conpty-kill] spawned; waiting for first output");
-        wait_for_first_output(&output_rx, &executor).await;
+        eprintln!("[conpty-kill] spawned; waiting for banner");
+        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
 
         spawned.handle.shutdown();
         eprintln!("[conpty-kill] shut down; waiting for exit report");
