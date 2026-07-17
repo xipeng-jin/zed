@@ -507,9 +507,11 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::time::{Duration, Instant};
 
-    // Stays under the test scheduler's 15 s hard parking limit so a genuine
-    // stall produces this suite's message instead of the scheduler's.
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    // Generous because first-use ConPTY sessions on cold Windows CI runners
+    // can take tens of seconds to produce their first output. While a PTY is
+    // live its exit poller ticks every 100 ms, which keeps individual parks
+    // under the test scheduler's 15 s hard parking limit.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[cfg(unix)]
     fn shell_options(command: &str) -> PtyOptions {
@@ -588,11 +590,19 @@ mod tests {
     ) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
-            if let PtyOutput::Bytes(batch) = recv_output(output_rx, executor).await {
-                bytes.extend_from_slice(&batch);
-                if String::from_utf8_lossy(&bytes).contains(marker) {
-                    return bytes;
+            match recv_output(output_rx, executor).await {
+                PtyOutput::Bytes(batch) => {
+                    bytes.extend_from_slice(&batch);
+                    if String::from_utf8_lossy(&bytes).contains(marker) {
+                        return bytes;
+                    }
                 }
+                // An exit event before the marker means the session ended
+                // byte-less; surface that instead of timing out opaquely.
+                PtyOutput::Event(event) => panic!(
+                    "session ended before producing {marker:?}: got {event:?}; output so far: {:?}",
+                    String::from_utf8_lossy(&bytes)
+                ),
             }
         }
     }
@@ -841,10 +851,12 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // The echo proves conhost is fully up before the child exits; a
-        // child exiting into a half-started ConPTY session races its startup.
+        // The echo proves conhost is fully up before the child exits (a child
+        // exiting into a half-started ConPTY session races its startup), and
+        // the ping holds the child alive long enough for conhost to flush the
+        // echo before the exit is observable.
         let spawned = spawn_pty(
-            cmd_options(&["/C", "echo conpty-live& exit 42"]),
+            cmd_options(&["/C", "echo conpty-live& ping -n 3 127.0.0.1 >NUL& exit 42"]),
             TerminalBounds::default(),
             output_tx,
             &executor,
