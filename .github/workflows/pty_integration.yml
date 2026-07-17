@@ -44,7 +44,15 @@ jobs:
   conpty_tests_windows:
     runs-on: windows-latest
     timeout-minutes: 90
+    env:
+      # cargo's bundled libgit2 cannot handle > MAX_PATH checkout paths (the
+      # python-environment-tools test fixtures exceed it); the git CLI with
+      # core.longpaths can. Upstream's self-hosted runners preconfigure this.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
+      - name: enable git long paths
+        run: git config --global core.longpaths true
+        shell: pwsh
       - name: checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: setup cargo config
