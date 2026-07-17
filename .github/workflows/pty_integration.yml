@@ -61,7 +61,7 @@ jobs:
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
       - name: run PTY seam suite against ConPTY
-        run: cargo test -p terminal --lib pty::
+        run: "cargo test -p terminal --lib pty::"
         shell: pwsh
       - name: cleanup cargo config
         if: always()
