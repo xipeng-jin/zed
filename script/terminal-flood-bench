@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs the sustained-flood terminal benchmark (SPEC.md §6 P4) in release mode:
+# child → PTY reader thread → bounded byte channel → batch-capped foreground
+# ingest, reporting throughput, per-turn stall bound, and echo latency.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo test -p terminal --release --lib -- --ignored --nocapture \
+    pty::tests::sustained_flood_benchmark

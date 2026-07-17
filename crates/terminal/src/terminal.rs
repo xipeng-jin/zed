@@ -1,19 +1,15 @@
 mod mappings;
 
 mod alacritty;
+mod pty;
 mod pty_info;
 pub mod terminal_settings;
 
-#[cfg(not(windows))]
-use anyhow::Context as _;
 use anyhow::{Result, bail};
 use futures_lite::future::yield_now;
 use log::trace;
 
-use futures::{
-    FutureExt,
-    channel::mpsc::{UnboundedReceiver, unbounded},
-};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 use itertools::Itertools as _;
 use mappings::mouse::{
@@ -57,14 +53,12 @@ use gpui::{
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-#[cfg(not(windows))]
-use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
-    AlacrittyGridIterator, AlacrittySearch, HyperlinkMatch, PtySender, RegexSearches, StreamIngest,
-    TerminalBackend, open_pty, pty_options,
+    AlacrittyGridIterator, AlacrittySearch, HyperlinkMatch, RegexSearches, TerminalBackend,
 };
 use crate::mappings::colors::to_rgb;
 use crate::mappings::{focus::focus_report, keys::encode_keystroke, paste::encode_paste};
+use crate::pty::{PtyHandle, PtyOutput};
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -1199,6 +1193,9 @@ fn init_command_startup_marker_command(shell_kind: ShellKind, marker_id: u64) ->
 pub struct TerminalBuilder {
     terminal: Terminal,
     events_rx: UnboundedReceiver<PtyEvent>,
+    /// Closed-with-no-senders for plain display-only terminals, so that half
+    /// of the pump's input stream ends immediately.
+    output_rx: async_channel::Receiver<PtyOutput>,
 }
 
 impl TerminalBuilder {
@@ -1237,6 +1234,10 @@ impl TerminalBuilder {
             .min(MAX_SCROLL_HISTORY_LINES);
 
         let (events_tx, events_rx) = unbounded();
+        let (output_tx, output_rx) = pty::output_channel();
+        // Display-only terminals have no byte producer; the closed channel
+        // ends that half of the pump's input stream immediately.
+        drop(output_tx);
         let backend = TerminalBackend::new_display_only(
             scrolling_history,
             cursor_shape,
@@ -1301,6 +1302,7 @@ impl TerminalBuilder {
         TerminalBuilder {
             terminal,
             events_rx,
+            output_rx,
         }
     }
 
@@ -1327,13 +1329,6 @@ impl TerminalBuilder {
         // allocation / acquiring a controlling terminal fails with `ENOTTY`.
         // When set, run the command as a plain subprocess instead.
         let no_pty = HeadlessTerminal::is_enabled(cx);
-        #[cfg(not(windows))]
-        let child_signal_mask = match current_child_signal_mask()
-            .context("failed to capture terminal child signal mask")
-        {
-            Ok(signal_mask) => Some(signal_mask),
-            Err(error) => return Task::ready(Err(error)),
-        };
         let fut = async move {
             // Remove SHLVL so the spawned shell initializes it to 1, matching
             // the behavior of standalone terminal emulators like iTerm2/Kitty/Alacritty.
@@ -1420,15 +1415,14 @@ impl TerminalBuilder {
                     .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
                     .min(MAX_SCROLL_HISTORY_LINES)
             };
-            //Spawn a task so the Alacritty EventLoop (or the subprocess reader) can communicate with us
-            //TODO: Remove with a bounded sender which can be dispatched on &self
             let (events_tx, events_rx) = unbounded();
+            let (output_tx, output_rx) = pty::output_channel();
             //Set up the terminal...
             let backend = TerminalBackend::new(
                 scrolling_history,
                 cursor_shape,
                 TerminalBounds::default(),
-                events_tx.clone(),
+                events_tx,
                 alternate_scroll,
             );
 
@@ -1448,9 +1442,7 @@ impl TerminalBuilder {
                     args,
                     env.clone(),
                     working_directory.clone(),
-                    backend.stream_ingest(),
-                    backend.stream_ingest(),
-                    events_tx,
+                    output_tx,
                     &background_executor,
                 ) {
                     Ok(subprocess) => subprocess,
@@ -1466,48 +1458,42 @@ impl TerminalBuilder {
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
             } else {
-                let alacritty_shell = shell_params.as_ref().map(|params| {
+                let shell = shell_params.as_ref().map(|params| {
                     (
                         params.program.clone(),
                         params.args.clone().unwrap_or_default(),
                     )
                 });
-                let pty_options = pty_options(
-                    alacritty_shell,
-                    working_directory.clone(),
-                    env.clone(),
-                    // We pass in the foreground thread's signal mask to the child process via pty_options,
-                    // so terminal construction can run on a background thread without breaking Ctrl-C and other signals
-                    // otherwise the terminal would inherit the background executor's signal mask which blocks
-                    // some terminal signals
-                    #[cfg(not(windows))]
-                    child_signal_mask,
-                    #[cfg(windows)]
-                    shell_kind.tty_escape_args(),
-                );
 
-                //Setup the pty...
-                let pty = match open_pty(&pty_options, TerminalBounds::default(), window_id) {
-                    Ok(pty) => pty,
+                //Setup the pty and its reader/writer threads...
+                let spawned = match pty::spawn_pty(
+                    pty::PtyOptions {
+                        shell,
+                        working_directory: working_directory.clone(),
+                        env: env.clone(),
+                        window_id,
+                    },
+                    TerminalBounds::default(),
+                    output_tx,
+                    &background_executor,
+                ) {
+                    Ok(spawned) => spawned,
                     Err(error) => {
                         bail!(TerminalError {
                             directory: working_directory,
                             program: shell_params.as_ref().map(|params| params.program.clone()),
                             args: shell_params.as_ref().and_then(|params| params.args.clone()),
                             title_override: terminal_title_override,
-                            source: error,
+                            source: std::io::Error::other(format!("{error:#}")),
                         });
                     }
                 };
 
-                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
-
-                //And connect them together
-                let pty_tx = backend.spawn_event_loop(events_tx, pty, pty_options.drain_on_exit)?;
+                let pty_info = PtyProcessInfo::new(spawned.process_id_getter);
 
                 (
                     TerminalType::Pty {
-                        pty_tx,
+                        pty: spawned.handle,
                         info: Arc::new(pty_info),
                     },
                     None,
@@ -1592,74 +1578,73 @@ impl TerminalBuilder {
             Ok(TerminalBuilder {
                 terminal,
                 events_rx,
+                output_rx,
             })
         };
-        cx.background_spawn(fut)
+        // Construction runs whole on the foreground executor (SPEC.md §3 S4):
+        // the background placement existed only for the signal-mask fix
+        // (zed#42234), which portable-pty's `pre_exec` subsumes.
+        cx.spawn(async move |_| fut.await)
     }
 
-    pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
-        //Event loop
-        self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
-            while let Some(event) = self.events_rx.next().await {
-                terminal.update(cx, |terminal, cx| {
-                    //Process the first event immediately for lowered latency
-                    terminal.process_pty_event(event, cx);
-                })?;
+    pub fn subscribe(self, cx: &Context<Terminal>) -> Terminal {
+        let TerminalBuilder {
+            mut terminal,
+            events_rx,
+            output_rx,
+        } = self;
+        // The foreground pump (SPEC.md §3 D2): feeds PTY/subprocess byte
+        // batches to the emulator a bounded number per turn, then yields so
+        // input handling and frames interleave; backpressure comes from the
+        // bounded channel and the kernel PTY queue, not a lock.
+        terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
+            enum Incoming {
+                Output(PtyOutput),
+                Event(PtyEvent),
+            }
 
-                'outer: loop {
-                    let mut events = Vec::new();
+            let incoming = futures::stream::select(
+                output_rx.clone().map(Incoming::Output),
+                events_rx.map(Incoming::Event),
+            );
+            let mut incoming = std::pin::pin!(incoming);
 
-                    #[cfg(any(test, feature = "test-support"))]
-                    let mut timer = cx.background_executor().simulate_random_delay().fuse();
-                    #[cfg(not(any(test, feature = "test-support")))]
-                    let mut timer = cx
-                        .background_executor()
-                        .timer(std::time::Duration::from_millis(4))
-                        .fuse();
-
-                    let mut wakeup = false;
-                    loop {
-                        futures::select_biased! {
-                            _ = timer => break,
-                            event = self.events_rx.next() => {
-                                if let Some(event) = event {
-                                    if matches!(event, PtyEvent::Event(TerminalBackendEvent::Wakeup))
-                                    {
-                                        wakeup = true;
-                                    } else {
-                                        events.push(event);
+            while let Some(incoming) = incoming.next().await {
+                match incoming {
+                    Incoming::Output(PtyOutput::Bytes(bytes)) => {
+                        terminal.update(cx, |this, cx| {
+                            this.backend.write(&bytes);
+                            let mut batches = 1;
+                            while batches < pty::MAX_BATCHES_PER_TURN {
+                                match output_rx.try_recv() {
+                                    Ok(PtyOutput::Bytes(bytes)) => {
+                                        this.backend.write(&bytes);
+                                        batches += 1;
                                     }
-
-                                    if events.len() > 100 {
+                                    // Exit-sequence events must stay ordered
+                                    // after the bytes drained above.
+                                    Ok(PtyOutput::Event(event)) => {
+                                        this.process_event(event, cx);
                                         break;
                                     }
-                                } else {
-                                    break;
+                                    Err(_) => break,
                                 }
-                            },
-                        }
-                    }
-
-                    if events.is_empty() && !wakeup {
-                        yield_now().await;
-                        break 'outer;
-                    }
-
-                    terminal.update(cx, |this, cx| {
-                        if wakeup {
+                            }
                             this.process_event(TerminalBackendEvent::Wakeup, cx);
-                        }
-
-                        for event in events {
-                            this.process_pty_event(event, cx);
-                        }
-                    })?;
-                    yield_now().await;
+                        })?;
+                        yield_now().await;
+                    }
+                    Incoming::Output(PtyOutput::Event(event)) => {
+                        terminal.update(cx, |this, cx| this.process_event(event, cx))?;
+                    }
+                    Incoming::Event(event) => {
+                        terminal.update(cx, |this, cx| this.process_pty_event(event, cx))?;
+                    }
                 }
             }
             anyhow::Ok(())
         });
-        self.terminal
+        terminal
     }
 
     #[cfg(windows)]
@@ -1683,7 +1668,7 @@ impl TerminalBuilder {
 
 enum TerminalType {
     Pty {
-        pty_tx: PtySender,
+        pty: PtyHandle,
         info: Arc<PtyProcessInfo>,
     },
     DisplayOnly,
@@ -1891,8 +1876,8 @@ impl Terminal {
 
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
-                    pty_tx.resize(new_bounds);
+                if let TerminalType::Pty { pty, .. } = &self.terminal_type {
+                    pty.resize(new_bounds);
                 }
 
                 self.backend.resize(new_bounds);
@@ -2250,7 +2235,7 @@ impl Terminal {
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.pty_write_log.borrow_mut().push(input.to_vec());
-        if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+        if let TerminalType::Pty { pty, .. } = &self.terminal_type {
             if log::log_enabled!(log::Level::Debug) {
                 if let Ok(str) = str::from_utf8(&input) {
                     log::debug!("Writing to PTY: {:?}", str);
@@ -2258,7 +2243,7 @@ impl Terminal {
                     log::debug!("Writing to PTY: {:?}", input);
                 }
             }
-            pty_tx.notify(input);
+            pty.notify(input);
         }
     }
 
@@ -3262,17 +3247,15 @@ impl SubprocessHandle {
 }
 
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
-/// drives its output into the terminal backend, mirroring what the Alacritty
-/// event loop does for a PTY but without one. Used when [`HeadlessTerminal`]
-/// is enabled.
+/// sends its output over the same bounded byte channel the PTY reader thread
+/// uses; the foreground pump feeds it to the emulator. Used when
+/// [`HeadlessTerminal`] is enabled.
 fn spawn_task_subprocess(
     program: String,
     args: Vec<String>,
     env: HashMap<String, String>,
     working_directory: Option<PathBuf>,
-    stdout_ingest: StreamIngest,
-    stderr_ingest: StreamIngest,
-    events_tx: futures::channel::mpsc::UnboundedSender<PtyEvent>,
+    output_tx: async_channel::Sender<PtyOutput>,
     executor: &BackgroundExecutor,
 ) -> Result<SubprocessHandle> {
     use futures::io::AsyncReadExt as _;
@@ -3295,11 +3278,12 @@ fn spawn_task_subprocess(
         let child = child.clone();
         let executor = executor.clone();
         async move {
-            // stdout and stderr are pumped concurrently, each through its own
-            // parser; the backend's shared term mutex serializes grid mutation.
+            // stdout and stderr are pumped concurrently into the shared byte
+            // channel; batches interleave at channel granularity, the same
+            // observable class as the former per-lock interleaving.
             type BoxedReader = Box<dyn futures::io::AsyncRead + Unpin + Send>;
-            let pump = |reader: Option<BoxedReader>, mut ingest: StreamIngest| {
-                let events_tx = events_tx.clone();
+            let pump = |reader: Option<BoxedReader>| {
+                let output_tx = output_tx.clone();
                 async move {
                     let Some(mut reader) = reader else { return };
                     let mut buffer = [0u8; 8192];
@@ -3314,10 +3298,10 @@ fn spawn_task_subprocess(
                             Ok(count) => {
                                 let converted =
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
-                                ingest.advance(&converted);
-                                events_tx
-                                    .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Wakeup))
-                                    .ok();
+                                if output_tx.send(PtyOutput::Bytes(converted)).await.is_err() {
+                                    // The terminal is gone; stop pumping.
+                                    return;
+                                }
                             }
                         }
                     }
@@ -3325,7 +3309,7 @@ fn spawn_task_subprocess(
             };
             let stdout = stdout.map(|reader| Box::new(reader) as BoxedReader);
             let stderr = stderr.map(|reader| Box::new(reader) as BoxedReader);
-            futures::future::join(pump(stdout, stdout_ingest), pump(stderr, stderr_ingest)).await;
+            futures::future::join(pump(stdout), pump(stderr)).await;
 
             // Both pipes are closed, so the child has exited or is about to.
             // Poll for its status without holding the lock across an await.
@@ -3350,7 +3334,11 @@ fn spawn_task_subprocess(
                 Some(status) => TerminalBackendEvent::ChildExit(status),
                 None => TerminalBackendEvent::Exit,
             };
-            events_tx.unbounded_send(PtyEvent::Event(event)).ok();
+            // Through the byte channel, so the exit event cannot overtake
+            // still-queued output.
+            if output_tx.send(PtyOutput::Event(event)).await.is_err() {
+                log::debug!("terminal dropped before subprocess exit could be reported");
+            }
         }
     });
 
@@ -3365,10 +3353,10 @@ impl Drop for Terminal {
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
-        if let TerminalType::Pty { pty_tx, info } =
+        if let TerminalType::Pty { pty, info } =
             std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
         {
-            pty_tx.shutdown();
+            pty.shutdown();
             info.terminate_child_process();
 
             let timer = self.background_executor.timer(Duration::from_millis(100));

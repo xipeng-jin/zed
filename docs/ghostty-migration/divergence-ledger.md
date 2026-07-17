@@ -217,3 +217,112 @@ ledger-referencing tests in the same files.
 - **Adjudication**: **accepted** — the old silence was an artifact of the
   dead uppercase rows, not a behavioral choice. Pinned by
   `adjudicated_divergences::ctrl_shift_letters`.
+
+---
+
+P4 entries (PTY/threading swap, ticket #45) apply on **all platforms
+immediately** — the PTY seam is shared, not behind the §5 cfg. No ported-test
+expectation changed at P4 (Class B ran untouched); these entries record
+behavioral deltas of the alacritty `tty`/`EventLoop` → portable-pty seam
+found by inspection, per the P3 precedent.
+
+## P4-001 — Windows cmd.exe arguments are always MSVC-quoted
+
+- **Phase / change**: P4 (PTY seam on portable-pty, ticket #45). The
+  alacritty Windows tty accepted `escape_args: false`
+  (`ShellKind::Cmd`) and joined arguments into the ConPTY command line raw;
+  Zed passed `shell_kind.tty_escape_args()` to get that. portable-pty's
+  `CommandBuilder` has no raw mode: every argument goes through
+  MSVC-C-runtime quoting (`append_quoted`).
+- **Triggering input**: a Windows terminal/task with `ShellKind::Cmd` whose
+  arguments contain spaces or embedded quotes, e.g.
+  `cmd /C echo "hello world"`.
+- **Old behavior**: `cmd /C echo "hello world"` (raw join; cmd parses its
+  own quoting).
+- **New behavior**: arguments with spaces are wrapped and inner quotes
+  backslash-escaped (`cmd /C "echo \"hello world\""`); cmd.exe does not
+  understand backslash-escaped quotes.
+- **Adjudication**: **accepted for the cfg window, re-examined at the
+  Windows gate (§8.2)**. Zed's default Windows shell is PowerShell (escaped
+  today already, and portable-pty's quoting matches); only user-configured
+  cmd.exe with quote-bearing args diverges. The §8.2 manual smoke ("run a
+  task") exercises this; if it bites, the documented exit is a raw-cmdline
+  patch in the portable-pty fork-or-vendor path (D1's exit strategy).
+  `util::shell::ShellKind::tty_escape_args` is dead code until then.
+
+## P4-002 — Missing or invalid working directory falls back to `$HOME` (unix)
+
+- **Phase / change**: P4, as above.
+- **Triggering input**: `TerminalBuilder::new` with `working_directory:
+  None`, or a path that no longer exists.
+- **Old behavior**: alacritty's `pre_exec` ignored a failed `chdir`; the
+  child inherited Zed's own working directory.
+- **New behavior**: portable-pty's `as_command` resolves the cwd to `$HOME`
+  when the requested directory is unset or not a directory.
+- **Adjudication**: **accepted** — Zed passes a concrete project directory
+  on every mainline path, and `$HOME` is the friendlier fallback for the
+  rare orphan case (matches what standalone terminals do). Unobservable in
+  any suite.
+
+## P4-003 — Default-shell resolution validates `$SHELL`; `SHELL` is always exported
+
+- **Phase / change**: P4, as above. The no-explicit-shell case (unix
+  `Shell::System`) resolves through the seam instead of alacritty's
+  `ShellUser::from_env`.
+- **Triggering input**: spawning with `shell: None` while `$SHELL` points at
+  a non-executable path, or with `SHELL`/`USER`/`HOME` absent from Zed's
+  environment.
+- **Old behavior**: `$SHELL` was trusted verbatim (spawn failed later if
+  bogus); `USER`/`HOME` were re-derived env-first-then-passwd and explicitly
+  set on the child; `SHELL` itself was not set for explicit commands.
+- **New behavior**: portable-pty falls back to the passwd shell when
+  `$SHELL` is not executable, and exports `SHELL=<resolved shell>` to every
+  child; `USER`/`HOME` ride the inherited base environment (no passwd
+  re-derivation). The macOS `/usr/bin/login` wrapper is preserved
+  seam-side, gated on `$USER` being present (its ghostty-derived
+  replacement lands at the §8.1 gate).
+- **Adjudication**: **accepted** — strictly more robust resolution; the
+  passwd re-derivation only mattered when Zed itself ran without
+  `USER`/`HOME`, which the .app launch path does not produce.
+
+## P4-004 — Headless subprocess stdout/stderr share one parser
+
+- **Phase / change**: P4, as above. The `HeadlessTerminal` subprocess pumps
+  send raw bytes over the same bounded channel as the PTY reader; the
+  foreground ingests through the backend's single parser.
+- **Triggering input**: a headless-host task writing ANSI to stdout and
+  stderr concurrently.
+- **Old behavior**: each stream had its own vte parser; the shared term
+  mutex interleaved *parsed effects* at lock granularity, so a split escape
+  sequence on one stream could not corrupt the other's parse state.
+- **New behavior**: batches interleave at channel granularity into one
+  parser; an escape sequence split across a batch boundary can interleave
+  with the other stream's bytes mid-sequence.
+- **Adjudication**: **accepted** — the architecture note (§6) already
+  classed this as "the same observable class of interleaving"; concurrent
+  mixed-stream ANSI was never ordering-guaranteed, and the headless path is
+  eval-CLI-only. The existing `test_no_pty_task_terminal_captures_output`
+  suite passes untouched.
+
+## P4-005 — Pump coalescing timer replaced by the bounded batch cap
+
+- **Phase / change**: P4, as above. The foreground pump in
+  `TerminalBuilder::subscribe` re-shaped around the bounded byte channel.
+- **Triggering input**: any PTY output — most visibly interactive trickles
+  (keystroke echo) and floods.
+- **Old behavior**: the pump coalesced events on a 4 ms timer with a
+  100-event cap before each `terminal.update`;
+  pty-threading-architecture.md §3.2(d) anticipated that shape surviving
+  "carrying bytes instead of parsed events" (open question 6 left the timer's
+  necessity to empirical validation).
+- **New behavior**: no timer. Each turn ingests up to
+  `MAX_BATCHES_PER_TURN × READ_BATCH_SIZE` (4 × 64 KiB) then yields; each
+  emulator-origin event gets its own update. SPEC.md §3 D2 mandates exactly
+  this ("a bounded number of batches per turn, then yields") and formally
+  superseded the spike's time-budgeted drain.
+- **Adjudication**: **accepted** — the empirical validation open question 6
+  asked for is the P4 sustained-flood benchmark: 84.2 MiB/s through the
+  seam, max per-turn foreground stall 2.2 ms (release), echo latency
+  ≤ 623 µs mean 264 µs during flood; interactive rows re-verified on the
+  `:99` harness. Coalescing knobs remain a post-removal tuning rider
+  (SPEC.md §6) if a real regression appears.

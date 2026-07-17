@@ -1,0 +1,70 @@
+# P4 acceptance gate (docs/ghostty-migration/SPEC.md §6): the PTY integration
+# suite (spawn/resize/kill/exit) must be green on Linux and Windows CI,
+# including the §8.2 ConPTY shutdown/exit/kill tests. Linux runs the full
+# terminal crate suite (the Class B proof rides along); Windows runs the PTY
+# seam suite against real ConPTY.
+#
+# Hand-written (not xtask-generated): it must run on this fork, where the
+# xtask-generated workflows are guarded to zed-industries and use Namespace
+# runners. Fold into run_tests.rs when the migration upstreams.
+name: pty_integration
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+      - migration/libghostty
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+jobs:
+  terminal_tests_linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: install linux dependencies
+        run: ./script/linux
+      - name: cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pty-integration-linux-${{ hashFiles('Cargo.lock') }}
+      - name: run terminal crate tests (includes the PTY integration suite)
+        run: cargo test -p terminal --lib
+  conpty_tests_windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: setup cargo config
+        run: |
+          New-Item -ItemType Directory -Path "./../.cargo" -Force
+          Copy-Item -Path "./.cargo/ci-config.toml" -Destination "./../.cargo/config.toml"
+        shell: pwsh
+      - name: cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
+      - name: run PTY seam suite against ConPTY
+        run: cargo test -p terminal --lib pty::
+        shell: pwsh
+      - name: cleanup cargo config
+        if: always()
+        run: |
+          Remove-Item -Recurse -Path "./../.cargo" -Force -ErrorAction SilentlyContinue
+        shell: pwsh

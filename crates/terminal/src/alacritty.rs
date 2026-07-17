@@ -1,14 +1,9 @@
-#[cfg(target_os = "windows")]
-use std::num::NonZeroU32;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
+use std::{ops::RangeInclusive, sync::Arc};
 
 mod hyperlinks;
 
 use alacritty_terminal::{
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
-    event_loop::{EventLoop, Msg, Notifier},
+    event::{Event as AlacTermEvent, EventListener, WindowSize},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
@@ -21,30 +16,24 @@ use alacritty_terminal::{
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
         search::{Match, RegexIter, RegexSearch},
     },
-    tty,
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler,
         NamedPrivateMode, PrivateMode, Processor, StdSyncHandler,
     },
 };
-use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
-#[cfg(target_os = "windows")]
-use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
     Cell, CellExtra, CellFlags, Color, Content, Cursor, CursorShape, Hyperlink, IndexedCell, Modes,
     Point, PtyEvent, Range, RenderableCells, Rgb, Scroll, Search, Selection, SelectionRange,
     SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
-    pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
-pub(super) type AlacrittyPty = tty::Pty;
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
 pub(super) type AlacrittyTermLock = FairMutex<AlacrittyTerm>;
@@ -56,52 +45,6 @@ pub(super) struct ZedListener(UnboundedSender<PtyEvent>);
 #[derive(Clone, Debug)]
 pub(super) struct AlacrittySearch {
     search: RegexSearch,
-}
-
-#[cfg(unix)]
-impl From<&AlacrittyPty> for ProcessIdGetter {
-    fn from(pty: &AlacrittyPty) -> Self {
-        Self::new(pty.file().as_raw_fd(), pty.child().id())
-    }
-}
-
-#[cfg(windows)]
-impl From<&AlacrittyPty> for ProcessIdGetter {
-    fn from(pty: &AlacrittyPty) -> Self {
-        let child = pty.child_watcher();
-        let handle = child.raw_handle();
-        let fallback_pid = child.pid().unwrap_or_else(|| unsafe {
-            NonZeroU32::new_unchecked(GetProcessId(HANDLE(handle as _)))
-        });
-
-        Self::new(handle as i32, u32::from(fallback_pid))
-    }
-}
-
-pub(super) struct PtySender {
-    notifier: Notifier,
-}
-
-impl PtySender {
-    pub(super) fn notify(&self, input: impl Into<Cow<'static, [u8]>>) {
-        self.notifier.notify(input);
-    }
-
-    pub(super) fn resize(&self, bounds: TerminalBounds) {
-        if let Err(error) = self
-            .notifier
-            .0
-            .send(Msg::Resize(window_size_from_terminal_bounds(bounds)))
-        {
-            log::error!("failed to resize alacritty pty: {error}");
-        }
-    }
-
-    pub(super) fn shutdown(&self) {
-        if let Err(error) = self.notifier.0.send(Msg::Shutdown) {
-            log::debug!("failed to shut down alacritty pty loop: {error}");
-        }
-    }
 }
 
 fn window_size_from_terminal_bounds(bounds: TerminalBounds) -> WindowSize {
@@ -171,35 +114,6 @@ impl TerminalBackend {
             term: Arc::new(FairMutex::new(term)),
             config,
             output_processor: Processor::new(),
-        }
-    }
-
-    pub(super) fn spawn_event_loop(
-        &self,
-        events_tx: UnboundedSender<PtyEvent>,
-        pty: AlacrittyPty,
-        drain_on_exit: bool,
-    ) -> Result<PtySender> {
-        let event_loop = EventLoop::new(
-            self.term.clone(),
-            ZedListener(events_tx),
-            pty,
-            drain_on_exit,
-            false,
-        )
-        .context("failed to create event loop")?;
-        let pty_tx = event_loop.channel();
-        let _io_thread = event_loop.spawn();
-
-        Ok(PtySender {
-            notifier: Notifier(pty_tx),
-        })
-    }
-
-    pub(super) fn stream_ingest(&self) -> StreamIngest {
-        StreamIngest {
-            term: self.term.clone(),
-            processor: Processor::new(),
         }
     }
 
@@ -383,21 +297,6 @@ impl TerminalBackend {
     }
 }
 
-/// Feeds raw bytes from a background reader (the headless subprocess path)
-/// into the shared emulator; each output stream gets its own parser while the
-/// terminal mutex serializes grid mutation.
-pub(super) struct StreamIngest {
-    term: Arc<AlacrittyTermLock>,
-    processor: Processor<StdSyncHandler>,
-}
-
-impl StreamIngest {
-    pub(super) fn advance(&mut self, bytes: &[u8]) {
-        let mut term = self.term.lock();
-        self.processor.advance(&mut *term, bytes);
-    }
-}
-
 /// A grid search prepared on the foreground and run to completion on a
 /// background thread, locking the shared emulator for the duration.
 pub(super) struct PreparedSearch {
@@ -436,38 +335,6 @@ fn pty_term_config(
         default_cursor_style: alacritty_cursor_style(cursor_shape),
         ..Config::default()
     }
-}
-
-#[cfg(not(windows))]
-pub(super) fn current_child_signal_mask() -> io::Result<tty::SignalMask> {
-    tty::SignalMask::current()
-}
-
-pub(super) fn pty_options(
-    shell: Option<(String, Vec<String>)>,
-    working_directory: Option<PathBuf>,
-    env: impl IntoIterator<Item = (String, String)>,
-    #[cfg(not(windows))] child_signal_mask: Option<tty::SignalMask>,
-    #[cfg(windows)] escape_args: bool,
-) -> tty::Options {
-    tty::Options {
-        shell: shell.map(|(program, args)| tty::Shell::new(program, args)),
-        working_directory,
-        drain_on_exit: true,
-        env: env.into_iter().collect(),
-        #[cfg(not(windows))]
-        child_signal_mask,
-        #[cfg(windows)]
-        escape_args,
-    }
-}
-
-pub(super) fn open_pty(
-    options: &tty::Options,
-    bounds: TerminalBounds,
-    window_id: u64,
-) -> io::Result<AlacrittyPty> {
-    tty::new(options, window_size_from_terminal_bounds(bounds), window_id)
 }
 
 fn alacritty_cursor_style(cursor_shape: SettingsCursorShape) -> AlacCursorStyle {

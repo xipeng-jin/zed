@@ -46,6 +46,7 @@ urlencoding.workspace = true
 vte.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
+portable-pty.workspace = true
 
 # Temporary Linux-only dependency during the libghostty migration window
 # (SPEC.md §5); widened per-platform at the §8 gates, unconditional by P10.
