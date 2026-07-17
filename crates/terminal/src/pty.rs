@@ -507,7 +507,9 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::time::{Duration, Instant};
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+    // Stays under the test scheduler's 15 s hard parking limit so a genuine
+    // stall produces this suite's message instead of the scheduler's.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[cfg(unix)]
     fn shell_options(command: &str) -> PtyOptions {
@@ -571,6 +573,26 @@ mod tests {
                     return (bytes, status);
                 }
                 PtyOutput::Event(event) => panic!("unexpected event in exit sequence: {event:?}"),
+            }
+        }
+    }
+
+    /// Waits until the session has demonstrably produced output containing
+    /// `marker` — on Windows, acting on a ConPTY session before conhost is
+    /// fully up races its startup, so the §8.2 tests establish liveness first.
+    #[cfg(windows)]
+    async fn wait_for_output_containing(
+        marker: &str,
+        output_rx: &async_channel::Receiver<PtyOutput>,
+        executor: &BackgroundExecutor,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            if let PtyOutput::Bytes(batch) = recv_output(output_rx, executor).await {
+                bytes.extend_from_slice(&batch);
+                if String::from_utf8_lossy(&bytes).contains(marker) {
+                    return bytes;
+                }
             }
         }
     }
@@ -736,6 +758,11 @@ mod tests {
         )
         .expect("failed to spawn pty");
 
+        // Acting on a ConPTY session before conhost is up races its startup;
+        // wait for the cmd banner first (the passing shutdown test's shape).
+        eprintln!("[conpty-resize] spawned; waiting for banner");
+        wait_for_output_containing("Microsoft", &output_rx, &executor).await;
+
         let bounds = TerminalBounds::new(
             gpui::px(10.),
             gpui::px(5.),
@@ -745,6 +772,7 @@ mod tests {
             },
         );
         spawned.handle.resize(bounds);
+        eprintln!("[conpty-resize] resized");
 
         let size = spawned
             .handle
@@ -754,6 +782,7 @@ mod tests {
         assert_eq!((size.rows, size.cols), (30, 80));
 
         spawned.handle.shutdown();
+        eprintln!("[conpty-resize] shut down; waiting for threads");
         let SpawnedPty { handle, .. } = spawned;
         let PtyHandle {
             reader_thread,
@@ -812,13 +841,19 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
+        // The echo proves conhost is fully up before the child exits; a
+        // child exiting into a half-started ConPTY session races its startup.
         let spawned = spawn_pty(
-            cmd_options(&["/C", "exit 42"]),
+            cmd_options(&["/C", "echo conpty-live& exit 42"]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
+
+        eprintln!("[conpty-exit] spawned; waiting for echo");
+        wait_for_output_containing("conpty-live", &output_rx, &executor).await;
+        eprintln!("[conpty-exit] session live; waiting for exit observation");
 
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
@@ -845,10 +880,17 @@ mod tests {
         )
         .expect("failed to spawn pty");
 
+        // Kill only once the session has demonstrably started (ping's first
+        // line); killing into a half-started ConPTY races conhost startup.
+        eprintln!("[conpty-kill] spawned; waiting for ping output");
+        wait_for_output_containing("127.0.0.1", &output_rx, &executor).await;
+
         spawned.handle.shutdown();
+        eprintln!("[conpty-kill] shut down; waiting for exit report");
 
         let (_, status) = drain_until_exit(&output_rx, &executor).await;
         assert!(!status.success(), "killed child must not report success");
+        eprintln!("[conpty-kill] exit observed; waiting for threads");
 
         let SpawnedPty { handle, .. } = spawned;
         let PtyHandle {
