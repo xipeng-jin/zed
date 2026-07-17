@@ -1,0 +1,15 @@
+[package]
+name = "conpty_control"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "conpty_control.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+portable-pty.workspace = true

@@ -1,8 +1,9 @@
 # P4 acceptance gate (docs/ghostty-migration/SPEC.md §6): the PTY integration
 # suite (spawn/resize/kill/exit) must be green on Linux and Windows CI,
 # including the §8.2 ConPTY shutdown/exit/kill tests. Linux runs the full
-# terminal crate suite (the Class B proof rides along); Windows runs the PTY
-# seam suite against real ConPTY.
+# terminal crate suite (the Class B proof rides along). The Windows job is
+# temporarily narrowed to paired direct portable-pty controls to determine
+# whether GitHub-hosted ConPTY fails independently of GPUI and the PTY seam.
 #
 # Hand-written (not xtask-generated): it must run on this fork, where the
 # xtask-generated workflows are guarded to zed-industries and use Namespace
@@ -41,9 +42,9 @@ jobs:
           key: pty-integration-linux-${{ hashFiles('Cargo.lock') }}
       - name: run terminal crate tests (includes the PTY integration suite)
         run: cargo test -p terminal --lib
-  conpty_tests_windows:
+  conpty_controls_windows:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 35
     env:
       # cargo's bundled libgit2 cannot handle > MAX_PATH checkout paths (the
       # python-environment-tools test fixtures exceed it); the git CLI with
@@ -68,8 +69,14 @@ jobs:
             ~/.cargo/git
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
-      - name: run PTY seam suite against ConPTY
-        run: "cargo test -p terminal --lib pty::"
+      - name: run direct portable-pty control in the terminal test binary
+        timeout-minutes: 15
+        run: "cargo test -p terminal --lib pty::tests::conpty_direct_portable_pty_control -- --exact --nocapture"
+        shell: pwsh
+      - name: run direct portable-pty control without GPUI
+        if: always()
+        timeout-minutes: 15
+        run: "cargo test -p conpty_control --lib tests::conpty_direct_portable_pty_control -- --exact --nocapture"
         shell: pwsh
       - name: cleanup cargo config
         if: always()

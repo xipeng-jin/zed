@@ -39,6 +39,7 @@ members = [
     "crates/command_palette_hooks",
     "crates/component",
     "crates/component_preview",
+    "crates/conpty_control",
     "crates/context_server",
     "crates/copilot",
     "crates/copilot_chat",
