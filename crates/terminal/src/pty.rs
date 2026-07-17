@@ -80,21 +80,22 @@ type SharedChild = Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>;
 pub(super) struct SpawnedPty {
     pub handle: PtyHandle,
     pub process_id_getter: ProcessIdGetter,
+    /// Both threads exit on their own once the PTY closes; production drops
+    /// (detaches) these. Only tests read them, via `is_finished`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub reader_thread: JoinHandle<()>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub writer_thread: JoinHandle<()>,
 }
 
-/// The foreground's handle to a live PTY: owns the master (dropping it closes
-/// the PTY — on Windows, that is what delivers reader EOF), the writer-thread
-/// input channel, and a killer for the child.
+/// The foreground's handle to a live PTY: owns the master (closing it is what
+/// delivers reader EOF on Windows), the writer-thread input channel, and a
+/// killer for the child.
 pub(super) struct PtyHandle {
-    master: Box<dyn MasterPty + Send>,
+    /// `Some` until drop takes it (see the `Drop` impl).
+    master: Option<Box<dyn MasterPty + Send>>,
     input_tx: async_channel::Sender<Cow<'static, [u8]>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    /// Both threads exit on their own once the PTY closes; dropping the handle
-    /// detaches them. Only tests read these, via `is_finished`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) reader_thread: JoinHandle<()>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) writer_thread: JoinHandle<()>,
     #[cfg(windows)]
     _exit_poller: Task<()>,
 }
@@ -112,9 +113,15 @@ impl PtyHandle {
     /// ordered before the emulator-side resize exactly like ghostty places its
     /// ioctl outside the terminal update.
     pub(super) fn resize(&self, bounds: TerminalBounds) {
-        if let Err(error) = self.master.resize(pty_size_from_bounds(bounds)) {
+        let Some(master) = &self.master else { return };
+        if let Err(error) = master.resize(pty_size_from_bounds(bounds)) {
             log::error!("failed to resize terminal PTY: {error:#}");
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn master(&self) -> Option<&(dyn MasterPty + Send)> {
+        self.master.as_deref()
     }
 
     /// Stops the writer thread and signals the child (SIGHUP on unix — the
@@ -126,6 +133,33 @@ impl PtyHandle {
         if let Err(error) = self.killer.lock().kill() {
             log::debug!("failed to signal terminal child on shutdown: {error}");
         }
+    }
+}
+
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        let Some(master) = self.master.take() else {
+            return;
+        };
+        // On Windows, dropping the master runs ClosePseudoConsole, which can
+        // block until pending output is drained — while the reader thread may
+        // itself be blocked sending to the bounded channel that only the
+        // dropping thread's side consumes. Never let that pair deadlock the
+        // dropping thread (the UI foreground in production): close on a
+        // detached thread; the reader drains and exits in parallel. On unix
+        // the master drop is a plain close(2).
+        #[cfg(windows)]
+        {
+            if let Err(error) = std::thread::Builder::new()
+                .name("terminal-pty-closer".to_string())
+                .spawn(move || drop(master))
+            {
+                // The closure — and with it the master — was dropped inline.
+                log::error!("failed to spawn pty closer thread: {error}");
+            }
+        }
+        #[cfg(not(windows))]
+        drop(master);
     }
 }
 
@@ -181,15 +215,15 @@ pub(super) fn spawn_pty(
 
     Ok(SpawnedPty {
         handle: PtyHandle {
-            master: pair.master,
+            master: Some(pair.master),
             input_tx,
             killer: Mutex::new(killer),
-            reader_thread,
-            writer_thread,
             #[cfg(windows)]
             _exit_poller: exit_poller,
         },
         process_id_getter,
+        reader_thread,
+        writer_thread,
     })
 }
 
@@ -684,9 +718,9 @@ mod tests {
         );
         assert_eq!(status.code(), Some(7), "exit code must propagate exactly");
 
-        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
         spawned.handle.shutdown();
-        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
     }
 
     #[cfg(unix)]
@@ -742,7 +776,8 @@ mod tests {
 
         let size = spawned
             .handle
-            .master
+            .master()
+            .expect("master must be open before drop")
             .get_size()
             .expect("failed to read pty size");
         assert_eq!((size.rows, size.cols), (30, 80));
@@ -755,8 +790,8 @@ mod tests {
             Some(libc::SIGHUP),
             "shutdown must signal the child like the alacritty pty drop did"
         );
-        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
-        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
     }
 
     #[cfg(unix)]
@@ -779,8 +814,8 @@ mod tests {
         let (_, status) = drain_until_exit(&output_rx, &executor).await;
         assert!(!status.success());
         assert_eq!(status.signal(), Some(libc::SIGHUP));
-        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
-        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
     }
 
     /// The resize half of the G3 suite on ConPTY: `PtyHandle::resize` must
@@ -819,19 +854,21 @@ mod tests {
 
         let size = spawned
             .handle
-            .master
+            .master()
+            .expect("master must be open before drop")
             .get_size()
             .expect("failed to read pty size");
         assert_eq!((size.rows, size.cols), (30, 80));
 
         spawned.handle.shutdown();
         eprintln!("[conpty-resize] shut down; waiting for threads");
-        let SpawnedPty { handle, .. } = spawned;
-        let PtyHandle {
+        let SpawnedPty {
+            handle,
             reader_thread,
             writer_thread,
             ..
-        } = handle;
+        } = spawned;
+        drop(handle);
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
     }
@@ -856,15 +893,17 @@ mod tests {
         // Wait for the cmd banner so the session is fully up.
         wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
 
-        let SpawnedPty { handle, .. } = spawned;
-        handle.shutdown();
-        // Dropping the master closes the pseudoconsole, which is what delivers
-        // reader EOF; keeping only the join handles mirrors `Terminal::drop`.
-        let PtyHandle {
+        let SpawnedPty {
+            handle,
             reader_thread,
             writer_thread,
             ..
-        } = handle;
+        } = spawned;
+        handle.shutdown();
+        // Dropping the handle closes the pseudoconsole (on a detached closer
+        // thread), which is what delivers reader EOF; keeping only the join
+        // handles mirrors `Terminal::drop`.
+        drop(handle);
 
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
@@ -939,12 +978,13 @@ mod tests {
         assert!(!status.success(), "killed child must not report success");
         eprintln!("[conpty-kill] exit observed; waiting for threads");
 
-        let SpawnedPty { handle, .. } = spawned;
-        let PtyHandle {
+        let SpawnedPty {
+            handle,
             reader_thread,
             writer_thread,
             ..
-        } = handle;
+        } = spawned;
+        drop(handle);
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
     }
