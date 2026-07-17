@@ -494,7 +494,7 @@ fn spawn_exit_poller(
                     return;
                 };
                 let polled = live_child.try_wait();
-                if cfg!(test) && (ticks <= 3 || !matches!(polled, Ok(None))) {
+                if cfg!(test) && (ticks <= 3 || ticks % 100 == 0 || !matches!(polled, Ok(None))) {
                     eprintln!("[exit-poller] tick {ticks}: {polled:?}");
                 }
                 match polled {
@@ -867,11 +867,19 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // `/C exit 42` as three space-free arguments: portable-pty quotes
-        // nothing (a quoted `/C` argument wedges under ConPTY — ledger
-        // P4-001) and cmd re-joins the tail into the command to run.
+        // ping.exe directly, exiting on its own with a known code (0) after
+        // ~1 s of real output. cmd.exe under `/C` never executes at all on
+        // this ConPTY path (ledger P4-001), so it cannot carry this test.
         let spawned = spawn_pty(
-            cmd_options(&["/C", "exit", "42"]),
+            PtyOptions {
+                shell: Some((
+                    "ping".to_string(),
+                    vec!["-n".to_string(), "2".to_string(), "127.0.0.1".to_string()],
+                )),
+                working_directory: None,
+                env: HashMap::default(),
+                window_id: 0,
+            },
             TerminalBounds::default(),
             output_tx,
             &executor,
@@ -882,8 +890,9 @@ mod tests {
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
         // EOF, which ConPTY may withhold until the pseudoconsole is dropped.
-        let (_, status) = drain_until_exit(&output_rx, &executor).await;
-        assert_eq!(status.code(), Some(42));
+        let (bytes, status) = drain_until_exit(&output_rx, &executor).await;
+        assert!(!bytes.is_empty(), "ping should produce output");
+        assert_eq!(status.code(), Some(0));
         drop(spawned);
     }
 
