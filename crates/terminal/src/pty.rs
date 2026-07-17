@@ -867,21 +867,22 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // The echo proves conhost is fully up before the child exits (a child
-        // exiting into a half-started ConPTY session races its startup), and
-        // the ping holds the child alive long enough for conhost to flush the
-        // echo before the exit is observable.
+        // Interactive cmd with the exit typed through the writer thread: no
+        // `/C` argument means no MSVC-quoted command line for cmd to parse
+        // (the P4-001 divergence wedges a quoted `/C` under ConPTY), and it
+        // exercises the seam's input path on Windows.
         let spawned = spawn_pty(
-            cmd_options(&["/C", "echo conpty-live& ping -n 3 127.0.0.1 >NUL& exit 42"]),
+            cmd_options(&[]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
 
-        eprintln!("[conpty-exit] spawned; waiting for echo");
+        eprintln!("[conpty-exit] spawned; waiting for banner");
         wait_for_first_output(&output_rx, &executor).await;
-        eprintln!("[conpty-exit] session live; waiting for exit observation");
+        eprintln!("[conpty-exit] session live; typing exit");
+        spawned.handle.notify(&b"exit 42\r\n"[..]);
 
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
@@ -900,17 +901,27 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
+        // ping.exe directly — every argument is space-free, so the command
+        // line carries no MSVC quoting for anything to mis-parse (P4-001).
         let spawned = spawn_pty(
-            cmd_options(&["/C", "ping -n 120 127.0.0.1"]),
+            PtyOptions {
+                shell: Some((
+                    "ping".to_string(),
+                    vec!["-n".to_string(), "120".to_string(), "127.0.0.1".to_string()],
+                )),
+                working_directory: None,
+                env: HashMap::default(),
+                window_id: 0,
+            },
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
 
-        // Kill only once the session has demonstrably started (ping's first
-        // line); killing into a half-started ConPTY races conhost startup.
-        eprintln!("[conpty-kill] spawned; waiting for ping output");
+        // Kill only once the session has demonstrably started; killing into a
+        // half-started ConPTY races conhost startup.
+        eprintln!("[conpty-kill] spawned; waiting for first output");
         wait_for_first_output(&output_rx, &executor).await;
 
         spawned.handle.shutdown();

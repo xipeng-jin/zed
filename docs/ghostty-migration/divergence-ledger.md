@@ -249,6 +249,16 @@ found by inspection, per the P3 precedent.
   task") exercises this; if it bites, the documented exit is a raw-cmdline
   patch in the portable-pty fork-or-vendor path (D1's exit strategy).
   `util::shell::ShellKind::tty_escape_args` is dead code until then.
+- **P4 CI evidence (2026-07-17)**: this is worse than a quote mis-parse on
+  at least some hosts. On `windows-latest`, `cmd.exe /C "<quoted arg with
+  spaces>"` under ConPTY emitted a 4-byte VT preamble and then wedged —
+  the command never executed, the child never exited, and after
+  `TerminateProcess` the wedged conhost also withheld reader EOF past
+  pseudoconsole close (instrumented run `d6d58ce20a`, `pty_integration`
+  job). Interactive `cmd.exe` and unquoted command lines behave normally,
+  and the PTY suite uses only those. Raises the §8.2 gate priority of the
+  raw-cmdline exit; `ShellKind::Cmd` tasks with spaced arguments should be
+  assumed broken on Windows until the gate resolves this.
 
 ## P4-002 — Missing or invalid working directory falls back to `$HOME` (unix)
 
