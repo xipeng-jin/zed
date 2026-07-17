@@ -389,3 +389,61 @@ now because the backend suite pins the behavior.
   the terminal ships this exact behavior for its own copy path. Pinned by
   `ghostty::tests::simple_selection_over_wide_chars_matches_alacritty`
   (case 3 asserts both behaviors, ledger-referenced).
+
+---
+
+P6 entries describe the dark backend's gap-fill components (SPEC.md §6) —
+unused by production until P8. As with P5, entries are recorded when a suite
+pins the behavior. No ported-test expectation changed in the hover re-host
+(ticket #48): the 36 hyperlink scenarios run byte-identical.
+
+## P6-001 — Adjacent identical-URI OSC 8 links merge into one hover region
+
+- **Phase / change**: P6 (hover/hyperlink pipeline re-host, ticket #48).
+  The hover-extent walk in `ghostty/hyperlinks.rs` compares URIs because
+  ghostty exposes no OSC 8 `id` (gap G7); `Hyperlink.id` stays `None`.
+- **Triggering input**: two adjacent OSC 8 links with distinct `id`
+  parameters but the same URI, hover over either.
+- **Old behavior**: alacritty compares the full hyperlink (`id` + URI), so
+  the two links are separate hover regions.
+- **New behavior**: URI equality merges them into one hover region.
+- **Adjudication**: **accepted** — pre-adjudicated at spec lock (SPEC.md §9
+  "accepted merge"; §4.2 S2). Pinned by
+  `ghostty::hyperlinks::tests::osc8::adjacent_distinct_links_with_identical_uris_merge`.
+
+## P6-002 — Hover logical-line walk caps at 100 wrapped rows
+
+- **Phase / change**: P6, as above. `line_search_left`/`line_search_right`
+  bound their wrap-flag walks at `MAX_SEARCH_LINES` (100) rows per
+  direction from the hover point.
+- **Triggering input**: hovering inside a logical line that spans more than
+  100 wrapped rows (a pathological fully-wrapped buffer) — URL/path
+  detection sees a truncated logical line.
+- **Old behavior**: Zed's alacritty fork walks the wrap chain uncapped
+  (`Term::line_search_left/right` have no bound at the pinned rev).
+- **New behavior**: the walk truncates at 100 wrapped rows per direction —
+  the bound SPEC.md §4.4 mandates, ported from upstream alacritty's hint
+  highlighting (`MAX_SEARCH_LINES`).
+- **Adjudication**: **accepted** — spec-mandated (§4.4 "alacritty's
+  100-wrapped-row cap"): a bounded hover cost beats exact parity on
+  degenerate buffers. No scenario exercises >100 wrapped rows; documented
+  in the module doc.
+
+## P6-003 — URL hover text drops zerowidth combining marks
+
+- **Phase / change**: P6, as above. Both URL and path regexes run over one
+  extracted base-chars-only line, and the reported URL text is sliced from
+  that same line.
+- **Triggering input**: hovering a URL containing a combining mark written
+  as separate codepoints (e.g. `e` + U+0301) inside an OSC-8-free line.
+- **Old behavior**: alacritty's URL regex also matches on base chars only,
+  but the matched text is re-extracted via `bounds_to_string`, which
+  appends zerowidth chars — the reported URL keeps the combining marks.
+- **New behavior**: the reported URL text is the base-chars-only match
+  slice — combining marks are dropped.
+- **Adjudication**: **accepted** — alacritty's own path branch already
+  dropped zerowidth chars (its hover line is built from `cell.c`), so the
+  delta is URL-branch-only and keeps URL text consistent with path text;
+  a URL whose identity depends on unnormalized combining marks is
+  pathological. No ported expectation changed; the `iri` scenarios
+  (single-codepoint wide chars) run byte-identical.

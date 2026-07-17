@@ -5,6 +5,9 @@
 //! fills (grid search, hover pipeline, vi mode) extend this surface.
 
 mod grid_search;
+mod hyperlinks;
+
+pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
 
 use std::{
     cell::{Cell as StdCell, RefCell},
@@ -31,7 +34,7 @@ use ghostty_vt::{
         ScrollViewport, SecondaryDeviceAttributes, SizeReportSize, TertiaryDeviceAttributes,
     },
 };
-use util::ResultExt;
+use util::{ResultExt, paths::PathStyle};
 
 use crate::{
     Cell, CellExtra, CellFlags, Color, Content, Cursor, CursorShape, Hyperlink, IndexedCell,
@@ -576,6 +579,19 @@ impl TerminalBackend {
     /// grid convention at this exit (S3).
     pub(super) fn search_matches(&self, found: grid_search::FoundMatches) -> Vec<Range> {
         grid_search::resolve_matches(&self.terminal, found)
+    }
+
+    /// Hover-to-detect links (SPEC.md §4.4): the ported hyperlinks pipeline
+    /// over this backend's grid, mirroring
+    /// `alacritty::TerminalBackend::find_from_terminal_point`.
+    pub(super) fn find_from_terminal_point(
+        &self,
+        point: Point,
+        regex_searches: &mut RegexSearches,
+        path_style: PathStyle,
+    ) -> Option<HyperlinkMatch> {
+        let point = point_clamp(GridDimensions::of(self), PointBoundary::Grid, point);
+        hyperlinks::find_from_grid_point(self, point, regex_searches, path_style)
     }
 
     /// Jump to the far cell of a wide character, mirroring alacritty's
