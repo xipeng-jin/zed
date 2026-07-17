@@ -575,6 +575,85 @@ mod tests {
     // under the test scheduler's 15 s hard parking limit.
     const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+    /// Control experiment, deliberately below the seam: portable-pty driven
+    /// directly from a plain `#[test]` with std threads — no gpui, no async
+    /// channels, no `spawn_pty`. Separates "portable-pty cannot run ConPTY on
+    /// this host" from "something in the seam or the gpui test harness breaks
+    /// it": if this passes while the `conpty_*` tests fail, the fault is
+    /// above portable-pty; if it fails too, the substrate itself is unfit.
+    #[cfg(windows)]
+    #[test]
+    fn conpty_direct_portable_pty_control() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty failed");
+
+        let command = CommandBuilder::new("cmd.exe");
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn cmd.exe failed");
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("clone reader failed");
+        let (bytes_tx, bytes_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        eprintln!("[direct-control] read: {count}");
+                        if bytes_tx.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[direct-control] read error: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // The banner (or any output beyond the ~20-byte ConPTY preamble)
+        // proves the child executed.
+        let mut total = Vec::new();
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while total.len() < 40 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match bytes_rx.recv_timeout(remaining) {
+                Ok(batch) => total.extend_from_slice(&batch),
+                Err(error) => panic!(
+                    "no output beyond {} bytes from a direct portable-pty cmd.exe session: {error}; \
+                     output so far: {:?}",
+                    total.len(),
+                    String::from_utf8_lossy(&total)
+                ),
+            }
+        }
+        eprintln!(
+            "[direct-control] session produced output: {:?}",
+            String::from_utf8_lossy(&total)
+        );
+
+        if let Err(error) = child.kill() {
+            eprintln!("[direct-control] kill failed: {error}");
+        }
+        drop(pair.master);
+        let status = child.wait().expect("wait failed");
+        eprintln!("[direct-control] child exited: {status:?}");
+    }
+
     #[cfg(unix)]
     fn shell_options(command: &str) -> PtyOptions {
         PtyOptions {
