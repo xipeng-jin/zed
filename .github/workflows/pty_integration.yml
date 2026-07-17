@@ -44,15 +44,7 @@ jobs:
   conpty_tests_windows:
     runs-on: windows-latest
     timeout-minutes: 90
-    env:
-      # cargo's bundled libgit2 cannot handle > MAX_PATH checkout paths (the
-      # python-environment-tools test fixtures exceed it); the git CLI with
-      # core.longpaths can. Upstream's self-hosted runners preconfigure this.
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
-      - name: enable git long paths
-        run: git config --global core.longpaths true
-        shell: pwsh
       - name: checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: setup cargo config
@@ -68,29 +60,8 @@ jobs:
             ~/.cargo/git
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
-      - name: build test binary
-        run: cargo test -p terminal --lib --no-run
-        shell: pwsh
-      # Pin the ConPTY provider: the Server 2022 in-box conhost is
-      # nondeterministically broken under this workload (sessions deliver only
-      # a VT preamble — ledger P4-001), so sideload a modern
-      # OpenConsole/conpty next to the test binary, portable-pty's preferred
-      # path and the configuration wezterm itself ships. The in-box-conhost
-      # question belongs to the §8.2 gate on real hardware.
-      - name: sideload modern ConPTY host
-        run: |
-          $release = "20240203-110809-5046fc22"
-          Invoke-WebRequest -Uri "https://github.com/wezterm/wezterm/releases/download/$release/WezTerm-windows-$release.zip" -OutFile wezterm.zip
-          Expand-Archive wezterm.zip -DestinationPath wezterm-sideload
-          $dir = Get-ChildItem wezterm-sideload | Select-Object -First 1
-          Copy-Item "$($dir.FullName)\conpty.dll" target\debug\deps\
-          Copy-Item "$($dir.FullName)\OpenConsole.exe" target\debug\deps\
-        shell: pwsh
-      # Serial: concurrent ConPTY spawns in one process contend on conhost
-      # startup and pipe-handle inheritance, starving whole sessions of
-      # output. Production spawns terminals one at a time from the foreground.
       - name: run PTY seam suite against ConPTY
-        run: "cargo test -p terminal --lib pty:: -- --test-threads=1"
+        run: cargo test -p terminal --lib pty::
         shell: pwsh
       - name: cleanup cargo config
         if: always()

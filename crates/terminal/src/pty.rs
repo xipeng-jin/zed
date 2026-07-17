@@ -80,22 +80,21 @@ type SharedChild = Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>;
 pub(super) struct SpawnedPty {
     pub handle: PtyHandle,
     pub process_id_getter: ProcessIdGetter,
-    /// Both threads exit on their own once the PTY closes; production drops
-    /// (detaches) these. Only tests read them, via `is_finished`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub reader_thread: JoinHandle<()>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub writer_thread: JoinHandle<()>,
 }
 
-/// The foreground's handle to a live PTY: owns the master (closing it is what
-/// delivers reader EOF on Windows), the writer-thread input channel, and a
-/// killer for the child.
+/// The foreground's handle to a live PTY: owns the master (dropping it closes
+/// the PTY — on Windows, that is what delivers reader EOF), the writer-thread
+/// input channel, and a killer for the child.
 pub(super) struct PtyHandle {
-    /// `Some` until drop takes it (see the `Drop` impl).
-    master: Option<Box<dyn MasterPty + Send>>,
+    master: Box<dyn MasterPty + Send>,
     input_tx: async_channel::Sender<Cow<'static, [u8]>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Both threads exit on their own once the PTY closes; dropping the handle
+    /// detaches them. Only tests read these, via `is_finished`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) reader_thread: JoinHandle<()>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) writer_thread: JoinHandle<()>,
     #[cfg(windows)]
     _exit_poller: Task<()>,
 }
@@ -113,15 +112,9 @@ impl PtyHandle {
     /// ordered before the emulator-side resize exactly like ghostty places its
     /// ioctl outside the terminal update.
     pub(super) fn resize(&self, bounds: TerminalBounds) {
-        let Some(master) = &self.master else { return };
-        if let Err(error) = master.resize(pty_size_from_bounds(bounds)) {
+        if let Err(error) = self.master.resize(pty_size_from_bounds(bounds)) {
             log::error!("failed to resize terminal PTY: {error:#}");
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn master(&self) -> Option<&(dyn MasterPty + Send)> {
-        self.master.as_deref()
     }
 
     /// Stops the writer thread and signals the child (SIGHUP on unix — the
@@ -133,33 +126,6 @@ impl PtyHandle {
         if let Err(error) = self.killer.lock().kill() {
             log::debug!("failed to signal terminal child on shutdown: {error}");
         }
-    }
-}
-
-impl Drop for PtyHandle {
-    fn drop(&mut self) {
-        let Some(master) = self.master.take() else {
-            return;
-        };
-        // On Windows, dropping the master runs ClosePseudoConsole, which can
-        // block until pending output is drained — while the reader thread may
-        // itself be blocked sending to the bounded channel that only the
-        // dropping thread's side consumes. Never let that pair deadlock the
-        // dropping thread (the UI foreground in production): close on a
-        // detached thread; the reader drains and exits in parallel. On unix
-        // the master drop is a plain close(2).
-        #[cfg(windows)]
-        {
-            if let Err(error) = std::thread::Builder::new()
-                .name("terminal-pty-closer".to_string())
-                .spawn(move || drop(master))
-            {
-                // The closure — and with it the master — was dropped inline.
-                log::error!("failed to spawn pty closer thread: {error}");
-            }
-        }
-        #[cfg(not(windows))]
-        drop(master);
     }
 }
 
@@ -215,15 +181,15 @@ pub(super) fn spawn_pty(
 
     Ok(SpawnedPty {
         handle: PtyHandle {
-            master: Some(pair.master),
+            master: pair.master,
             input_tx,
             killer: Mutex::new(killer),
+            reader_thread,
+            writer_thread,
             #[cfg(windows)]
             _exit_poller: exit_poller,
         },
         process_id_getter,
-        reader_thread,
-        writer_thread,
     })
 }
 
@@ -375,17 +341,8 @@ fn spawn_reader_thread(
         .spawn(move || {
             let mut buffer = vec![0u8; READ_BATCH_SIZE];
             let mut receiver_alive = true;
-            let mut reads = 0u32;
             loop {
-                let read_result = reader.read(&mut buffer);
-                if cfg!(test) && reads < 4 {
-                    reads += 1;
-                    eprintln!(
-                        "[pty-reader] read #{reads}: {:?}",
-                        read_result.as_ref().map(|count| *count)
-                    );
-                }
-                match read_result {
+                match reader.read(&mut buffer) {
                     // portable-pty maps the Linux slave-hangup EIO to a clean
                     // EOF already.
                     Ok(0) => break,
@@ -411,11 +368,7 @@ fn spawn_reader_thread(
 
             // `None` means the Windows exit poller observed and reported the
             // exit first; nothing left to do.
-            let status = reap_child(&child);
-            if cfg!(test) {
-                eprintln!("[pty-reader] eof; reaped: {status:?}");
-            }
-            if let Some(status) = status
+            if let Some(status) = reap_child(&child)
                 && receiver_alive
             {
                 for event in exit_event_sequence(status) {
@@ -511,27 +464,15 @@ fn spawn_exit_poller(
 ) -> Task<()> {
     let timer_executor = executor.clone();
     executor.spawn(async move {
-        if cfg!(test) {
-            eprintln!("[exit-poller] started");
-        }
-        let mut ticks = 0u32;
         loop {
             timer_executor.timer(EXIT_POLL_INTERVAL).await;
-            ticks += 1;
             let status = {
                 let mut guard = child.lock();
                 let Some(live_child) = guard.as_mut() else {
                     // The reader thread reaped first (master already dropped).
-                    if cfg!(test) {
-                        eprintln!("[exit-poller] tick {ticks}: child already reaped");
-                    }
                     return;
                 };
-                let polled = live_child.try_wait();
-                if cfg!(test) && (ticks <= 3 || ticks % 100 == 0 || !matches!(polled, Ok(None))) {
-                    eprintln!("[exit-poller] tick {ticks}: {polled:?}");
-                }
-                match polled {
+                match live_child.try_wait() {
                     Ok(None) => continue,
                     Ok(Some(status)) => {
                         guard.take();
@@ -547,9 +488,6 @@ fn spawn_exit_poller(
                 if output_tx.send(PtyOutput::Event(event)).await.is_err() {
                     return;
                 }
-            }
-            if cfg!(test) {
-                eprintln!("[exit-poller] exit reported after {ticks} ticks");
             }
             return;
         }
@@ -569,90 +507,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::time::{Duration, Instant};
 
-    // Generous because first-use ConPTY sessions on cold Windows CI runners
-    // can take tens of seconds to produce their first output. While a PTY is
-    // live its exit poller ticks every 100 ms, which keeps individual parks
-    // under the test scheduler's 15 s hard parking limit.
-    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-    /// Control experiment, deliberately below the seam: portable-pty driven
-    /// directly from a plain `#[test]` with std threads — no gpui, no async
-    /// channels, no `spawn_pty`. Separates "portable-pty cannot run ConPTY on
-    /// this host" from "something in the seam or the gpui test harness breaks
-    /// it": if this passes while the `conpty_*` tests fail, the fault is
-    /// above portable-pty; if it fails too, the substrate itself is unfit.
-    #[cfg(windows)]
-    #[test]
-    fn conpty_direct_portable_pty_control() {
-        use std::io::Read as _;
-        use std::sync::mpsc;
-
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty failed");
-
-        let command = CommandBuilder::new("cmd.exe");
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .expect("spawn cmd.exe failed");
-        drop(pair.slave);
-
-        let mut reader = pair.master.try_clone_reader().expect("clone reader failed");
-        let (bytes_tx, bytes_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        eprintln!("[direct-control] read: {count}");
-                        if bytes_tx.send(buffer[..count].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("[direct-control] read error: {error}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // The banner (or any output beyond the ~20-byte ConPTY preamble)
-        // proves the child executed.
-        let mut total = Vec::new();
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        while total.len() < 40 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match bytes_rx.recv_timeout(remaining) {
-                Ok(batch) => total.extend_from_slice(&batch),
-                Err(error) => panic!(
-                    "no output beyond {} bytes from a direct portable-pty cmd.exe session: {error}; \
-                     output so far: {:?}",
-                    total.len(),
-                    String::from_utf8_lossy(&total)
-                ),
-            }
-        }
-        eprintln!(
-            "[direct-control] session produced output: {:?}",
-            String::from_utf8_lossy(&total)
-        );
-
-        if let Err(error) = child.kill() {
-            eprintln!("[direct-control] kill failed: {error}");
-        }
-        drop(pair.master);
-        let status = child.wait().expect("wait failed");
-        eprintln!("[direct-control] child exited: {status:?}");
-    }
+    const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[cfg(unix)]
     fn shell_options(command: &str) -> PtyOptions {
@@ -720,39 +575,6 @@ mod tests {
         }
     }
 
-    /// Waits until the session has demonstrably produced `min_total` bytes of
-    /// output — on Windows, acting on a ConPTY session before conhost is
-    /// fully up races its startup, so the §8.2 tests establish liveness
-    /// first. Sized in bytes rather than matched on content: ConPTY output is
-    /// a VT stream whose text framing is not guaranteed, and its startup
-    /// preamble (~20 bytes across two reads on the CI runner) precedes any
-    /// child text such as the cmd banner.
-    #[cfg(windows)]
-    async fn wait_for_output_bytes(
-        min_total: usize,
-        output_rx: &async_channel::Receiver<PtyOutput>,
-        executor: &BackgroundExecutor,
-    ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        while bytes.len() < min_total {
-            match recv_output(output_rx, executor).await {
-                PtyOutput::Bytes(batch) => bytes.extend_from_slice(&batch),
-                // An exit event first means the session ended early; surface
-                // that instead of timing out opaquely.
-                PtyOutput::Event(event) => panic!(
-                    "session ended after {} bytes, before reaching {min_total}: got {event:?}",
-                    bytes.len()
-                ),
-            }
-        }
-        bytes
-    }
-
-    /// The ConPTY startup preamble alone is ~20 bytes; the cmd banner pushes
-    /// a session past this.
-    #[cfg(windows)]
-    const SESSION_LIVE_BYTES: usize = 40;
-
     /// Waits for a thread to finish while draining the output channel, so a
     /// producer blocked on the bounded channel can always make progress.
     async fn assert_thread_finishes(
@@ -797,9 +619,9 @@ mod tests {
         );
         assert_eq!(status.code(), Some(7), "exit code must propagate exactly");
 
-        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
         spawned.handle.shutdown();
-        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
     }
 
     #[cfg(unix)]
@@ -855,8 +677,7 @@ mod tests {
 
         let size = spawned
             .handle
-            .master()
-            .expect("master must be open before drop")
+            .master
             .get_size()
             .expect("failed to read pty size");
         assert_eq!((size.rows, size.cols), (30, 80));
@@ -869,8 +690,8 @@ mod tests {
             Some(libc::SIGHUP),
             "shutdown must signal the child like the alacritty pty drop did"
         );
-        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
-        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
     }
 
     #[cfg(unix)]
@@ -893,8 +714,8 @@ mod tests {
         let (_, status) = drain_until_exit(&output_rx, &executor).await;
         assert!(!status.success());
         assert_eq!(status.signal(), Some(libc::SIGHUP));
-        assert_thread_finishes(&spawned.reader_thread, &output_rx, &executor).await;
-        assert_thread_finishes(&spawned.writer_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.reader_thread, &output_rx, &executor).await;
+        assert_thread_finishes(&spawned.handle.writer_thread, &output_rx, &executor).await;
     }
 
     /// The resize half of the G3 suite on ConPTY: `PtyHandle::resize` must
@@ -915,11 +736,6 @@ mod tests {
         )
         .expect("failed to spawn pty");
 
-        // Acting on a ConPTY session before conhost is up races its startup;
-        // wait for the cmd banner first.
-        eprintln!("[conpty-resize] spawned; waiting for banner");
-        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
-
         let bounds = TerminalBounds::new(
             gpui::px(10.),
             gpui::px(5.),
@@ -929,25 +745,21 @@ mod tests {
             },
         );
         spawned.handle.resize(bounds);
-        eprintln!("[conpty-resize] resized");
 
         let size = spawned
             .handle
-            .master()
-            .expect("master must be open before drop")
+            .master
             .get_size()
             .expect("failed to read pty size");
         assert_eq!((size.rows, size.cols), (30, 80));
 
         spawned.handle.shutdown();
-        eprintln!("[conpty-resize] shut down; waiting for threads");
-        let SpawnedPty {
-            handle,
+        let SpawnedPty { handle, .. } = spawned;
+        let PtyHandle {
             reader_thread,
             writer_thread,
             ..
-        } = spawned;
-        drop(handle);
+        } = handle;
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
     }
@@ -970,19 +782,21 @@ mod tests {
         .expect("failed to spawn pty");
 
         // Wait for the cmd banner so the session is fully up.
-        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
+        loop {
+            if let PtyOutput::Bytes(_) = recv_output(&output_rx, &executor).await {
+                break;
+            }
+        }
 
-        let SpawnedPty {
-            handle,
+        let SpawnedPty { handle, .. } = spawned;
+        handle.shutdown();
+        // Dropping the master closes the pseudoconsole, which is what delivers
+        // reader EOF; keeping only the join handles mirrors `Terminal::drop`.
+        let PtyHandle {
             reader_thread,
             writer_thread,
             ..
-        } = spawned;
-        handle.shutdown();
-        // Dropping the handle closes the pseudoconsole (on a detached closer
-        // thread), which is what delivers reader EOF; keeping only the join
-        // handles mirrors `Terminal::drop`.
-        drop(handle);
+        } = handle;
 
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
@@ -998,24 +812,13 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // Interactive cmd with `exit 42` typed through the writer thread once
-        // the banner has arrived. Typing must come after the banner: input
-        // written during conhost startup wedges the session, and children
-        // spawned *with arguments* never execute at all on this runner's
-        // in-box ConPTY (ledger P4-001), so interactive cmd is the one
-        // reliable vehicle for a natural exit here.
         let spawned = spawn_pty(
-            cmd_options(&[]),
+            cmd_options(&["/C", "exit 42"]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
-
-        eprintln!("[conpty-exit] spawned; waiting for banner");
-        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
-        eprintln!("[conpty-exit] banner up; typing exit");
-        spawned.handle.notify(&b"exit 42\r"[..]);
 
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
@@ -1034,36 +837,25 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // Interactive cmd as the long-running child (children spawned with
-        // arguments never execute on this runner's in-box ConPTY — ledger
-        // P4-001 — and an idle interactive cmd runs until killed).
         let spawned = spawn_pty(
-            cmd_options(&[]),
+            cmd_options(&["/C", "ping -n 120 127.0.0.1"]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
 
-        // Kill only once the session has demonstrably started; killing into a
-        // half-started ConPTY races conhost startup.
-        eprintln!("[conpty-kill] spawned; waiting for banner");
-        wait_for_output_bytes(SESSION_LIVE_BYTES, &output_rx, &executor).await;
-
         spawned.handle.shutdown();
-        eprintln!("[conpty-kill] shut down; waiting for exit report");
 
         let (_, status) = drain_until_exit(&output_rx, &executor).await;
         assert!(!status.success(), "killed child must not report success");
-        eprintln!("[conpty-kill] exit observed; waiting for threads");
 
-        let SpawnedPty {
-            handle,
+        let SpawnedPty { handle, .. } = spawned;
+        let PtyHandle {
             reader_thread,
             writer_thread,
             ..
-        } = spawned;
-        drop(handle);
+        } = handle;
         assert_thread_finishes(&reader_thread, &output_rx, &executor).await;
         assert_thread_finishes(&writer_thread, &output_rx, &executor).await;
     }

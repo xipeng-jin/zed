@@ -249,28 +249,6 @@ found by inspection, per the P3 precedent.
   task") exercises this; if it bites, the documented exit is a raw-cmdline
   patch in the portable-pty fork-or-vendor path (D1's exit strategy).
   `util::shell::ShellKind::tty_escape_args` is dead code until then.
-- **P4 CI evidence (2026-07-17, eleven instrumented `pty_integration`
-  runs)**: on `windows-latest` (Server 2022), ConPTY sessions created
-  through the seam **nondeterministically** wedge when driven by the
-  in-box kernel32 conhost: a session delivers a ~20-byte VT preamble and
-  then nothing — the child never executes, never exits, and after
-  `TerminateProcess` reader EOF is withheld past pseudoconsole close.
-  Which sessions wedged varied *across runner instances* — early runs
-  pointed at MSVC-quoted `cmd /C` arguments, then at any
-  argument-bearing child (`ping.exe` direct), and finally (`b99c174bfe`)
-  interactive `cmd.exe` itself wedged, discrediting every
-  code-level-determinism theory including the `STARTF_USESTDHANDLES` +
-  `INVALID_HANDLE_VALUE` std-handles candidate (an alacritty-parity
-  null-handles fork patch, held at
-  `xipeng-jin/wezterm@zed-conpty-null-std-handles`, changed nothing).
-  Resolution: **CI pins the ConPTY provider** by sideloading a modern
-  `OpenConsole.exe`/`conpty.dll` (a pinned wezterm release) next to the
-  test binary — portable-pty's preferred path and the configuration
-  wezterm/VS Code ship in production. The behavior of the seam on stock
-  Windows in-box conhost (desktop Win10/11 conhost is far newer than
-  Server 2022's) is a **hard §8.2 gate item on real Windows hardware**,
-  as is the original cmd.exe quoting divergence above; sideloading an
-  OpenConsole with Zed on Windows is a candidate gate outcome.
 
 ## P4-002 — Missing or invalid working directory falls back to `$HOME` (unix)
 
