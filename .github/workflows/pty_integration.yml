@@ -68,8 +68,11 @@ jobs:
             ~/.cargo/git
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
+      # Serial: concurrent ConPTY spawns in one process contend on conhost
+      # startup and pipe-handle inheritance, starving whole sessions of
+      # output. Production spawns terminals one at a time from the foreground.
       - name: run PTY seam suite against ConPTY
-        run: "cargo test -p terminal --lib pty::"
+        run: "cargo test -p terminal --lib pty:: -- --test-threads=1"
         shell: pwsh
       - name: cleanup cargo config
         if: always()
