@@ -867,22 +867,17 @@ mod tests {
         let executor = cx.background_executor.clone();
 
         let (output_tx, output_rx) = output_channel();
-        // Interactive cmd with the exit typed through the writer thread: no
-        // `/C` argument means no MSVC-quoted command line for cmd to parse
-        // (the P4-001 divergence wedges a quoted `/C` under ConPTY), and it
-        // exercises the seam's input path on Windows.
+        // `/C exit 42` as three space-free arguments: portable-pty quotes
+        // nothing (a quoted `/C` argument wedges under ConPTY — ledger
+        // P4-001) and cmd re-joins the tail into the command to run.
         let spawned = spawn_pty(
-            cmd_options(&[]),
+            cmd_options(&["/C", "exit", "42"]),
             TerminalBounds::default(),
             output_tx,
             &executor,
         )
         .expect("failed to spawn pty");
-
-        eprintln!("[conpty-exit] spawned; waiting for banner");
-        wait_for_first_output(&output_rx, &executor).await;
-        eprintln!("[conpty-exit] session live; typing exit");
-        spawned.handle.notify(&b"exit 42\r\n"[..]);
+        eprintln!("[conpty-exit] spawned; waiting for exit observation");
 
         // The master (and with it the pseudoconsole) stays open for the whole
         // wait: observing the exit here proves it does not depend on reader
