@@ -68,6 +68,24 @@ jobs:
             ~/.cargo/git
             target
           key: pty-integration-windows-${{ hashFiles('Cargo.lock') }}
+      - name: build test binary
+        run: cargo test -p terminal --lib --no-run
+        shell: pwsh
+      # Pin the ConPTY provider: the Server 2022 in-box conhost is
+      # nondeterministically broken under this workload (sessions deliver only
+      # a VT preamble — ledger P4-001), so sideload a modern
+      # OpenConsole/conpty next to the test binary, portable-pty's preferred
+      # path and the configuration wezterm itself ships. The in-box-conhost
+      # question belongs to the §8.2 gate on real hardware.
+      - name: sideload modern ConPTY host
+        run: |
+          $release = "20240203-110809-5046fc22"
+          Invoke-WebRequest -Uri "https://github.com/wezterm/wezterm/releases/download/$release/WezTerm-windows-$release.zip" -OutFile wezterm.zip
+          Expand-Archive wezterm.zip -DestinationPath wezterm-sideload
+          $dir = Get-ChildItem wezterm-sideload | Select-Object -First 1
+          Copy-Item "$($dir.FullName)\conpty.dll" target\debug\deps\
+          Copy-Item "$($dir.FullName)\OpenConsole.exe" target\debug\deps\
+        shell: pwsh
       # Serial: concurrent ConPTY spawns in one process contend on conhost
       # startup and pipe-handle inheritance, starving whole sessions of
       # output. Production spawns terminals one at a time from the foreground.
