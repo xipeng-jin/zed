@@ -346,7 +346,7 @@ closes at P10. Fixed ordering edges: P0 before P3 (first production dep on
 | **P1 — Backend-struct refactor** | Collapse term/config/processor + free functions into `alacritty::TerminalBackend`; `terminal.rs` stops locking. Pure mechanics. | All suites green, zero test edits. |
 | **P2 — Zed-owned domain types** | #31 Color mirror + S2 owned `Cell`/`Hyperlink`; conversion at snapshot build. | Class B untouched; vte out of the public API; the two `Arc`-sharing round-trip tests retired via ledger; downstream crates compile unmodified. |
 | **P3 — Ghostty encoders** (gated on P0; Linux-cfg per §5) | Key/mouse/paste/focus encoders against the alacritty core via the `Modes`→options shim; `keys.rs`/scroll-report suites ported as contract tests. First production dep on `ghostty_vt`. | Contract tests byte-identical (mismatches ledger-adjudicated); copy/paste + keys manual rows. |
-| **P4 — PTY/threading swap** | `pty.rs` (portable-pty git-pinned per §8.2); reader/writer threads; bounded byte channel; foreground pump → `Processor::advance`; EventLoop/SignalMask deleted; construction moves foreground; headless converges on the byte channel. | Class B untouched; PTY integration suite (spawn/resize/kill/exit) green on Linux + Windows CI incl. ConPTY shutdown/exit/kill tests; **sustained-flood benchmark lands here** (decided at spec lock) and validates channel/batch tuning; affected manual rows. |
+| **P4 — PTY/threading swap** | `pty.rs` (portable-pty git-pinned per §8.2); reader/writer threads; bounded byte channel; foreground pump → `Processor::advance`; EventLoop/SignalMask deleted; construction moves foreground; headless converges on the byte channel. | Class B untouched; PTY integration suite (spawn/resize/kill/exit) green on Linux + Windows CI incl. ConPTY shutdown/exit/kill tests; **sustained-flood benchmark lands here** (decided at spec lock) and validates channel/batch tuning; affected manual rows. *Windows-CI half amended to the §8.2 self-hosted/real-hardware substrate (ticket #45 sign-off, 2026-07-21 — see §8.2 amendment).* |
 | **P5 — Dark ghostty backend: core** | Snapshot path, mutations, selection, G5 clear, theme push; G5 clear test + G6 point tests + `format_selection_buf` characterization tests. Unused by production. | Backend suite green; clear test passes identically on both backends. |
 | **P6 — Dark ghostty backend: gap fills** | `grid_search`, hover pipeline, `vi_mode` port, full #35 test plan (36 hyperlink scenarios re-hosted; upstream vi tests; byte↔cell map tests; max-scrollback extraction benchmark). Divisible; parallel with P7. | #35's acceptance bar met. |
 | **P7 — Differential harness** (window opens) | Harness holds both backends; recorder + recorded/synthetic corpus; non-gating fuzzer; divergence ledger seeded; alacritty perf baseline recorded (release builds). | Corpus runs divergence-free modulo adjudicated entries; CI job wired. |
@@ -419,6 +419,14 @@ integration suite (shutdown without EOF-wait hang, exit observation via
 git-pinned for the wezterm#7709 `kill()` fix; manual smoke on real Windows
 hardware. The vt core is platform-independent — the Linux differential corpus
 vouches for it.
+
+**Amendment (2026-07-21, ticket
+[#45](https://github.com/xipeng-jin/zed/issues/45))**: "Windows CI" in this
+section and in the §6 P4 row means upstream's self-hosted Windows runners
+(`self-32vcpu-windows-2022`). GitHub-hosted Windows runners starve ConPTY
+sessions below the seam in bare portable-pty (Actions run 29603970998) and
+are diagnostic/advisory only — never acceptance evidence. The Linux half of
+the P4 CI criterion is unchanged and remains gating.
 
 ## 9. Deferred decisions and accepted losses
 
