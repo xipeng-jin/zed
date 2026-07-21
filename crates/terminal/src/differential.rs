@@ -2031,7 +2031,6 @@ mod perf {
     use super::harness_bounds;
     use crate::terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape};
     use crate::{Content, Scroll, alacritty};
-    use std::time::Instant;
 
     const CHUNK: usize = 64 * 1024;
     const SCROLLBACK: usize = 10_000;
@@ -2050,20 +2049,63 @@ mod perf {
         )
     }
 
-    fn feed_scenario(name: &str, bytes: &[u8]) {
-        let mut backend = baseline_backend();
-        let mut content = Content::default();
-        let started = Instant::now();
-        for chunk in bytes.chunks(CHUNK) {
-            backend.write(chunk);
-            content = backend.make_content(&content);
-        }
-        let elapsed = started.elapsed();
-        let mebibytes = bytes.len() as f64 / (1024.0 * 1024.0);
-        println!(
-            "  {name}: {mebibytes:.1} MiB in {elapsed:.2?} → {:.1} MiB/s",
-            mebibytes / elapsed.as_secs_f64()
-        );
+    /// Scenario bodies shared by the alacritty baseline and the ghostty P8
+    /// comparison, duck-typed over the backend like the production seam (a
+    /// trait would not compile off-Linux, where only alacritty exists).
+    macro_rules! feed_scenario {
+        ($name:expr, $backend:expr, $bytes:expr) => {{
+            let mut backend = $backend;
+            let bytes = $bytes;
+            let mut content = Content::default();
+            let started = std::time::Instant::now();
+            for chunk in bytes.chunks(CHUNK) {
+                backend.write(chunk);
+                content = backend.make_content(&content);
+            }
+            let elapsed = started.elapsed();
+            let mebibytes = bytes.len() as f64 / (1024.0 * 1024.0);
+            println!(
+                "  {}: {mebibytes:.1} MiB in {elapsed:.2?} → {:.1} MiB/s",
+                $name,
+                mebibytes / elapsed.as_secs_f64()
+            );
+            content
+        }};
+    }
+
+    // Sustained scrolling with full scrollback: snapshot per scroll step,
+    // the shape find/scroll interactions drive through the seam.
+    macro_rules! scroll_scenario {
+        ($backend:expr) => {{
+            let mut backend = $backend;
+            let mut fill = Vec::new();
+            for line in 0..(SCROLLBACK + 100) {
+                fill.extend_from_slice(format!("scrollback fill line {line}\r\n").as_bytes());
+            }
+            for chunk in fill.chunks(CHUNK) {
+                backend.write(chunk);
+            }
+            let mut content = Content::default();
+            let operations = 20_000;
+            let started = std::time::Instant::now();
+            for step in 0..operations {
+                let scroll = match step % 100 {
+                    0 => Scroll::Top,
+                    50 => Scroll::Bottom,
+                    s if s < 50 => Scroll::Delta(3),
+                    _ => Scroll::Delta(-3),
+                };
+                backend.scroll_display(scroll);
+                content = backend.make_content(&content);
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "  sustained_scroll: {operations} scroll+snapshot ops over {} history lines in {elapsed:.2?} → {:.0} ops/s",
+                SCROLLBACK,
+                operations as f64 / elapsed.as_secs_f64()
+            );
+            assert!(!content.cells.is_empty(), "scroll scenario produced no snapshot");
+        }};
     }
 
     fn colored_dump_bytes() -> Vec<u8> {
@@ -2115,39 +2157,214 @@ mod perf {
         }
         println!("terminal perf baseline (alacritty backend):");
 
-        feed_scenario("colored_dump", &colored_dump_bytes());
-        feed_scenario("wide_char_cjk", &wide_char_bytes());
-        feed_scenario("alt_screen_churn", &alt_screen_churn_bytes());
+        feed_scenario!("colored_dump", baseline_backend(), colored_dump_bytes());
+        feed_scenario!("wide_char_cjk", baseline_backend(), wide_char_bytes());
+        feed_scenario!("alt_screen_churn", baseline_backend(), alt_screen_churn_bytes());
+        scroll_scenario!(baseline_backend());
+    }
 
-        // Sustained scrolling with full scrollback: snapshot per scroll step,
-        // the shape find/scroll interactions drive through the seam.
-        let mut backend = baseline_backend();
-        let mut fill = Vec::new();
-        for line in 0..(SCROLLBACK + 100) {
-            fill.extend_from_slice(format!("scrollback fill line {line}\r\n").as_bytes());
+    /// The same scenarios through the ghostty backend, for the P8 gate:
+    /// no scenario may regress more than 20% against the recorded alacritty
+    /// baseline (SPEC.md §6 P8, §7; docs/ghostty-migration/perf-baseline.md).
+    #[cfg(target_os = "linux")]
+    mod ghostty_swap {
+        use super::*;
+        use crate::ghostty;
+
+        fn swap_backend() -> ghostty::TerminalBackend {
+            let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+            // The receiver is dropped: the ghostty backend forwards events
+            // with `unbounded_send(..).ok()`, so a benchmark run without an
+            // event consumer is fine.
+            ghostty::TerminalBackend::new(
+                SCROLLBACK,
+                SettingsCursorShape::Block,
+                harness_bounds(120, 40),
+                events_tx,
+                AlternateScroll::On,
+            )
         }
-        for chunk in fill.chunks(CHUNK) {
-            backend.write(chunk);
+
+        #[test]
+        #[ignore = "release-build benchmark; run via script/terminal-perf-baseline"]
+        fn perf_swap_ghostty() {
+            if cfg!(debug_assertions) {
+                println!(
+                    "WARNING: debug build — swap numbers are only valid from release runs"
+                );
+            }
+            println!("terminal perf (ghostty backend, P8 swap):");
+
+            feed_scenario!("colored_dump", swap_backend(), colored_dump_bytes());
+            feed_scenario!("wide_char_cjk", swap_backend(), wide_char_bytes());
+            feed_scenario!("alt_screen_churn", swap_backend(), alt_screen_churn_bytes());
+            scroll_scenario!(swap_backend());
         }
-        let mut content = Content::default();
-        let operations = 20_000;
-        let started = Instant::now();
-        for step in 0..operations {
-            let scroll = match step % 100 {
-                0 => Scroll::Top,
-                50 => Scroll::Bottom,
-                s if s < 50 => Scroll::Delta(3),
-                _ => Scroll::Delta(-3),
+
+        /// The sustained-flood scenario through the ghostty backend: the P8
+        /// twin of `pty::tests::sustained_flood_benchmark` (which stays on
+        /// alacritty as the recorded-baseline probe), with the same seam —
+        /// child → reader thread → bounded channel → batch-capped ingest —
+        /// and the same reporting. Run in release via
+        /// `script/terminal-flood-bench`.
+        #[cfg(unix)]
+        #[gpui::test]
+        #[ignore = "benchmark; run via script/terminal-flood-bench"]
+        async fn sustained_flood_ghostty(cx: &mut gpui::TestAppContext) {
+            use crate::pty::{self, PtyOutput};
+            use futures::FutureExt as _;
+            use std::time::{Duration, Instant};
+
+            cx.executor().allow_parking();
+            let executor = cx.background_executor.clone();
+
+            const FLOOD_BYTES: u64 = 256 * 1024 * 1024;
+            const MARKER_INTERVAL: Duration = Duration::from_millis(250);
+            const RECV_TIMEOUT: Duration = Duration::from_secs(20);
+
+            let (output_tx, output_rx) = pty::output_channel();
+            // The flood alphabet deliberately excludes 'Z', the echo marker.
+            let spawned = pty::spawn_pty(
+                pty::PtyOptions {
+                    shell: Some((
+                        "/bin/sh".to_string(),
+                        vec![
+                            "-c".to_string(),
+                            format!(
+                                "yes 0123456789abcdefghijklmnopqrstuv | head -c {FLOOD_BYTES}"
+                            ),
+                        ],
+                    )),
+                    working_directory: None,
+                    env: collections::HashMap::default(),
+                    window_id: 0,
+                },
+                crate::TerminalBounds::default(),
+                output_tx,
+                &executor,
+            )
+            .expect("failed to spawn flood pty");
+
+            let mut backend = swap_backend();
+
+            let mut total_bytes = 0u64;
+            let mut turns = 0u64;
+            let mut total_turn_time = Duration::ZERO;
+            let mut max_turn_time = Duration::ZERO;
+            let mut echo_samples = Vec::new();
+            let mut marker_sent_at: Option<Instant> = None;
+            let mut last_marker_at = Instant::now();
+            let started_at = Instant::now();
+
+            let mut ingest = |bytes: &[u8],
+                              total_bytes: &mut u64,
+                              marker_sent_at: &mut Option<Instant>,
+                              echo_samples: &mut Vec<Duration>| {
+                if let Some(sent_at) = *marker_sent_at
+                    && bytes.contains(&b'Z')
+                {
+                    echo_samples.push(sent_at.elapsed());
+                    *marker_sent_at = None;
+                }
+                backend.write(bytes);
+                *total_bytes += bytes.len() as u64;
             };
-            backend.scroll_display(scroll);
-            content = backend.make_content(&content);
+
+            'pump: loop {
+                let first = futures::select_biased! {
+                    output = output_rx.recv().fuse() => {
+                        output.expect("pty output channel closed unexpectedly")
+                    }
+                    _ = executor.timer(RECV_TIMEOUT).fuse() => {
+                        panic!("timed out waiting for pty output")
+                    }
+                };
+                let turn_started_at = Instant::now();
+                let mut exited = false;
+                match first {
+                    PtyOutput::Bytes(bytes) => {
+                        ingest(
+                            &bytes,
+                            &mut total_bytes,
+                            &mut marker_sent_at,
+                            &mut echo_samples,
+                        );
+                        let mut batches = 1;
+                        while batches < pty::MAX_BATCHES_PER_TURN {
+                            match output_rx.try_recv() {
+                                Ok(PtyOutput::Bytes(bytes)) => {
+                                    ingest(
+                                        &bytes,
+                                        &mut total_bytes,
+                                        &mut marker_sent_at,
+                                        &mut echo_samples,
+                                    );
+                                    batches += 1;
+                                }
+                                Ok(PtyOutput::Event(event)) => {
+                                    exited = matches!(
+                                        event,
+                                        crate::TerminalBackendEvent::ChildExit(_)
+                                    );
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    PtyOutput::Event(event) => {
+                        exited =
+                            matches!(event, crate::TerminalBackendEvent::ChildExit(_));
+                    }
+                }
+
+                let turn_time = turn_started_at.elapsed();
+                turns += 1;
+                total_turn_time += turn_time;
+                max_turn_time = max_turn_time.max(turn_time);
+
+                if exited {
+                    break 'pump;
+                }
+
+                if marker_sent_at.is_none() && last_marker_at.elapsed() > MARKER_INTERVAL {
+                    spawned.handle.notify(&b"Z"[..]);
+                    marker_sent_at = Some(Instant::now());
+                    last_marker_at = Instant::now();
+                }
+            }
+
+            let wall = started_at.elapsed();
+
+            assert!(
+                total_bytes >= FLOOD_BYTES,
+                "flood should deliver every byte, got {total_bytes} of {FLOOD_BYTES}"
+            );
+
+            let mib = total_bytes as f64 / (1024.0 * 1024.0);
+            println!("sustained-flood benchmark (ghostty backend, P8 swap):");
+            println!(
+                "  throughput: {mib:.1} MiB in {:.2}s = {:.1} MiB/s",
+                wall.as_secs_f64(),
+                mib / wall.as_secs_f64()
+            );
+            println!(
+                "  foreground turns: {turns}, mean {:?}, max (UI-stall bound) {:?}",
+                total_turn_time / turns.max(1) as u32,
+                max_turn_time
+            );
+            if echo_samples.is_empty() {
+                println!("  echo latency: no samples");
+            } else {
+                let total: Duration = echo_samples.iter().sum();
+                let min = echo_samples.iter().min().expect("nonempty");
+                let max = echo_samples.iter().max().expect("nonempty");
+                println!(
+                    "  echo latency during flood: n={}, min {min:?}, mean {:?}, max {max:?}",
+                    echo_samples.len(),
+                    total / echo_samples.len() as u32,
+                );
+            }
         }
-        let elapsed = started.elapsed();
-        println!(
-            "  sustained_scroll: {operations} scroll+snapshot ops over {} history lines in {elapsed:.2?} → {:.0} ops/s",
-            SCROLLBACK,
-            operations as f64 / elapsed.as_secs_f64()
-        );
-        assert!(!content.cells.is_empty(), "scroll scenario produced no snapshot");
     }
 }

@@ -27,12 +27,24 @@ use util::paths::PathStyle;
 
 use crate::{
     Cell, CellExtra, CellFlags, Color, Content, Cursor, CursorShape, Hyperlink, IndexedCell, Modes,
-    Point, PtyEvent, Range, RenderableCells, Rgb, Scroll, Search, Selection, SelectionRange,
-    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
+    Point, PtyEvent, Range, Rgb, Scroll, Selection, SelectionRange, SelectionSide, SelectionType,
+    TerminalBackendEvent, TerminalBounds, ViMotion,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
+
+/// Iterator over borrowed grid cells; `crate::RenderableCells` on
+/// macOS/Windows (the ghostty analogue owns its cells and has no lifetime).
+pub struct RenderableCells<'a> {
+    cells: AlacrittyGridIterator<'a>,
+}
+
+/// A compiled search query; `crate::Search` on macOS/Windows.
+#[derive(Clone, Debug)]
+pub struct Search {
+    search: AlacrittySearch,
+}
 
 pub(super) type AlacrittyTerm = Term<ZedListener>;
 pub(super) type AlacrittyTermConfig = Config;
@@ -126,6 +138,23 @@ impl TerminalBackend {
         self.config.default_cursor_style = alacritty_cursor_style(cursor_shape);
         self.term.lock().set_options(self.config.clone());
     }
+
+    /// No-op: the alacritty core answers color queries through the
+    /// `ColorRequest` event path, reading the live theme at request time, so
+    /// no defaults are pushed (the ghostty analogue stores these to answer
+    /// OSC 4/10/11/12 internally, SPEC.md §4.2).
+    pub(super) fn push_theme_colors(
+        &mut self,
+        _foreground: Rgb,
+        _background: Rgb,
+        _cursor: Rgb,
+        _palette: &[Rgb; 256],
+    ) {
+    }
+
+    /// No-op: the alacritty core does not answer CSI ?996n color-scheme
+    /// queries (the ghostty analogue does).
+    pub(super) fn set_color_scheme(&mut self, _dark: bool) {}
 
     pub(super) fn make_content(&mut self, last_content: &Content) -> Content {
         make_content(&self.term.lock_unfair(), last_content)

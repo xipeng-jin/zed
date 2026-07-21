@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# The nested-Xwayland `:99` terminal smoke reel (SPEC.md §7;
+# verification-strategy.md §7): launches the dev Zed build on an isolated
+# Xwayland server, opens a terminal, drives a fixed scenario reel — colored
+# output, vim alt-screen edit, tmux split, resize, title change, scrollback —
+# and captures a screenshot per step into an artifact directory. Automation
+# drives; a human reviews the reel. No pixel-diff assertions.
+#
+# Requires: Xwayland, ImageMagick `import`, python3 + python-xlib, tmux, and
+# a vi available as `vi`/`vim`/`nvim`. Runs entirely on display :99 so the
+# user's session is untouched.
+#
+# Usage: script/terminal-smoke-reel [output-dir]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+OUT_DIR="${1:-target/terminal-smoke-reel/$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$OUT_DIR"
+DISPLAY_NUM=":99"
+DATA_DIR="$(mktemp -d /tmp/zed-smoke.XXXXXX)"
+
+if [[ ! -x target/debug/zed ]]; then
+    echo "target/debug/zed missing — run 'cargo build -p zed' first" >&2
+    exit 1
+fi
+
+# A stale lock without a live server blocks Xwayland startup.
+if [[ -e /tmp/.X99-lock ]] && ! [[ -e /tmp/.X11-unix/X99 ]]; then
+    rm -f /tmp/.X99-lock
+fi
+
+Xwayland "$DISPLAY_NUM" -geometry 1280x800 -decorate &
+XWAYLAND_PID=$!
+trap 'kill $XWAYLAND_PID 2>/dev/null || true; rm -rf "$DATA_DIR"' EXIT
+sleep 2
+
+# The lavapipe ICD avoids a RADV swapchain deadlock under nested Xwayland;
+# gpui falls back to its stable GL adapter.
+env -u WAYLAND_DISPLAY DISPLAY="$DISPLAY_NUM" \
+    VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+    target/debug/zed --user-data-dir "$DATA_DIR" &
+ZED_PID=$!
+sleep 12
+
+OUT_DIR="$OUT_DIR" DISPLAY_NUM="$DISPLAY_NUM" python3 script/lib/terminal-smoke-reel.py
+
+kill "$ZED_PID" 2>/dev/null || true
+wait "$ZED_PID" 2>/dev/null || true
+
+echo "reel captured in $OUT_DIR"

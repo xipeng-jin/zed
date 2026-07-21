@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Runs the sustained-flood terminal benchmark (SPEC.md §6 P4) in release mode:
 # child → PTY reader thread → bounded byte channel → batch-capped foreground
-# ingest, reporting throughput, per-turn stall bound, and echo latency.
+# ingest, reporting throughput, per-turn stall bound, and echo latency —
+# first into the alacritty backend (the recorded-baseline probe), then (on
+# Linux) into the ghostty backend for the P8 within-20% comparison.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo test -p terminal --release --lib -- --ignored --nocapture \
     pty::tests::sustained_flood_benchmark
+
+if [[ "$(uname -s)" == "Linux" ]]; then
+    cargo test -p terminal --release --lib -- --ignored --nocapture \
+        differential::perf::ghostty_swap::sustained_flood_ghostty
+fi

@@ -50,12 +50,12 @@ pub(super) struct ScreenPoint {
 /// regex crate's default size limits, comparable to alacritty's
 /// regex-automata cache bounds — yields `None`, which surfaces as no matches.
 #[derive(Clone, Debug)]
-pub(crate) struct SearchQuery {
+pub struct SearchQuery {
     regex: Regex,
 }
 
 impl SearchQuery {
-    pub(crate) fn new(pattern: &str) -> Option<Self> {
+    pub fn new(pattern: &str) -> Option<Self> {
         let case_insensitive = !pattern.chars().any(char::is_uppercase);
         RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
@@ -483,7 +483,7 @@ mod tests {
             AlternateScroll::On,
         );
         backend.write(input);
-        let searcher = Search::new(pattern).expect("pattern should compile");
+        let searcher = crate::alacritty::Search::new(pattern).expect("pattern should compile");
         backend.prepare_search(searcher).run()
     }
 

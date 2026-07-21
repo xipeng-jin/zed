@@ -1,14 +1,17 @@
 mod mappings;
 
+// Production on macOS/Windows; on Linux only the differential-harness and
+// contract-test oracle since the P8 swap, so Linux builds no longer
+// reference all of it. Deleted at P10.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod alacritty;
 // The differential harness (SPEC.md §6 P7, §7): transcript-driven
-// comparison of both backends plus the alacritty perf-baseline scenarios.
+// comparison of both backends plus the perf-baseline scenarios.
 #[cfg(test)]
 mod differential;
-// The dark ghostty backend (SPEC.md §6 P5): compiled and tested on Linux,
-// unused by production until the P8 swap re-points the backend import.
+// The ghostty backend (SPEC.md §6 P5/P8): the production Linux backend
+// since the P8 swap.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod ghostty;
 mod pty;
 mod pty_info;
@@ -34,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
-use theme::{ActiveTheme, Theme};
+use theme::{ActiveTheme, Appearance, GlobalTheme, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
@@ -62,9 +65,21 @@ use gpui::{
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-use crate::alacritty::{
-    AlacrittyGridIterator, AlacrittySearch, HyperlinkMatch, RegexSearches, TerminalBackend,
-};
+// The backend import/construction cfg point (SPEC.md §5, from P8): Linux
+// runs on the ghostty backend, macOS/Windows on alacritty until their §8
+// gates open. Both expose the same duck-typed surface (S1).
+#[cfg(not(target_os = "linux"))]
+pub use crate::alacritty::{RenderableCells, Search};
+#[cfg(not(target_os = "linux"))]
+pub(crate) use crate::alacritty::TerminalBackend;
+#[cfg(not(target_os = "linux"))]
+use crate::alacritty::{HyperlinkMatch, RegexSearches};
+#[cfg(target_os = "linux")]
+pub use crate::ghostty::{RenderableCells, Search};
+#[cfg(target_os = "linux")]
+pub(crate) use crate::ghostty::TerminalBackend;
+#[cfg(target_os = "linux")]
+use crate::ghostty::{HyperlinkMatch, RegexSearches};
 use crate::mappings::colors::to_rgb;
 use crate::mappings::{focus::focus_report, keys::encode_keystroke, paste::encode_paste};
 use crate::pty::{PtyHandle, PtyOutput};
@@ -113,11 +128,6 @@ enum ViMotion {
     Bracket,
     ParagraphUp,
     ParagraphDown,
-}
-
-#[derive(Clone, Debug)]
-pub struct Search {
-    search: AlacrittySearch,
 }
 
 #[derive(Clone, Debug)]
@@ -618,10 +628,6 @@ impl BitOr for CellFlags {
     }
 }
 
-pub struct RenderableCells<'a> {
-    cells: AlacrittyGridIterator<'a>,
-}
-
 #[derive(Debug, Clone)]
 pub struct IndexedCell {
     pub point: Point,
@@ -997,9 +1003,15 @@ pub(crate) enum TerminalBackendEvent {
     Title(String),
     ResetTitle,
     ClipboardStore(String),
+    // The next three variants are emitted only by the alacritty backend; on
+    // Linux production builds nothing reads their payloads since the P8 swap
+    // deleted the handler arms. They die at P10 with that backend.
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     ClipboardLoad(ClipboardFormatter),
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     ColorRequest(usize, ColorFormatter),
     PtyWrite(String),
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     TextAreaSizeRequest(TextAreaSizeFormatter),
     CursorBlinkingChange,
     Wakeup,
@@ -1261,6 +1273,9 @@ impl TerminalBuilder {
             subprocess: None,
             completion_tx: None,
             backend,
+            // Display-only construction has no `cx`; the first `sync` pushes
+            // the theme.
+            last_theme: None,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1334,6 +1349,13 @@ impl TerminalBuilder {
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
+        // Headless hosts and unit tests may run without a theme; the backend
+        // then keeps its built-in defaults for color-query answers, matching
+        // the alacritty-era event path, which had no theme to read either.
+        let theme = cx
+            .try_global::<GlobalTheme>()
+            .is_some()
+            .then(|| cx.theme().clone());
         // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
         // allocation / acquiring a controlling terminal fails with `ENOTTY`.
         // When set, run the command as a plain subprocess instead.
@@ -1427,13 +1449,16 @@ impl TerminalBuilder {
             let (events_tx, events_rx) = unbounded();
             let (output_tx, output_rx) = pty::output_channel();
             //Set up the terminal...
-            let backend = TerminalBackend::new(
+            let mut backend = TerminalBackend::new(
                 scrolling_history,
                 cursor_shape,
                 TerminalBounds::default(),
                 events_tx,
                 alternate_scroll,
             );
+            if let Some(theme) = &theme {
+                push_theme_into_backend(&mut backend, theme);
+            }
 
             // When `no_pty` is set (headless hosts), run the task as a plain
             // subprocess and pump its piped output into the same emulator the
@@ -1516,6 +1541,7 @@ impl TerminalBuilder {
                 subprocess,
                 completion_tx,
                 backend,
+                last_theme: theme,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1690,6 +1716,9 @@ pub struct Terminal {
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     backend: TerminalBackend,
+    /// The last theme pushed into the backend as its embedder default colors
+    /// (SPEC.md §4.2); compared by pointer in `sync` to re-push on change.
+    last_theme: Option<Arc<Theme>>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1813,6 +1842,7 @@ impl Terminal {
             TerminalBackendEvent::ClipboardStore(data) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(data))
             }
+            #[cfg(not(target_os = "linux"))]
             TerminalBackendEvent::ClipboardLoad(format) => {
                 self.write_to_pty(
                     match &cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -1824,6 +1854,7 @@ impl Terminal {
                 )
             }
             TerminalBackendEvent::PtyWrite(out) => self.write_to_pty(out.into_bytes()),
+            #[cfg(not(target_os = "linux"))]
             TerminalBackendEvent::TextAreaSizeRequest(format) => {
                 self.write_to_pty(format(self.last_content.terminal_bounds).into_bytes())
             }
@@ -1846,6 +1877,7 @@ impl Terminal {
                     info.emit_title_changed_if_changed(cx);
                 }
             }
+            #[cfg(not(target_os = "linux"))]
             TerminalBackendEvent::ColorRequest(index, format) => {
                 // It's important that the color request is processed here to retain relative order
                 // with other PTY writes. Otherwise applications might witness out-of-order
@@ -1864,6 +1896,18 @@ impl Terminal {
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
+            }
+            // Only the alacritty backend constructs these variants, and it is
+            // never live on Linux since the P8 swap: ghostty answers OSC
+            // 4/10/11/12 color queries, XTWINOPS size reports, and OSC 52
+            // internally (SPEC.md §4.2, §4.5). The variants die at P10 with
+            // the alacritty backend that emits them.
+            #[cfg(target_os = "linux")]
+            event @ (TerminalBackendEvent::ClipboardLoad(_)
+            | TerminalBackendEvent::ColorRequest(..)
+            | TerminalBackendEvent::TextAreaSizeRequest(_)) => {
+                log::error!("unexpected alacritty-only backend event on Linux: {event:?}");
+                debug_assert!(false, "alacritty-only backend event on Linux");
             }
         }
     }
@@ -2485,7 +2529,12 @@ impl Terminal {
         }
 
         // Keep default terminal behavior
-        if let Some(bytes) = encode_keystroke(keystroke, self.last_content.mode, option_as_meta) {
+        if let Some(bytes) = encode_keystroke(
+            keystroke,
+            self.last_content.mode,
+            &self.backend,
+            option_as_meta,
+        ) {
             self.input(bytes);
             true
         } else {
@@ -2518,6 +2567,19 @@ impl Terminal {
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.try_global::<GlobalTheme>().is_some() {
+            let theme = cx.theme();
+            if self
+                .last_theme
+                .as_ref()
+                .is_none_or(|last| !Arc::ptr_eq(last, theme))
+            {
+                let theme = theme.clone();
+                push_theme_into_backend(&mut self.backend, &theme);
+                self.last_theme = Some(theme);
+            }
+        }
+
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
             self.process_terminal_event(&e, window, cx)
@@ -2526,7 +2588,15 @@ impl Terminal {
         self.last_content = self.backend.make_content(&self.last_content);
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
+        self.backend.with_renderable_cells(f)
+    }
+
+    // The ghostty backend hands out owned cells, so its `RenderableCells`
+    // carries no lifetime (callers' closures are inferred either way).
+    #[cfg(target_os = "linux")]
+    pub fn with_renderable_cells<R>(&self, f: impl FnOnce(RenderableCells) -> R) -> R {
         self.backend.with_renderable_cells(f)
     }
 
@@ -2593,6 +2663,7 @@ impl Terminal {
                         e.pressed_button,
                         e.modifiers,
                         self.last_content.mode,
+                        &self.backend,
                     );
 
                     if let Some(bytes) = bytes {
@@ -2740,8 +2811,14 @@ impl Terminal {
         }
 
         if self.mouse_mode(e.modifiers.shift) {
-            let bytes =
-                mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode);
+            let bytes = mouse_button_report(
+                point,
+                e.button,
+                e.modifiers,
+                true,
+                self.last_content.mode,
+                &self.backend,
+            );
 
             if let Some(bytes) = bytes {
                 self.write_to_pty(bytes);
@@ -2828,8 +2905,14 @@ impl Terminal {
                 self.last_content.display_offset,
             );
 
-            let bytes =
-                mouse_button_report(point, e.button, e.modifiers, false, self.last_content.mode);
+            let bytes = mouse_button_report(
+                point,
+                e.button,
+                e.modifiers,
+                false,
+                self.last_content.mode,
+                &self.backend,
+            );
 
             if let Some(bytes) = bytes {
                 self.write_to_pty(bytes);
@@ -2877,8 +2960,13 @@ impl Terminal {
                     self.last_content.display_offset,
                 );
 
-                if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
-                {
+                if let Some(scrolls) = scroll_report(
+                    point,
+                    scroll_lines,
+                    e,
+                    self.last_content.mode,
+                    &self.backend,
+                ) {
                     for scroll in scrolls {
                         self.write_to_pty(scroll);
                     }
@@ -2932,9 +3020,27 @@ impl Terminal {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub fn find_matches(&self, searcher: Search, cx: &Context<Self>) -> Task<Vec<Range>> {
         let searcher = self.backend.prepare_search(searcher);
         cx.background_spawn(async move { searcher.run() })
+    }
+
+    /// The ghostty search sandwich (SPEC.md §4.4): bulk-extract on the
+    /// foreground, regex on the background, then re-enter the entity to map
+    /// byte matches back onto the live grid.
+    #[cfg(target_os = "linux")]
+    pub fn find_matches(&self, searcher: Search, cx: &Context<Self>) -> Task<Vec<Range>> {
+        let prepared = self.backend.prepare_search(searcher);
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move { prepared.find_matches() })
+                .await;
+            // A dropped terminal has nothing to highlight; empty matches are
+            // the correct answer, not an error.
+            this.update(cx, |this, _| this.backend.search_matches(found))
+                .unwrap_or_default()
+        })
     }
 
     pub fn working_directory(&self) -> Option<PathBuf> {
@@ -3458,6 +3564,23 @@ fn content_index_for_mouse(pos: GpuiPoint<Pixels>, terminal_bounds: &TerminalBou
     let row = (pos.y / terminal_bounds.line_height()).round() as usize;
     let clamped_row = min(row, terminal_bounds.num_lines().saturating_sub(1));
     clamped_row * terminal_bounds.num_columns() + clamped_col
+}
+
+/// Push the theme's colors into the backend as its embedder defaults, at
+/// creation and on every theme change (SPEC.md §4.2). The ghostty backend
+/// stores them (preserving OSC overrides) to answer OSC 4/10/11/12 and CSI
+/// ?996n queries internally; the alacritty backend no-ops and keeps
+/// answering through the `ColorRequest` event path.
+fn push_theme_into_backend(backend: &mut TerminalBackend, theme: &Theme) {
+    let palette: [Rgb; 256] =
+        std::array::from_fn(|index| to_rgb(get_color_at_index(index, theme)));
+    backend.push_theme_colors(
+        to_rgb(get_color_at_index(256, theme)),
+        to_rgb(get_color_at_index(257, theme)),
+        to_rgb(get_color_at_index(258, theme)),
+        &palette,
+    );
+    backend.set_color_scheme(theme.appearance() == Appearance::Dark);
 }
 
 /// Converts an 8 bit ANSI color to its GPUI equivalent.
@@ -4811,6 +4934,9 @@ mod tests {
         let terminal = init_ctrl_click_hyperlink_test(cx, b"Visit https://zed.dev/ for more\r\n");
 
         terminal.update(cx, |terminal, cx| {
+            // Encode-time options come off the live terminal (SPEC.md §4.3),
+            // so the simulated snapshot mode must be driven into it too.
+            terminal.backend.write(b"\x1b[?1000h");
             terminal.last_content.mode = Modes::MOUSE_MODE;
             terminal.take_pty_write_log();
 
@@ -4839,6 +4965,9 @@ mod tests {
         let terminal = init_ctrl_click_hyperlink_test(cx, b"Visit https://zed.dev/ for more\r\n");
 
         terminal.update(cx, |terminal, cx| {
+            // Encode-time options come off the live terminal (SPEC.md §4.3),
+            // so the simulated snapshot mode must be driven into it too.
+            terminal.backend.write(b"\x1b[?1000h");
             terminal.last_content.mode = Modes::MOUSE_MODE;
             terminal.take_pty_write_log();
 
@@ -4877,6 +5006,9 @@ mod tests {
         });
 
         terminal.update(cx, |terminal, cx| {
+            // Encode-time options come off the live terminal (SPEC.md §4.3),
+            // so the simulated snapshot mode must be driven into it too.
+            terminal.backend.write(b"\x1b[?1000h");
             terminal.last_content.mode = Modes::MOUSE_MODE;
 
             let click_position = point(px(80.0), px(10.0));

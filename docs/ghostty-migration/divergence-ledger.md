@@ -743,3 +743,63 @@ events compare through the `terminal.rs` glue state (`Title("")` and
   (SPEC.md §7). Each confirmed real divergence gets promoted into the
   synthetic corpus and its own entry as it is triaged during the P8–P10
   window; the P10 gate requires zero unadjudicated fuzz findings.
+
+## P8-001 — Encoder options honored live from terminal state
+
+- **Phase / change**: P8 (the swap, ticket #51). The temporary
+  Zed-`Modes`→encoder-options shim died with the swap; the key and mouse
+  encoders now read their options off the live foreground-owned terminal via
+  `set_options_from_terminal` at encode time (SPEC.md §4.3, §6 P8 row).
+- **Triggering input**: any application toggling terminal state the shim
+  could not see: the kitty keyboard progressive-enhancement query, DEC 1036
+  (alt-sends-escape), or modifyOtherKeys.
+- **Old behavior**: kitty flags structurally `DISABLED`, alt-esc prefix
+  unconditionally on, modifyOtherKeys unconditionally off — the alacritty
+  core neither tracked nor answered these, so the shim pinned them.
+- **New behavior**: ghostty answers the kitty query internally and the
+  encoder honors the negotiated flags (the seam's `legacy_fill` byte fills —
+  F13–F20, ctrl-punctuation, ctrl-i/ctrl-m — are skipped while kitty flags
+  are active, since distinguishing those keys is the protocol's purpose);
+  DEC 1036 and modifyOtherKeys follow live terminal state.
+- **Adjudication**: **accepted**. Exact-freshness encode-time sync is the
+  locked design (SPEC.md §4.3); kitty keyboard arriving via ghostty's
+  encoder is an accepted incidental capability gain (SPEC.md §1). With no
+  application-driven state changes, output is byte-identical: the ported
+  `keys.rs`/mouse contract suites pass with expectations untouched, their
+  harness re-plumbed to drive a live terminal into the `Modes` states via
+  the VT stream (`mappings::test_support::backend_with_modes`).
+
+## P8-002 — SGR-Pixels reports carry cell-granular coordinates
+
+- **Phase / change**: P8, as above. With mouse-encoder options read live,
+  SGR-Pixels (DEC 1016) becomes reachable — the alacritty core never
+  tracked it.
+- **Triggering input**: an application enabling `CSI ?1016h` and observing
+  mouse reports.
+- **Old behavior**: mode 1016 ignored; reports stayed SGR cell-based.
+- **New behavior**: reports use the SGR-Pixels wire format, but Zed's
+  policy layer owns the grid math and feeds the encoder an identity 1×1
+  cell map, so the "pixel" coordinates are cell numbers.
+- **Adjudication**: **accepted**. Strictly more protocol-conformant than
+  ignoring the mode; applications get valid SGR-Pixels framing at cell
+  resolution. Revisit only if a real application needs sub-cell precision.
+
+## P8-003 — Theme-change color answers refresh on the render sync
+
+- **Phase / change**: P8, as above. Theme colors are pushed into ghostty as
+  embedder defaults at terminal creation and re-pushed from `Terminal::sync`
+  when the active theme changes (pointer-compared per frame); ghostty then
+  answers OSC 4/10/11/12 internally (SPEC.md §4.2).
+- **Triggering input**: an application querying e.g. `OSC 11 ; ? ST` in the
+  window between a theme change and the terminal's next rendered frame.
+- **Old behavior**: the alacritty `ColorRequest` event path read the live
+  theme at request-processing time — always fresh.
+- **New behavior**: the answer reflects the previous theme until the next
+  `sync` pushes the new palette (at most one frame in a visible terminal;
+  a never-rendered terminal answers from creation-time colors).
+- **Adjudication**: **accepted**. The staleness window is one render frame
+  and self-heals; ordering of answers within the PTY byte stream is
+  strictly better than the event path (SPEC.md §3 D3). Display-only
+  terminals without a theme at construction (headless hosts, unit tests)
+  keep ghostty's built-in defaults — parity with the alacritty-era event
+  path, which had no theme global to read in those contexts either.

@@ -46,22 +46,28 @@ impl TerminalModifiers {
 
 /// Encode a keystroke into the bytes to write to the PTY.
 ///
-/// On Linux the escape bytes come from ghostty's `key::Encoder` (SPEC.md
-/// §4.3); macOS and Windows keep the alacritty-era `to_esc_str` path until
-/// their platform gates open (SPEC.md §5, §8).
+/// On Linux the escape bytes come from ghostty's `key::Encoder`, its options
+/// read off the live foreground-owned terminal at encode time (SPEC.md §4.3);
+/// macOS and Windows keep the alacritty-era `to_esc_str` path over the
+/// snapshot `Modes` until their platform gates open (SPEC.md §5, §8).
+#[cfg(target_os = "linux")]
+pub(crate) fn encode_keystroke(
+    keystroke: &Keystroke,
+    _mode: Modes,
+    backend: &crate::TerminalBackend,
+    option_as_meta: bool,
+) -> Option<Vec<u8>> {
+    ghostty_encode_keystroke(keystroke, backend.vt_terminal(), option_as_meta)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn encode_keystroke(
     keystroke: &Keystroke,
     mode: Modes,
+    _backend: &crate::TerminalBackend,
     option_as_meta: bool,
 ) -> Option<Vec<u8>> {
-    #[cfg(target_os = "linux")]
-    {
-        ghostty_encode_keystroke(keystroke, mode, option_as_meta)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        to_esc_str(keystroke, mode, option_as_meta).map(|esc| esc.into_owned().into_bytes())
-    }
+    to_esc_str(keystroke, mode, option_as_meta).map(|esc| esc.into_owned().into_bytes())
 }
 
 // Alacritty-era path: production on macOS/Windows, contract-test oracle on
@@ -279,7 +285,7 @@ fn modifier_code(keystroke: &Keystroke) -> u32 {
 #[cfg(target_os = "linux")]
 fn ghostty_encode_keystroke(
     keystroke: &Keystroke,
-    mode: Modes,
+    terminal: &ghostty_vt::Terminal<'_, '_>,
     option_as_meta: bool,
 ) -> Option<Vec<u8>> {
     use ghostty_vt::key::{Action, Event, Mods};
@@ -296,7 +302,15 @@ fn ghostty_encode_keystroke(
         return Some(b"\n".to_vec());
     }
 
-    if let Some(bytes) = legacy_fill(keystroke) {
+    // The seam fills preserve alacritty-era bytes only while the application
+    // has not enabled the kitty keyboard protocol; with kitty flags active
+    // the encoder owns these keys natively (that is the protocol's point —
+    // e.g. distinguishing ctrl-i from tab).
+    let kitty_active = terminal
+        .kitty_keyboard_flags()
+        .log_err()
+        .is_some_and(|flags| !flags.is_empty());
+    if !kitty_active && let Some(bytes) = legacy_fill(keystroke) {
         return Some(bytes);
     }
 
@@ -347,7 +361,18 @@ fn ghostty_encode_keystroke(
         }
     };
 
-    let mut encoder = key_encoder(mode, option_as_meta)?;
+    // Encode-time mode sync from the live terminal (SPEC.md §4.3): cursor
+    // key application, keypad application, alt-esc prefix (DEC 1036),
+    // modifyOtherKeys, and kitty flags all come from terminal state.
+    let mut encoder = ghostty_vt::key::Encoder::new().log_err()?;
+    encoder
+        .set_options_from_terminal(terminal)
+        // Not derivable from terminal state; the call above resets it.
+        .set_macos_option_as_alt(if option_as_meta {
+            ghostty_vt::key::OptionAsAlt::True
+        } else {
+            ghostty_vt::key::OptionAsAlt::False
+        });
     let mut event = Event::new().log_err()?;
     event
         .set_action(Action::Press)
@@ -360,36 +385,6 @@ fn ghostty_encode_keystroke(
     let mut bytes = Vec::new();
     encoder.encode_to_vec(&event, &mut bytes).log_err()?;
     if bytes.is_empty() { None } else { Some(bytes) }
-}
-
-/// The temporary Zed-`Modes` → encoder-options shim (SPEC.md §4.3): feeds
-/// ghostty's encoder from the alacritty core's mode snapshot. Replaced by
-/// `set_options_from_terminal` at P8.
-#[cfg(target_os = "linux")]
-fn key_encoder(
-    mode: Modes,
-    option_as_meta: bool,
-) -> Option<ghostty_vt::key::Encoder<'static>> {
-    use ghostty_vt::key::{Encoder, KittyKeyFlags, OptionAsAlt};
-    use util::ResultExt as _;
-
-    let mut encoder = Encoder::new().log_err()?;
-    encoder
-        .set_cursor_key_application(mode.contains(Modes::APP_CURSOR))
-        .set_keypad_key_application(mode.contains(Modes::APP_KEYPAD))
-        // Zed's `Modes` does not track DEC 1036; the alacritty-era path
-        // unconditionally ESC-prefixed alt on Linux.
-        .set_alt_esc_prefix(true)
-        .set_modify_other_keys_state_2(false)
-        // Structurally off until the core swap (P8): the alacritty core never
-        // answers the kitty progressive-enhancement query.
-        .set_kitty_flags(KittyKeyFlags::DISABLED)
-        .set_macos_option_as_alt(if option_as_meta {
-            OptionAsAlt::True
-        } else {
-            OptionAsAlt::False
-        });
-    Some(encoder)
 }
 
 /// Sequences ghostty's legacy encoder deliberately does not produce, supplied
@@ -709,15 +704,18 @@ mod test {
     /// Permanent contract suite on the encoding path (SPEC.md §4.3): same
     /// keystroke + modes ⇒ byte-identical output to the alacritty-era
     /// `to_esc_str`. On Linux this exercises the ghostty `key::Encoder`
-    /// behind the `Modes` shim; elsewhere the legacy path, so the
-    /// expectations hold everywhere by construction.
+    /// reading its options off a live terminal driven into the `Modes` state
+    /// through the VT stream; elsewhere the legacy path, so the expectations
+    /// hold everywhere by construction.
     mod contract {
         use super::*;
+        use crate::mappings::test_support::backend_with_modes;
 
         #[track_caller]
         fn assert_bytes(keystroke: &str, mode: Modes, expected: &[u8]) {
             let keystroke = Keystroke::parse(keystroke).unwrap();
-            let actual = encode_keystroke(&keystroke, mode, false);
+            let (backend, _events_rx) = backend_with_modes(mode);
+            let actual = encode_keystroke(&keystroke, mode, &backend, false);
             assert_eq!(
                 actual.as_deref(),
                 Some(expected),
@@ -730,7 +728,8 @@ mod test {
         #[track_caller]
         fn assert_no_bytes(keystroke: &str, mode: Modes) {
             let keystroke = Keystroke::parse(keystroke).unwrap();
-            let actual = encode_keystroke(&keystroke, mode, false);
+            let (backend, _events_rx) = backend_with_modes(mode);
+            let actual = encode_keystroke(&keystroke, mode, &backend, false);
             assert_eq!(
                 actual, None,
                 "keystroke {keystroke} in mode {mode:?} should fall through to the text path",
@@ -888,7 +887,8 @@ mod test {
                 key: "🖖🏻".to_string(),
                 key_char: None,
             };
-            assert_eq!(encode_keystroke(&multigrapheme, none, false), None);
+            let (backend, _events_rx) = backend_with_modes(none);
+            assert_eq!(encode_keystroke(&multigrapheme, none, &backend, false), None);
         }
     }
 
@@ -898,11 +898,13 @@ mod test {
     #[cfg(target_os = "linux")]
     mod adjudicated_divergences {
         use super::*;
+        use crate::mappings::test_support::backend_with_modes;
 
         #[track_caller]
         fn assert_bytes(keystroke: &str, expected: &[u8]) {
             let keystroke = Keystroke::parse(keystroke).unwrap();
-            let actual = encode_keystroke(&keystroke, Modes::NONE, false);
+            let (backend, _events_rx) = backend_with_modes(Modes::NONE);
+            let actual = encode_keystroke(&keystroke, Modes::NONE, &backend, false);
             assert_eq!(
                 actual.as_deref(),
                 Some(expected),
@@ -959,12 +961,13 @@ mod test {
         // caret code, matching ctrl-letter like every other terminal.
         #[test]
         fn ctrl_shift_letters() {
+            let (backend, _events_rx) = backend_with_modes(Modes::NONE);
             for (index, letter) in ('a'..='z').enumerate() {
                 let byte = [index as u8 + 1];
                 let keystroke = format!("ctrl-shift-{letter}");
                 let keystroke = Keystroke::parse(&keystroke).unwrap();
                 assert_eq!(
-                    encode_keystroke(&keystroke, Modes::NONE, false).as_deref(),
+                    encode_keystroke(&keystroke, Modes::NONE, &backend, false).as_deref(),
                     Some(byte.as_slice()),
                     "ctrl-shift-{letter}",
                 );

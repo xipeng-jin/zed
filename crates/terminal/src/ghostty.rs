@@ -1,14 +1,14 @@
-//! The ghostty-backed terminal core (SPEC.md §4, §6 P5), built *dark*:
-//! compiled and tested on Linux, unused by production until the P8 swap.
-//! It mirrors `alacritty::TerminalBackend`'s inherent method surface so the
-//! swap only re-points one import and the construction call. The P6 gap
-//! fills (grid search, hover pipeline, vi mode) extend this surface.
+//! The ghostty-backed terminal core (SPEC.md §4): the production Linux
+//! backend since the P8 swap re-pointed `terminal.rs`'s import here.
+//! It mirrors `alacritty::TerminalBackend`'s inherent method surface, with
+//! the P6 gap fills (grid search, hover pipeline, vi mode) extending it.
 
 mod grid_search;
 mod hyperlinks;
 mod vi_mode;
 
 pub(super) use hyperlinks::{HyperlinkMatch, RegexSearches};
+pub use grid_search::SearchQuery as Search;
 
 use std::{
     cell::{Cell as StdCell, RefCell},
@@ -27,7 +27,7 @@ use ghostty_vt::{
     selection::{
         FormatOptions, SelectLineOptions, SelectWordOptions, Selection as GhosttySelection,
     },
-    style::{Palette, PaletteIndex, RgbColor, StyleColor, Underline},
+    style::{Id as StyleId, Palette, PaletteIndex, RgbColor, StyleColor, Underline},
     terminal::{
         ColorScheme, CompressionMode, CompressionResult, ConformanceLevel,
         CursorStyle as GhosttyCursorStyle, DeviceAttributes, DeviceType, Mode,
@@ -102,9 +102,9 @@ struct SeamSelection {
     end_side: SelectionSide,
 }
 
-/// Iterator over owned viewport cells; the ghostty analogue of the alacritty
-/// grid iterator behind `crate::RenderableCells`, which re-points here at P8.
-pub(super) struct RenderableCells(std::vec::IntoIter<IndexedCell>);
+/// Iterator over owned viewport cells; `crate::RenderableCells` on Linux
+/// (unlike the alacritty analogue it owns its cells, so no lifetime).
+pub struct RenderableCells(std::vec::IntoIter<IndexedCell>);
 
 impl Iterator for RenderableCells {
     type Item = IndexedCell;
@@ -118,14 +118,22 @@ impl Iterator for RenderableCells {
     }
 }
 
+/// The render-pipeline FFI objects. They sit behind a `RefCell` on the
+/// backend because their `update` calls need `&mut` while the public
+/// snapshot-read surface (`with_renderable_cells`) is reached through
+/// `&Terminal` downstream.
+struct RenderPipeline {
+    render_state: RenderState<'static>,
+    row_iterator: RowIterator<'static>,
+    cell_iterator: CellIterator<'static>,
+}
+
 /// The ghostty-backed terminal core: the `!Send` emulator, its render state,
 /// and the callback plumbing, owned by the foreground thread with no locks
 /// (SPEC.md §3 D2). Mirrors `alacritty::TerminalBackend`'s inherent surface.
 pub(super) struct TerminalBackend {
     terminal: GhosttyTerminal<'static, 'static>,
-    render_state: RenderState<'static>,
-    row_iterator: RowIterator<'static>,
-    cell_iterator: CellIterator<'static>,
+    render: RefCell<RenderPipeline>,
     /// Callbacks fire synchronously inside `vt_write`; they queue here and
     /// drain FIFO right after each write, preserving PTY-response ordering
     /// (SPEC.md §3 D3).
@@ -231,10 +239,14 @@ impl TerminalBackend {
 
         Self {
             terminal,
-            render_state: RenderState::new().expect("failed to allocate the ghostty render state"),
-            row_iterator: RowIterator::new().expect("failed to allocate the ghostty row iterator"),
-            cell_iterator: CellIterator::new()
-                .expect("failed to allocate the ghostty cell iterator"),
+            render: RefCell::new(RenderPipeline {
+                render_state: RenderState::new()
+                    .expect("failed to allocate the ghostty render state"),
+                row_iterator: RowIterator::new()
+                    .expect("failed to allocate the ghostty row iterator"),
+                cell_iterator: CellIterator::new()
+                    .expect("failed to allocate the ghostty cell iterator"),
+            }),
             events,
             events_tx,
             bounds: shared_bounds,
@@ -251,6 +263,12 @@ impl TerminalBackend {
     pub(super) fn write(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
         self.drain_events();
+    }
+
+    /// The live foreground-owned terminal, for encode-time mode sync via the
+    /// encoders' `set_options_from_terminal` (SPEC.md §4.3).
+    pub(crate) fn vt_terminal(&self) -> &GhosttyTerminal<'static, 'static> {
+        &self.terminal
     }
 
     pub(super) fn set_default_cursor_style(&mut self, cursor_shape: SettingsCursorShape) {
@@ -299,19 +317,9 @@ impl TerminalBackend {
         }
     }
 
-    pub(super) fn with_renderable_cells<R>(
-        &mut self,
-        f: impl FnOnce(RenderableCells) -> R,
-    ) -> R {
+    pub(super) fn with_renderable_cells<R>(&self, f: impl FnOnce(RenderableCells) -> R) -> R {
         let cells = match self.collect_viewport_cells() {
-            Ok(collected) => {
-                let display_offset = self.display_offset() as i32;
-                collected
-                    .cells
-                    .into_iter()
-                    .map(|cell| indexed_cell(cell, display_offset))
-                    .collect()
-            }
+            Ok(collected) => collected.cells,
             Err(error) => {
                 log::error!("ghostty backend failed to collect renderable cells: {error}");
                 Vec::new()
@@ -455,7 +463,9 @@ impl TerminalBackend {
     }
 
     pub(super) fn cursor_blinking(&mut self) -> bool {
-        self.render_state
+        self.render
+            .borrow_mut()
+            .render_state
             .update(&self.terminal)
             .and_then(|snapshot| snapshot.cursor_blinking())
             .log_err()
@@ -464,7 +474,10 @@ impl TerminalBackend {
 
     /// The effective (OSC override or embedder default) color at an index in
     /// alacritty's color-table layout: 0–255 palette, 256 foreground,
-    /// 257 background, 258 cursor.
+    /// 257 background, 258 cursor. Production answers color queries inside
+    /// ghostty since the P8 swap; this read-back remains as the differential
+    /// harness's probe of that internal state.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn color(&self, index: usize) -> Option<Rgb> {
         let color = match index {
             0..=255 => Some(self.terminal.color_palette().log_err()?.0[index]),
@@ -869,11 +882,7 @@ impl TerminalBackend {
 
         let display_offset = self.display_offset();
         let scrollback_lines = self.scrollback_lines();
-        let cells: Vec<IndexedCell> = collected
-            .cells
-            .into_iter()
-            .map(|cell| indexed_cell(cell, display_offset as i32))
-            .collect();
+        let cells = collected.cells;
 
         let mode = self.modes();
 
@@ -943,8 +952,14 @@ impl TerminalBackend {
         })
     }
 
-    fn collect_viewport_cells(&mut self) -> Result<CollectedCells, GhosttyError> {
-        let snapshot = self.render_state.update(&self.terminal)?;
+    fn collect_viewport_cells(&self) -> Result<CollectedCells, GhosttyError> {
+        let mut render = self.render.borrow_mut();
+        let RenderPipeline {
+            render_state,
+            row_iterator,
+            cell_iterator,
+        } = &mut *render;
+        let snapshot = render_state.update(&self.terminal)?;
         if snapshot.dirty()? == Dirty::Full {
             self.display_offset.set(None);
         }
@@ -963,24 +978,47 @@ impl TerminalBackend {
             CursorShape::Hidden
         };
 
+        // Read after the dirty handling above so a dirty-full frame refreshes
+        // the cached offset before it labels every cell's grid line.
+        let display_offset = self.display_offset() as i32;
+
+        // The loop below is the per-frame hot path: it touches every viewport
+        // cell, and each *iterator*-level read (`select`, `raw_cell`,
+        // `style`, `graphemes_*`) is an FFI round-trip into the render state,
+        // while reads on the fetched raw-cell *value* are cheap pure calls.
+        // So the raw cell is fetched once and interrogated, the style is
+        // fetched only when the cell is styled with a style id that differs
+        // from the previous cell's (styles come in runs), and the grapheme
+        // buffers are touched only for actual grapheme-cluster cells.
         let mut cells = Vec::with_capacity(columns * screen_lines);
-        let mut row_iteration = self.row_iterator.update(&snapshot)?;
-        let mut viewport_line = 0;
+        let mut row_iteration = row_iterator.update(&snapshot)?;
+        let mut viewport_line = 0i32;
         while let Some(row) = row_iteration.next() {
-            let mut cell_iteration = self.cell_iterator.update(row)?;
+            let mut cell_iteration = cell_iterator.update(row)?;
+            // Style ids are page-local and a viewport can span a page
+            // boundary, so the run cache resets per row (rows never span
+            // pages).
+            let mut cached_style: Option<ConvertedStyle> = None;
             for column in 0..columns {
                 cell_iteration.select(column as u16)?;
 
                 let raw_cell = cell_iteration.raw_cell()?;
-                let style = cell_iteration.style()?;
+                let content_tag = raw_cell.content_tag()?;
 
-                let graphemes_len = cell_iteration.graphemes_len()?;
-                let mut graphemes = vec!['\0'; graphemes_len];
-                if graphemes_len > 0 {
-                    cell_iteration.graphemes_buf(&mut graphemes)?;
-                }
-                let character = graphemes.first().copied().unwrap_or(' ');
-                let zerowidth = graphemes.get(1..).unwrap_or_default().to_vec();
+                let (character, zerowidth) = if content_tag == CellContentTag::CodepointGrapheme {
+                    let graphemes_len = cell_iteration.graphemes_len()?;
+                    let mut graphemes = vec!['\0'; graphemes_len];
+                    if graphemes_len > 0 {
+                        cell_iteration.graphemes_buf(&mut graphemes)?;
+                    }
+                    (
+                        graphemes.first().copied().unwrap_or(' '),
+                        graphemes.get(1..).unwrap_or_default().to_vec(),
+                    )
+                } else {
+                    let codepoint = raw_cell.codepoint()?;
+                    (char::from_u32(codepoint).unwrap_or(' '), Vec::new())
+                };
 
                 let hyperlink = if raw_cell.has_hyperlink()? {
                     hyperlink_at(&self.terminal, column as u16, viewport_line as u32)
@@ -988,7 +1026,31 @@ impl TerminalBackend {
                     None
                 };
 
-                let mut flags = cell_flags_from_style(&style);
+                let (fg, style_bg, mut flags) = if raw_cell.has_styling()? {
+                    let style_id = raw_cell.style_id()?;
+                    match cached_style {
+                        Some(cached) if cached.id == style_id => {
+                            (cached.fg, cached.bg, cached.flags)
+                        }
+                        _ => {
+                            let style = cell_iteration.style()?;
+                            let converted = ConvertedStyle {
+                                id: style_id,
+                                fg: color_from_style(style.fg_color, NamedColor::Foreground),
+                                bg: color_from_style(style.bg_color, NamedColor::Background),
+                                flags: cell_flags_from_style(&style),
+                            };
+                            cached_style = Some(converted);
+                            (converted.fg, converted.bg, converted.flags)
+                        }
+                    }
+                } else {
+                    (
+                        Color::Named(NamedColor::Foreground),
+                        Color::Named(NamedColor::Background),
+                        CellFlags::empty(),
+                    )
+                };
                 if raw_cell.wide()? == CellWide::SpacerTail {
                     flags.insert(CellFlags::WIDE_CHAR_SPACER);
                 }
@@ -997,13 +1059,13 @@ impl TerminalBackend {
                 // cell *content* (bg-color content tags), not as a style
                 // entry — reading the style alone drops the background of
                 // BCE-filled cells (e.g. a tmux status bar's EL fill).
-                let bg = match raw_cell.content_tag()? {
+                let bg = match content_tag {
                     CellContentTag::BgColorPalette => color_from_style(
                         StyleColor::Palette(raw_cell.bg_color_palette()?),
                         NamedColor::Background,
                     ),
                     CellContentTag::BgColorRgb => Color::Spec(zed_rgb(raw_cell.bg_color_rgb()?)),
-                    _ => color_from_style(style.bg_color, NamedColor::Background),
+                    _ => style_bg,
                 };
 
                 let extra = (!zerowidth.is_empty() || hyperlink.is_some()).then(|| {
@@ -1013,12 +1075,13 @@ impl TerminalBackend {
                     })
                 });
 
-                cells.push(ViewportCell {
-                    column,
-                    viewport_line,
+                cells.push(IndexedCell {
+                    // S3 coordinate conversion: the render state iterates the
+                    // viewport; Zed's Content speaks alacritty grid lines.
+                    point: Point::new(viewport_line - display_offset, column),
                     cell: Cell {
                         c: if character == '\0' { ' ' } else { character },
-                        fg: color_from_style(style.fg_color, NamedColor::Foreground),
+                        fg,
                         bg,
                         flags,
                         extra,
@@ -1296,26 +1359,22 @@ impl TerminalBackend {
     }
 }
 
-struct ViewportCell {
-    column: usize,
-    viewport_line: usize,
-    cell: Cell,
-}
-
 struct CollectedCells {
-    cells: Vec<ViewportCell>,
+    /// Already in grid-convention coordinates (S3), converted as collected.
+    cells: Vec<IndexedCell>,
     screen_lines: usize,
     cursor_blinking: bool,
     cursor_shape: CursorShape,
 }
 
-fn indexed_cell(cell: ViewportCell, display_offset: i32) -> IndexedCell {
-    IndexedCell {
-        // S3 coordinate conversion: the render state iterates the viewport;
-        // Zed's Content speaks alacritty grid lines.
-        point: Point::new(cell.viewport_line as i32 - display_offset, cell.column),
-        cell: cell.cell,
-    }
+/// One interned ghostty style converted to seam terms, keyed by its
+/// page-local id for the per-row run cache in `collect_viewport_cells`.
+#[derive(Clone, Copy)]
+struct ConvertedStyle {
+    id: StyleId,
+    fg: Color,
+    bg: Color,
+    flags: CellFlags,
 }
 
 fn hyperlink_at(terminal: &GhosttyTerminal<'_, '_>, x: u16, y: u32) -> Option<Hyperlink> {
