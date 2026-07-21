@@ -33,7 +33,7 @@ jobs:
       - name: checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: run the differential corpus (gating)
-        run: cargo test -p terminal --lib differential::
+        run: "cargo test -p terminal --lib differential::"
       - name: run the differential fuzz lane (non-gating)
         continue-on-error: true
-        run: cargo test -p terminal --lib -- --ignored --nocapture differential::fuzz
+        run: "cargo test -p terminal --lib -- --ignored --nocapture differential::fuzz"
