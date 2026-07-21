@@ -154,7 +154,11 @@ impl Drop for PtyHandle {
                 .name("terminal-pty-closer".to_string())
                 .spawn(move || drop(master))
             {
-                // The closure — and with it the master — was dropped inline.
+                // The closure — and with it the master — was dropped inline,
+                // back on the dropping thread. Accepted: forgetting the master
+                // instead would leak the pseudoconsole and its conhost for the
+                // process lifetime, so a rare blocking close (spawn only fails
+                // under resource exhaustion) is the lesser evil.
                 log::error!("failed to spawn pty closer thread: {error}");
             }
         }
