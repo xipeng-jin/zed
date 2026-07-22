@@ -4,8 +4,9 @@
 # must always move together, in one PR. Bump procedure:
 # docs/ghostty-migration/build-strategy.md, section 7.
 
-commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"
-release = "ghostty-a887df42c5"
+commit = "636ce3a46f30916ca4d55e46e36eb1b5dc8698a8"
+release = "ghostty-636ce3a46f"
+source_repo = "xipeng-jin/ghostty"
 # owner/name of the repo hosting prebuilt releases; upstream handoff = GitHub
 # repo transfer (preserves assets and hashes) + editing this line.
 prebuilt_repo = "xipeng-jin/libghostty-vt-prebuilt"
@@ -21,7 +22,7 @@ headers_sha256 = "4c87c8f9587bbd48f7dd723b76bb3cd730a0b7537e4bc684ed87bf59bdc3d1
 # for the default prebuilt fetch. Stamped from the release's SHA256SUMS after
 # `gh attestation verify` (bump procedure: build-strategy.md §7).
 [sha256]
-x86_64-unknown-linux-gnu = "47896301eb32f113169385815b469a7534cc90b32ac6136aaa744e0d4fd38530"
-aarch64-unknown-linux-gnu = "fbe83b84646c8100e5e1580f4daf20a6eb3a85ece838c137bc7c0d55c0082412"
-x86_64-unknown-linux-musl = "2f5c46ced9f497421f925a446eec7196d286177f1f6b180ff5314a864ae4333b"
-aarch64-unknown-linux-musl = "053a1be4760e3bbd8be865b72f07fb8d51a5b636123b991ef635961b927cb3b4"
+x86_64-unknown-linux-gnu = "a45f2cdc3bfa1562d0b056f9803b0bf07a89c9071e9caf286795094f9a8c51b9"
+aarch64-unknown-linux-gnu = "617755cd144532ab279d6e764b25773fcb49d48faa424142b7f62fec9886974a"
+x86_64-unknown-linux-musl = "46c236f81d74ad44cfe2d579f82ad5b8cae1304dceee1a83f35cea0abae960c5"
+aarch64-unknown-linux-musl = "12de72930cf03cf1ee1abc1f91a3b17b505917f1c8e7efa8a82a14fc8511667c"

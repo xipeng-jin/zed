@@ -26,7 +26,7 @@ Re-record on the same machine before comparing the ghostty backend at P8;
 the macOS gate (§8.1) re-records the whole suite on macOS hardware,
 including the flood scenario targeting the ~1 KiB master-read cap.
 
-## P8 swap comparison (2026-07-21)
+## Initial P8 swap comparison (2026-07-21)
 
 Same machine, same release build, alacritty re-recorded in the same run
 (`script/terminal-perf-baseline` + `script/terminal-flood-bench`, which now
@@ -40,9 +40,9 @@ run both backends):
 | `sustained_scroll` | 33 147 ops/s | 10 119 ops/s | −69.5% | **fails** |
 | `sustained_flood` | 84.6 MiB/s; turns mean 17.3 µs, max 1.20 ms; echo mean 82 µs | 88.6 MiB/s; turns mean 6.2 µs, max **0.36 ms**; echo mean 97 µs | +4.7% throughput, 3.3× lower stall bound | passes |
 
-Analysis of the two failures (both pending adjudication on ticket #51 —
-they exceed the §7 gate and need an owner-signed amendment or further
-work; neither is a seam regression the swap PR can absorb):
+At this point, the two failures exceeded the §7 gate and were offered for
+adjudication on ticket #51. The owner rejected adjudication and required the
+engineering work recorded in the gate-closure section below:
 
 - `colored_dump` is **write-bound in the core**: feeding the bytes without
   any snapshots measures 87.3 MiB/s, so ~85% of the scenario cost is
@@ -67,3 +67,26 @@ FFI reads dropped from ~5 to 2 (style fetched once per same-style run,
 grapheme buffers only for grapheme cells, per-cell allocations removed),
 which took `wide_char_cjk` and `alt_screen_churn` from −19.5% and +8.5%
 to +0.6% and +31%.
+
+## P8 gate closure (2026-07-22)
+
+Same machine, official ReleaseFast prebuilt, and both backends measured in
+each release-mode script invocation:
+
+| Scenario | alacritty (same run) | ghostty (P8) | Δ | ≤20%? |
+|---|---|---|---|---|
+| `colored_dump` | 183.0 MiB/s | 232.4 MiB/s | +27.0% | passes |
+| `wide_char_cjk` | 179.7 MiB/s | 200.9 MiB/s | +11.8% | passes |
+| `alt_screen_churn` | 135.6 MiB/s | 185.9 MiB/s | +37.1% | passes |
+| `sustained_scroll` | 34 016 ops/s | 140 953 ops/s | +314.4% | passes |
+| `sustained_flood` | 89.3 MiB/s; turns mean 17.626 µs, max 1.071 ms; echo mean 292.829 µs | 89.9 MiB/s; turns mean 6.568 µs, max 0.312 ms; echo mean 196.318 µs | +0.7% throughput, 3.4× lower stall bound | passes |
+
+The scroll result comes from reusing converted viewport rows when a snapshot
+changes only the display offset; writes and resizes invalidate the cache, and
+the cache-miss conversion remains covered by the differential corpus. A targeted
+regression compares warmed-cache scrolls cell-for-cell with an independently
+rebuilt terminal, including a write between scrolls. The colored-output result
+comes from Ghostty fork commit `636ce3a46f30916ca4d55e46e36eb1b5dc8698a8`, which
+raises the standard page's initial style capacity from 128 to 512. Color-dense
+output can introduce two styles per row, so the larger initial allocation avoids
+repeated page growth, splitting, and cloning without changing the C API.

@@ -29,7 +29,7 @@ Rejected: in-tree workflow publishing releases on the Zed repo (namespace pollut
 ## 3. Publishing workflow
 
 - **Trigger:** `workflow_dispatch` only. Inputs: `ghostty_commit` (full 40-char, format-validated) and optional `targets` (defaults to the full day-one matrix). No scheduled or push triggers — pin bumps are deliberate, so publishing is too (build-strategy §7 step 1: publish precedes the pin-bump PR).
-- **Runner:** one x86_64 `ubuntu-latest` job. Zig 0.15.2 via `mlugg/setup-zig`, checkout of `ghostty-org/ghostty` at exactly the input commit.
+- **Runner:** one x86_64 `ubuntu-latest` job. Zig 0.15.2 via `mlugg/setup-zig`, checkout of Zed's `xipeng-jin/ghostty` source fork at exactly the input commit (the same repository recorded as `source_repo` in Zed's pin).
 - **Build recipe: direct zig**, per target — the same invocation `build.rs`'s source path makes, recorded in the release body:
 
   ```

@@ -194,7 +194,7 @@ Scored against: (1) plain `cargo build` for contributors, (2) CI, (3) offline/ni
 
 1. `GHOSTTY_VT_LIB_DIR` set → link `<dir>/libghostty-vt.a` directly. No network, no zig, no git. (nix, distros, air-gapped builds, "I built it myself".)
 2. `GHOSTTY_SOURCE_DIR` set → source build: invoke zig against that checkout (dev loop on ghostty; pin is *not* enforced, a `cargo:warning` notes the checkout is unpinned).
-3. `GHOSTTY_VT_FROM_SOURCE=1` → source build at the pin: git-fetch ghostty at `GHOSTTY_COMMIT` into `OUT_DIR` (blobless clone + stamp, as today), then zig. (Escape hatch when prebuilt is missing for an exotic target; also what the publishing workflow runs.)
+3. `GHOSTTY_VT_FROM_SOURCE=1` → source build at the pin: git-fetch ghostty from the `source_repo` in `ghostty_pin.toml` into `OUT_DIR` (blobless clone + stamp), then zig. (Escape hatch when prebuilt is missing for an exotic target; also what the publishing workflow runs.)
 4. Default → **prebuilt fetch**: download `libghostty-vt-<GHOSTTY_COMMIT[0..10]>-<target-triple>.tar.gz` from `https://github.com/{prebuilt_repo}/releases/download/ghostty-<commit[0..10]>/…` (`prebuilt_repo` read from `ghostty_pin.toml`; scheme decided in [artifact-pipeline.md](artifact-pipeline.md)) into `$OUT_DIR/`, verify sha256 against the in-tree pin manifest, unpack, link.
 
 We do **not** carry libghostty-rs's `pkg-config` feature (a system libghostty of arbitrary API revision contradicts the pin; build.rs itself documents the API as pre-1.0) or `link-dynamic` (static only). Drop both to shrink the matrix. `DOCS_RS` short-circuit is kept.
@@ -253,8 +253,9 @@ Every failure panics the build script (cargo convention) with a message that nam
 
   ```toml
   # Single source of truth for the ghostty native pin.
-  commit = "a887df42c56f6de86c0fe6da9c4eeca37931e083"
-  release = "ghostty-a887df42c5"   # tag in the prebuilt-artifacts repo
+  commit = "636ce3a46f30916ca4d55e46e36eb1b5dc8698a8"
+  release = "ghostty-636ce3a46f"   # tag in the prebuilt-artifacts repo
+  source_repo = "xipeng-jin/ghostty"   # owner/name of the pinned native source fork
   prebuilt_repo = "xipeng-jin/libghostty-vt-prebuilt"   # owner/name; upstream handoff = repo transfer + this line
 
   [sha256]
@@ -264,7 +265,7 @@ Every failure panics the build script (cargo convention) with a message that nam
   aarch64-unknown-linux-musl = "…"
   ```
 
-  No pin anywhere else: the vendored `bindings.rs`, the prebuilt artifacts, and the source-build fallback all key off this file. (libghostty-rs keeps the pin as a `const` in build.rs, line 7; we move it to data so the bump diff is boring and greppable.)
+  No pin anywhere else: the native source repository and commit, the vendored `bindings.rs`, the prebuilt artifacts, and the source-build fallback all key off this file. (libghostty-rs keeps the pin as a `const` in build.rs, line 7; we move it to data so the bump diff is boring and greppable.)
 - **What we pin to:** a raw ghostty commit, not a tag — libghostty has no versioned releases (§3.3) and a pre-1.0 C API, so *only* the exact commit that `bindings.rs` was generated from is known-compatible. Prebuilt artifacts are content-addressed by that commit and sha256-pinned, so a tampered or re-uploaded asset cannot link.
 - **Bump procedure (gist):**
   1. Trigger the artifact workflow at the new ghostty commit; it builds all matrix targets from source (`GHOSTTY_VT_FROM_SOURCE` path at the new commit) and publishes a `ghostty-<commit>` release with a sha256 manifest.

@@ -2201,6 +2201,23 @@ mod perf {
             scroll_scenario!(swap_backend());
         }
 
+        #[test]
+        #[ignore = "release-build profiling target"]
+        fn perf_colored_write_only_ghostty() {
+            let mut backend = swap_backend();
+            let bytes = colored_dump_bytes();
+            let started = std::time::Instant::now();
+            for chunk in bytes.chunks(CHUNK) {
+                backend.write(chunk);
+            }
+            let elapsed = started.elapsed();
+            let mebibytes = bytes.len() as f64 / (1024.0 * 1024.0);
+            println!(
+                "  colored_dump_write_only: {mebibytes:.1} MiB in {elapsed:.2?} → {:.1} MiB/s",
+                mebibytes / elapsed.as_secs_f64()
+            );
+        }
+
         /// The sustained-flood scenario through the ghostty backend: the P8
         /// twin of `pty::tests::sustained_flood_benchmark` (which stays on
         /// alacritty as the recorded-baseline probe), with the same seam —

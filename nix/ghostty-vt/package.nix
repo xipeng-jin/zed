@@ -11,13 +11,13 @@
 }:
 let
   prebuiltRepo = "xipeng-jin/libghostty-vt-prebuilt";
-  commit10 = "a887df42c5";
+  commit10 = "636ce3a46f";
   target = stdenvNoCC.hostPlatform.rust.rustcTarget;
   sha256s = {
-    "x86_64-unknown-linux-gnu" = "47896301eb32f113169385815b469a7534cc90b32ac6136aaa744e0d4fd38530";
-    "aarch64-unknown-linux-gnu" = "fbe83b84646c8100e5e1580f4daf20a6eb3a85ece838c137bc7c0d55c0082412";
-    "x86_64-unknown-linux-musl" = "2f5c46ced9f497421f925a446eec7196d286177f1f6b180ff5314a864ae4333b";
-    "aarch64-unknown-linux-musl" = "053a1be4760e3bbd8be865b72f07fb8d51a5b636123b991ef635961b927cb3b4";
+    "x86_64-unknown-linux-gnu" = "a45f2cdc3bfa1562d0b056f9803b0bf07a89c9071e9caf286795094f9a8c51b9";
+    "aarch64-unknown-linux-gnu" = "617755cd144532ab279d6e764b25773fcb49d48faa424142b7f62fec9886974a";
+    "x86_64-unknown-linux-musl" = "46c236f81d74ad44cfe2d579f82ad5b8cae1304dceee1a83f35cea0abae960c5";
+    "aarch64-unknown-linux-musl" = "12de72930cf03cf1ee1abc1f91a3b17b505917f1c8e7efa8a82a14fc8511667c";
   };
 in
 stdenvNoCC.mkDerivation {

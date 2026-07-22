@@ -64,6 +64,7 @@ follow the cargo profile).
 - `commit` — the exact ghostty commit the vendored `src/bindings.rs` was
   generated from. libghostty's C API is pre-1.0; only this commit is
   known-compatible.
+- `source_repo` — the owner/name of the repository containing that commit.
 - `headers_sha256` — digest of the installed C headers at that commit,
   stamped by the gen-bindings tool and verified by `build.rs` on pinned
   source builds, so a pin bump without regenerated bindings fails the build.

@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PIN_FILE: &str = include_str!("ghostty_pin.toml");
-const GHOSTTY_REPO: &str = "https://github.com/ghostty-org/ghostty.git";
 const DOCS_URL: &str = "docs/ghostty-migration/build-strategy.md";
 const ZIG_DOWNLOAD_URL: &str = "https://ziglang.org/download/#release-0.15.2";
 
 struct Pin {
     commit: String,
     release: String,
+    source_repo: String,
     prebuilt_repo: String,
     headers_sha256: String,
     prebuilt_sha256: BTreeMap<String, String>,
@@ -72,6 +72,7 @@ fn main() {
 fn parse_pin(contents: &str) -> Pin {
     let mut commit = None;
     let mut release = None;
+    let mut source_repo = None;
     let mut prebuilt_repo = None;
     let mut headers_sha256 = None;
     let mut prebuilt_sha256 = BTreeMap::new();
@@ -104,6 +105,7 @@ fn parse_pin(contents: &str) -> Pin {
             match key {
                 "commit" => commit = Some(value),
                 "release" => release = Some(value),
+                "source_repo" => source_repo = Some(value),
                 "prebuilt_repo" => prebuilt_repo = Some(value),
                 "headers_sha256" => headers_sha256 = Some(value),
                 other => {
@@ -123,6 +125,8 @@ fn parse_pin(contents: &str) -> Pin {
     Pin {
         commit,
         release: release.expect("ghostty-vt-sys: ghostty_pin.toml is missing 'release'"),
+        source_repo: source_repo
+            .expect("ghostty-vt-sys: ghostty_pin.toml is missing 'source_repo'"),
         prebuilt_repo: prebuilt_repo
             .expect("ghostty-vt-sys: ghostty_pin.toml is missing 'prebuilt_repo'"),
         headers_sha256: headers_sha256
@@ -315,7 +319,7 @@ fn build_from_source(checkout: SourceCheckout, pin: &Pin, target: &str) {
             );
             dir
         }
-        SourceCheckout::PinnedFetch => fetch_ghostty(&out_dir, &pin.commit),
+        SourceCheckout::PinnedFetch => fetch_ghostty(&out_dir, &pin.source_repo, &pin.commit),
     };
 
     let install_prefix = out_dir.join("ghostty-install");
@@ -528,9 +532,10 @@ fn zig_optimize_mode() -> &'static str {
 
 /// Clone ghostty at the pinned commit into OUT_DIR/ghostty-src, reusing an
 /// existing clone when the stamp matches.
-fn fetch_ghostty(out_dir: &Path, commit: &str) -> PathBuf {
+fn fetch_ghostty(out_dir: &Path, source_repo: &str, commit: &str) -> PathBuf {
     let src_dir = out_dir.join("ghostty-src");
     let stamp = src_dir.join(".ghostty-commit");
+    let source_url = format!("https://github.com/{source_repo}.git");
 
     if stamp.exists()
         && let Ok(existing) = std::fs::read_to_string(&stamp)
@@ -551,7 +556,7 @@ fn fetch_ghostty(out_dir: &Path, commit: &str) -> PathBuf {
     eprintln!("ghostty-vt-sys: fetching ghostty {commit} ...");
     let fetch_failure = |error: &dyn std::fmt::Display| -> ! {
         panic!(
-            "ghostty-vt-sys: failed to fetch ghostty {commit} from {GHOSTTY_REPO}: {error}. \
+            "ghostty-vt-sys: failed to fetch ghostty {commit} from {source_url}: {error}. \
              If offline, use GHOSTTY_SOURCE_DIR with an existing checkout, or set \
              GHOSTTY_VT_LIB_DIR to a directory containing a prebuilt libghostty-vt.a."
         )
@@ -563,7 +568,7 @@ fn fetch_ghostty(out_dir: &Path, commit: &str) -> PathBuf {
         .arg("clone")
         .arg("--filter=blob:none")
         .arg("--no-checkout")
-        .arg(GHOSTTY_REPO)
+        .arg(&source_url)
         .arg(&src_dir)
         .status();
     match clone_status {

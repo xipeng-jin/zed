@@ -22,7 +22,7 @@ use ghostty_vt::{
     RenderState, Terminal as GhosttyTerminal, TerminalOptions,
     error::Error as GhosttyError,
     fmt::Format,
-    render::{CellIterator, CursorVisualStyle, Dirty, RowIterator},
+    render::{CellIterator, CursorVisualStyle, Dirty, RowIteration, RowIterator},
     screen::{CellContentTag, CellWide, Screen, TrackedGridRef},
     selection::{
         FormatOptions, SelectLineOptions, SelectWordOptions, Selection as GhosttySelection,
@@ -128,6 +128,13 @@ struct RenderPipeline {
     cell_iterator: CellIterator<'static>,
 }
 
+struct ViewportCellCache {
+    rows: Vec<Vec<IndexedCell>>,
+    columns: usize,
+    screen_lines: usize,
+    display_offset: usize,
+}
+
 /// The ghostty-backed terminal core: the `!Send` emulator, its render state,
 /// and the callback plumbing, owned by the foreground thread with no locks
 /// (SPEC.md §3 D2). Mirrors `alacritty::TerminalBackend`'s inherent surface.
@@ -147,6 +154,8 @@ pub(super) struct TerminalBackend {
     /// offset-from-bottom is cached and refreshed only on scroll, resize,
     /// clear, or a dirty-full frame (SPEC.md §4.2 S3).
     display_offset: StdCell<Option<usize>>,
+    viewport_cells: RefCell<Option<ViewportCellCache>>,
+    content_dirty: StdCell<bool>,
     selection: Option<SeamSelection>,
     /// Zed-side vi-mode state surfaced as `Modes::VI` (SPEC.md §4.2),
     /// toggled by `toggle_vi_mode`.
@@ -252,6 +261,8 @@ impl TerminalBackend {
             bounds: shared_bounds,
             color_scheme,
             display_offset: StdCell::new(None),
+            viewport_cells: RefCell::new(None),
+            content_dirty: StdCell::new(true),
             selection: None,
             vi_mode: false,
             vi_cursor: Point::new(0, 0),
@@ -261,6 +272,7 @@ impl TerminalBackend {
     }
 
     pub(super) fn write(&mut self, bytes: &[u8]) {
+        self.content_dirty.set(true);
         self.terminal.vt_write(bytes);
         self.drain_events();
     }
@@ -490,6 +502,7 @@ impl TerminalBackend {
     }
 
     pub(super) fn resize(&mut self, bounds: TerminalBounds) {
+        self.content_dirty.set(true);
         self.bounds.set(bounds);
         self.terminal
             .resize(
@@ -982,115 +995,90 @@ impl TerminalBackend {
         // the cached offset before it labels every cell's grid line.
         let display_offset = self.display_offset() as i32;
 
-        // The loop below is the per-frame hot path: it touches every viewport
-        // cell, and each *iterator*-level read (`select`, `raw_cell`,
-        // `style`, `graphemes_*`) is an FFI round-trip into the render state,
-        // while reads on the fetched raw-cell *value* are cheap pure calls.
-        // So the raw cell is fetched once and interrogated, the style is
-        // fetched only when the cell is styled with a style id that differs
-        // from the previous cell's (styles come in runs), and the grapheme
-        // buffers are touched only for actual grapheme-cluster cells.
-        let mut cells = Vec::with_capacity(columns * screen_lines);
-        let mut row_iteration = row_iterator.update(&snapshot)?;
-        let mut viewport_line = 0i32;
-        while let Some(row) = row_iteration.next() {
-            let mut cell_iteration = cell_iterator.update(row)?;
-            // Style ids are page-local and a viewport can span a page
-            // boundary, so the run cache resets per row (rows never span
-            // pages).
-            let mut cached_style: Option<ConvertedStyle> = None;
-            for column in 0..columns {
-                cell_iteration.select(column as u16)?;
-
-                let raw_cell = cell_iteration.raw_cell()?;
-                let content_tag = raw_cell.content_tag()?;
-
-                let (character, zerowidth) = if content_tag == CellContentTag::CodepointGrapheme {
-                    let graphemes_len = cell_iteration.graphemes_len()?;
-                    let mut graphemes = vec!['\0'; graphemes_len];
-                    if graphemes_len > 0 {
-                        cell_iteration.graphemes_buf(&mut graphemes)?;
-                    }
-                    (
-                        graphemes.first().copied().unwrap_or(' '),
-                        graphemes.get(1..).unwrap_or_default().to_vec(),
-                    )
-                } else {
-                    let codepoint = raw_cell.codepoint()?;
-                    (char::from_u32(codepoint).unwrap_or(' '), Vec::new())
-                };
-
-                let hyperlink = if raw_cell.has_hyperlink()? {
-                    hyperlink_at(&self.terminal, column as u16, viewport_line as u32)
-                } else {
-                    None
-                };
-
-                let (fg, style_bg, mut flags) = if raw_cell.has_styling()? {
-                    let style_id = raw_cell.style_id()?;
-                    match cached_style {
-                        Some(cached) if cached.id == style_id => {
-                            (cached.fg, cached.bg, cached.flags)
-                        }
-                        _ => {
-                            let style = cell_iteration.style()?;
-                            let converted = ConvertedStyle {
-                                id: style_id,
-                                fg: color_from_style(style.fg_color, NamedColor::Foreground),
-                                bg: color_from_style(style.bg_color, NamedColor::Background),
-                                flags: cell_flags_from_style(&style),
-                            };
-                            cached_style = Some(converted);
-                            (converted.fg, converted.bg, converted.flags)
-                        }
-                    }
-                } else {
-                    (
-                        Color::Named(NamedColor::Foreground),
-                        Color::Named(NamedColor::Background),
-                        CellFlags::empty(),
-                    )
-                };
-                if raw_cell.wide()? == CellWide::SpacerTail {
-                    flags.insert(CellFlags::WIDE_CHAR_SPACER);
-                }
-
-                // Cells erased under an SGR background carry their color as
-                // cell *content* (bg-color content tags), not as a style
-                // entry — reading the style alone drops the background of
-                // BCE-filled cells (e.g. a tmux status bar's EL fill).
-                let bg = match content_tag {
-                    CellContentTag::BgColorPalette => color_from_style(
-                        StyleColor::Palette(raw_cell.bg_color_palette()?),
-                        NamedColor::Background,
-                    ),
-                    CellContentTag::BgColorRgb => Color::Spec(zed_rgb(raw_cell.bg_color_rgb()?)),
-                    _ => style_bg,
-                };
-
-                let extra = (!zerowidth.is_empty() || hyperlink.is_some()).then(|| {
-                    Arc::new(CellExtra {
-                        zerowidth,
-                        hyperlink,
-                    })
-                });
-
-                cells.push(IndexedCell {
-                    // S3 coordinate conversion: the render state iterates the
-                    // viewport; Zed's Content speaks alacritty grid lines.
-                    point: Point::new(viewport_line - display_offset, column),
-                    cell: Cell {
-                        c: if character == '\0' { ' ' } else { character },
-                        fg,
-                        bg,
-                        flags,
-                        extra,
-                    },
-                });
+        if self.content_dirty.get() {
+            self.viewport_cells.borrow_mut().take();
+            let mut cells = Vec::with_capacity(columns * screen_lines);
+            let mut row_iteration = row_iterator.update(&snapshot)?;
+            let mut viewport_line = 0usize;
+            while let Some(row) = row_iteration.next() {
+                self.collect_viewport_row(
+                    cell_iterator,
+                    row,
+                    columns,
+                    viewport_line,
+                    display_offset,
+                    &mut cells,
+                )?;
+                row.set_dirty(false)?;
+                viewport_line += 1;
             }
+            self.content_dirty.set(false);
+            return Ok(CollectedCells {
+                cells,
+                screen_lines,
+                cursor_blinking,
+                cursor_shape,
+            });
+        }
+
+        // Converting a cache-miss row crosses FFI for each iterator-level read,
+        // so reuse rows whose stable grid-line range overlaps the last viewport.
+        let previous_cache = self.viewport_cells.borrow_mut().take();
+        let mut reusable_viewport_rows = 0..0;
+        let mut reusable_rows = VecDeque::new();
+        if let Some(mut previous_cache) = previous_cache
+            && previous_cache.columns == columns
+            && previous_cache.screen_lines == screen_lines
+            && previous_cache.rows.len() == screen_lines
+        {
+            let previous_top = -(previous_cache.display_offset as i64);
+            let current_top = -(display_offset as i64);
+            let overlap_top = previous_top.max(current_top);
+            let overlap_bottom =
+                (previous_top + screen_lines as i64).min(current_top + screen_lines as i64);
+            if overlap_top < overlap_bottom {
+                reusable_viewport_rows = (overlap_top - current_top) as usize
+                    ..(overlap_bottom - current_top) as usize;
+                let previous_start = (overlap_top - previous_top) as usize;
+                let previous_end = (overlap_bottom - previous_top) as usize;
+                reusable_rows.extend(previous_cache.rows.drain(previous_start..previous_end));
+            }
+        }
+
+        let mut rows = Vec::with_capacity(screen_lines);
+        let mut row_iteration = row_iterator.update(&snapshot)?;
+        let mut viewport_line = 0usize;
+        while let Some(row) = row_iteration.next() {
+            let reusable_row = reusable_viewport_rows
+                .contains(&viewport_line)
+                .then(|| reusable_rows.pop_front())
+                .flatten();
+            let row_cells = if let Some(reusable_row) = reusable_row {
+                reusable_row
+            } else {
+                let mut row_cells = Vec::with_capacity(columns);
+                self.collect_viewport_row(
+                    cell_iterator,
+                    row,
+                    columns,
+                    viewport_line,
+                    display_offset,
+                    &mut row_cells,
+                )?;
+                row_cells
+            };
             row.set_dirty(false)?;
+            rows.push(row_cells);
             viewport_line += 1;
         }
+
+        let cells = rows.iter().flatten().cloned().collect();
+        *self.viewport_cells.borrow_mut() = Some(ViewportCellCache {
+            rows,
+            columns,
+            screen_lines,
+            display_offset: display_offset as usize,
+        });
 
         Ok(CollectedCells {
             cells,
@@ -1098,6 +1086,107 @@ impl TerminalBackend {
             cursor_blinking,
             cursor_shape,
         })
+    }
+
+    fn collect_viewport_row(
+        &self,
+        cell_iterator: &mut CellIterator<'static>,
+        row: &RowIteration<'static, '_>,
+        columns: usize,
+        viewport_line: usize,
+        display_offset: i32,
+        cells: &mut Vec<IndexedCell>,
+    ) -> Result<(), GhosttyError> {
+        let mut cell_iteration = cell_iterator.update(row)?;
+        // Style ids are page-local and a viewport can span a page boundary,
+        // so the run cache resets per row (rows never span pages).
+        let mut cached_style: Option<ConvertedStyle> = None;
+        for column in 0..columns {
+            cell_iteration.select(column as u16)?;
+
+            let raw_cell = cell_iteration.raw_cell()?;
+            let content_tag = raw_cell.content_tag()?;
+
+            let (character, zerowidth) = if content_tag == CellContentTag::CodepointGrapheme {
+                let graphemes_len = cell_iteration.graphemes_len()?;
+                let mut graphemes = vec!['\0'; graphemes_len];
+                if graphemes_len > 0 {
+                    cell_iteration.graphemes_buf(&mut graphemes)?;
+                }
+                (
+                    graphemes.first().copied().unwrap_or(' '),
+                    graphemes.get(1..).unwrap_or_default().to_vec(),
+                )
+            } else {
+                let codepoint = raw_cell.codepoint()?;
+                (char::from_u32(codepoint).unwrap_or(' '), Vec::new())
+            };
+
+            let hyperlink = if raw_cell.has_hyperlink()? {
+                hyperlink_at(&self.terminal, column as u16, viewport_line as u32)
+            } else {
+                None
+            };
+
+            let (fg, style_bg, mut flags) = if raw_cell.has_styling()? {
+                let style_id = raw_cell.style_id()?;
+                match cached_style {
+                    Some(cached) if cached.id == style_id => {
+                        (cached.fg, cached.bg, cached.flags)
+                    }
+                    _ => {
+                        let style = cell_iteration.style()?;
+                        let converted = ConvertedStyle {
+                            id: style_id,
+                            fg: color_from_style(style.fg_color, NamedColor::Foreground),
+                            bg: color_from_style(style.bg_color, NamedColor::Background),
+                            flags: cell_flags_from_style(&style),
+                        };
+                        cached_style = Some(converted);
+                        (converted.fg, converted.bg, converted.flags)
+                    }
+                }
+            } else {
+                (
+                    Color::Named(NamedColor::Foreground),
+                    Color::Named(NamedColor::Background),
+                    CellFlags::empty(),
+                )
+            };
+            if raw_cell.wide()? == CellWide::SpacerTail {
+                flags.insert(CellFlags::WIDE_CHAR_SPACER);
+            }
+
+            // Cells erased under an SGR background carry their color as cell
+            // *content* (bg-color content tags), not as a style entry.
+            let bg = match content_tag {
+                CellContentTag::BgColorPalette => color_from_style(
+                    StyleColor::Palette(raw_cell.bg_color_palette()?),
+                    NamedColor::Background,
+                ),
+                CellContentTag::BgColorRgb => Color::Spec(zed_rgb(raw_cell.bg_color_rgb()?)),
+                _ => style_bg,
+            };
+
+            let extra = (!zerowidth.is_empty() || hyperlink.is_some()).then(|| {
+                Arc::new(CellExtra {
+                    zerowidth,
+                    hyperlink,
+                })
+            });
+
+            cells.push(IndexedCell {
+                point: Point::new(viewport_line as i32 - display_offset, column),
+                cell: Cell {
+                    c: if character == '\0' { ' ' } else { character },
+                    fg,
+                    bg,
+                    flags,
+                    extra,
+                },
+            });
+        }
+        Ok(())
     }
 
     fn send_event(&self, event: TerminalBackendEvent) {
@@ -2017,6 +2106,63 @@ mod tests {
         assert_eq!(backend.display_offset(), 3);
         backend.scroll_to_point(Point::new(4, 0));
         assert_eq!(backend.display_offset(), 0);
+    }
+
+    #[test]
+    fn snapshots_after_scrolling_reflect_writes_and_resizes() {
+        let (mut backend, _events_rx) = test_backend(8, 3, 100);
+        backend.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        let _ = content(&mut backend);
+
+        backend.scroll_display(Scroll::Delta(1));
+        let scrolled = content(&mut backend);
+        assert_eq!(scrolled.display_offset, 1);
+        assert_eq!(cell_at(&scrolled, -1, 0).character(), 't');
+        assert_eq!(cell_at(&scrolled, 0, 0).character(), 'f');
+
+        backend.scroll_display(Scroll::Bottom);
+        let bottom = content(&mut backend);
+        let (mut expected_backend, _events_rx) = test_backend(8, 3, 100);
+        expected_backend.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        let expected_bottom = content(&mut expected_backend);
+        assert_eq!(bottom.display_offset, 0);
+        assert_eq!(bottom.cells.len(), expected_bottom.cells.len());
+        for (actual, expected) in bottom.cells.iter().zip(&expected_bottom.cells) {
+            assert_eq!(actual.point, expected.point);
+            assert_eq!(actual.cell, expected.cell);
+        }
+
+        backend.write(b"FIVE!");
+        let written = content(&mut backend);
+        assert_eq!(screen_rows(&written, 8, 3), ["four", "five", "FIVE!"]);
+
+        backend.scroll_display(Scroll::Delta(1));
+        let scrolled_after_write = content(&mut backend);
+        expected_backend.write(b"FIVE!");
+        let _ = content(&mut expected_backend);
+        expected_backend.scroll_display(Scroll::Delta(1));
+        let expected_scrolled_after_write = content(&mut expected_backend);
+        assert_eq!(
+            scrolled_after_write.cells.len(),
+            expected_scrolled_after_write.cells.len()
+        );
+        for (actual, expected) in scrolled_after_write
+            .cells
+            .iter()
+            .zip(&expected_scrolled_after_write.cells)
+        {
+            assert_eq!(actual.point, expected.point);
+            assert_eq!(actual.cell, expected.cell);
+        }
+
+        backend.scroll_display(Scroll::Bottom);
+        backend.resize(test_bounds(10, 4));
+        let resized = content(&mut backend);
+        assert_eq!(resized.cells.len(), 40);
+        assert_eq!(
+            screen_rows(&resized, 10, 4).last(),
+            Some(&"FIVE!".to_string())
+        );
     }
 
     #[test]
