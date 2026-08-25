@@ -3,7 +3,7 @@
 
 # Alacritty performance baseline (P7)
 
-All numbers below were measured **host-native** (`-Dcpu=native`, v1 default). Under v2 the CPU policy is decided by the artifact-pipeline ticket; no gate reading may cite these until both cores are re-run under that policy.
+**Correction (2026-08-25, ticket #28):** the ghostty core measured below was the *published* v1 prebuilt, which the publish workflow built with `-Dtarget=<triple>` and no `-Dcpu` — Zig resolves that to `Target.Cpu.baseline` (`std/zig/system.zig:377-380`), so these numbers were **baseline**, not host-native (only local `GHOSTTY_SOURCE_DIR` builds were native). v2's CPU policy is explicitly `-Dcpu=baseline` (build-strategy.md §0 row 3); the numbers still may not be cited for a v2 gate until both cores are re-run on the v2 (upstream, trimmed) pin.
 
 The pre-swap baseline required by [SPEC.md §7](SPEC.md#7-verification) and
 [verification-strategy.md §6](verification-strategy.md#6-performance): the

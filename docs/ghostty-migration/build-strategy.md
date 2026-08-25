@@ -1,19 +1,38 @@
-> [!NOTE]
-> **v2 status (2026-08-25):** v1 decision record, salvaged as the v2 starting text (salvage-policy.md rule 1). **Not locked for v2**: the re-opened ticket amends this file in place and removes this banner on resolution. Source: `migration/libghostty` @ `e537270dac`.
+# libghostty-vt build strategy (v2)
 
-# libghostty-vt build strategy
-
-Status: **Decided** (this doc is the decision record)
+Status: **Decided for v2** (2026-08-25, ticket [#28](https://github.com/xipeng-jin/zed/issues/28), map [#27](https://github.com/xipeng-jin/zed/issues/27)).
+Supersedes: the v1 record of the same name on `migration/libghostty` (resolved 2026-07-15, last at `e537270dac`). v1 text is retained below where re-confirmed; every amended point is marked **[v2 amended]** in place and summarised in §0. Sections 3–5 (the v1 survey and options analysis) are kept as history and are **not** re-verified except where §0 says so.
 Scope: how Zed's build produces the native `libghostty-vt` static library, and the exact build contract we commit to.
 Related: the bindings-vendoring ticket (how `libghostty-rs`-derived code lands in-tree) is separate; this doc only constrains it.
 
 Local sources cited below:
 
 - `libghostty-rs` checkout: `/home/xjin/Projects/refs/libghostty-rs` (referred to as `libghostty-rs/`)
-- `ghostty` checkout: `/home/xjin/Projects/refs/ghostty` at `f8041e849b` (2026-07-14), which contains the pinned commit `a887df42c5` (2026-07-11) in history (referred to as `ghostty/`)
+- `ghostty` checkout: `/home/xjin/Projects/refs/ghostty`. v1 sections cite it at `f8041e849b` (2026-07-14, pin `a887df42c5`); v2 sections (§0, §6, §7) cite upstream `main` @ `8867c37c5` (2026-08-24) (referred to as `ghostty/`)
+- `libghostty-rs` at `de9fd9b0fa` (0.2.1, 2026-08-18) for v2 sections; `51bf4bf732` for v1 sections
 - Zed worktree: this repo (referred to as `zed/`)
 
-Claims are marked **[verified]** (read from source / measured on this machine) or **[recon]** (taken from prior reconnaissance or web, cited).
+Claims are marked **[verified]** (read from source / measured on this machine) or **[recon]** (taken from prior reconnaissance or web, cited). v2 measurements: Intel Core Ultra 7 155H (22 threads), Fedora, zig 0.16.0 at `/usr/bin/zig`; raw evidence file for the v2 pass: the research notes attached to ticket #28.
+
+---
+
+## 0. v2 re-validation summary (2026-08-25)
+
+Point-by-point against the "Re-validation required" comment on #28. **[verified]** unless noted.
+
+| # | Question | v2 answer |
+|---|---|---|
+| 1 | Prebuilt-by-default hybrid and the four resolution paths | **Re-confirmed** unchanged: `GHOSTTY_VT_LIB_DIR` → `GHOSTTY_SOURCE_DIR` → `GHOSTTY_VT_FROM_SOURCE=1` → default prebuilt fetch (§6.1). libghostty-rs HEAD still has no prebuilt support and still git-fetches at build time (`build.rs:393-432`); ghostty still publishes no Linux/Windows binaries. Two new source-path knobs join the env table (§6.2): `LIBGHOSTTY_VT_SYS_CPU` (upstream, default `baseline`) and the feature set, which is **not** an env var but a pin-file field so prebuilt and source builds cannot disagree. Cold source build at HEAD: 76 s wall / 241 s CPU (native), 48 s (baseline), warm no-op 0.14–0.26 s; 8 zig packages fetched (global cache 99 MB, local 405 MB) — the "never offline-clean" argument against Zig-for-everyone stands. |
+| 2 | Zig version window | **Amended**: `requireZig` (`ghostty/src/build/zig.zig:5-18`) demands `major == 0 && minor == 16 && patch >= 0` from `build.zig.zon:6` `minimum_zig_version = "0.16.0"`; 0.15.x and 0.17.x both fail at `build.zig` compile time. libghostty-rs `build.rs` does **not** check the version itself. Our `build.rs` keeps v1's own pre-check but reads the required version from `ghostty_pin.toml` (`zig = "0.16.0"`) and enforces the same rule (same major.minor, patch ≥) so a future 0.17 bump is a pin-file change, not a code change (§6.3). |
+| 3 | CPU target for distributed prebuilts | **Re-confirmed as baseline — and the premise corrected.** v1's *published* prebuilts were already baseline: the publish workflow passed `-Dtarget=<triple>` with no `-Dcpu`, and Zig resolves an explicit target with no cpu to `Target.Cpu.baseline` (`/usr/lib/zig/std/zig/system.zig:377-380`). The P8 gate numbers were measured against that "official ReleaseFast prebuilt" (perf-baseline.md), so they were baseline, not host-native; only the v1 *local source builds* (no `-Dtarget`, host == target) were native. v2 makes it explicit: `-Dcpu=baseline` on every path (prebuilt workflow and source builds), `LIBGHOSTTY_VT_SYS_CPU` as the override. Perf cost is small by construction: every SIMD hot path dispatches at runtime — Highway `HWY_DYNAMIC_DISPATCH` (`ghostty/src/simd/{vt,index_of,codepoint_width}.cpp`) and simdutf (`pkg/simdutf/vendor/simdutf.h:274`); `nm` on the baseline archive shows fallback/westmere/haswell + SSE2…AVX2 tiers, the native archive only haswell (non-portable). Baseline archive is 17.99 MB vs 16.79 MB native. No measured delta exists for the scalar Zig code; none is needed here because the v2 perf re-run is defined on baseline (§0 row 5). |
+| 4 | `-Dvt-features` trimming | **Amended: trim `-kitty_graphics,-glyph_protocol`; keep `snapshot` on.** Nine flags, all default on (`ghostty/src/terminal/build_options.zig:59-156`); Zed's parity scope needs `selection`, `render_state`, `input_encode`, `color`, `formatter`, `grid_introspection`. `kitty_graphics` is out of scope on the map and removes 16 `ghostty_kitty_graphics_*` exports plus the wuffs PNG decoder; `glyph_protocol` has no C API and Alacritty never implemented it, so off is parity-neutral. `snapshot` stays on because the map's fog reserves it for the verification ticket (differential-harness golden state). Measured (baseline, ReleaseFast): all-on 17.99 MB / 196 exports → `-kitty_graphics,-glyph_protocol` **14.57 MB / 180 exports** → also `-snapshot` 13.45 MB / 167. Behaviour: APC `G` payloads are consumed and dropped (`apc.zig:65`, state `.ignore`), no crash. Headers are **not** trimmed by the zig build, so the vendored `bindings.rs` still declares the symbols; the safe crate's `kitty-graphics` cargo feature (off by default) must stay off and no Zed code may reference `ghostty_snapshot_*`-less symbols — a link error, not a compile error, is the failure mode. The feature string lives in `ghostty_pin.toml` (§7) and is passed by both the publish workflow and `build.rs` source paths. |
+| 5 | Upstream vs fork pin | **Amended: upstream commit** (salvage-policy rule 6). Upstream `page.zig:1817-1822` still has `.styles = 128`; the fork commit `636ce3a46f` (512) lives only on `zed/perf-style-capacity`, is not an ancestor of HEAD, and no upstream commit or discussion touches the literal. `source_repo` becomes `ghostty-org/ghostty`; the fork line is re-instated only by the perf re-measure. Evidence the re-measure must produce, on the **baseline upstream** prebuilt at the pin: `colored_dump` and `sustained_scroll` from `script/terminal-perf-baseline` against alacritty in the same run (≤20 % gate), and a page-split count (or `RefCountedSet` growth) for the colored stream so a failure can be attributed to style capacity rather than to the seam. Not decided here. |
+| 6 | rustc 1.97.1 floor | **Re-confirmed, no implication**: libghostty-rs MSRV is `rust-version = "1.90"`, edition 2024 (`rs/Cargo.toml:6-9`); Zed pins `1.97.1` (`rust-toolchain.toml:2`), workspace edition 2024. Vendored crates inherit the workspace; nothing in Cargo or CI changes. The hand-written CI job picks the toolchain up from `rust-toolchain.toml`. |
+| 7 | Fork-CI constraints | **Re-confirmed**: every xtask-generated Zed workflow is guarded `github.repository_owner == 'zed-industries' || 'zed-extensions'` and uses Namespace/self-hosted runners (`run_tests.yml:21,143,921`), so nothing upstream runs here; `libghostty-rs`'s own CI is Nix + Namespace + cachix and equally unusable. The single hand-written `ghostty_source_build.yml` (ubuntu-latest, `mlugg/setup-zig@v2`) stays the only CI for the source path; v2 changes: zig `0.16.0`, trigger branch `migration/libghostty2`, package cache keyed on `ghostty_pin.toml`. Cold build was 48–76 s on 22 threads; budget ~5 min on a 4-vCPU runner, inside the existing 30-min timeout. The prebuilt publish workflow in `xipeng-jin/libghostty-vt-prebuilt` moves to zig 0.16.0 and gains explicit `-Dcpu=baseline` + `-Dvt-features` (artifact-pipeline ticket owns the edit). |
+
+Other facts checked at HEAD: `-Demit-lib-vt` unchanged; `-Dsimd` still exists (`Config.zig:238`, `-Dsimd=false` archive 15.09 MB — still rejected, v1 §8.4); Windows static now links `ntdll`+`kernel32` and disables the stack protector under MSVC (`GhosttyLibVt.zig:252-268`, archive `ghostty-vt-static.lib`); Darwin static archives pass through `LibsystemOverrideStep` (`:328-358`) — both go to the platform-gate ticket, neither changes the Linux contract.
+
+---
 
 ---
 
@@ -36,7 +55,7 @@ Criteria: plain `cargo build` works for contributors; CI; offline/sandboxed (nix
 
 - Plain `cargo build` on Linux downloads a ~15 MB `libghostty-vt.a` (ReleaseFast) from a Zed-controlled GitHub release, keyed by ghostty commit + target triple, and verifies it against a sha256 checked into the tree. No Zig, no git-clone-of-ghostty, no bindgen/libclang at build time (bindings are pre-generated and vendored).
 - `GHOSTTY_VT_LIB_DIR` (new) points at a local archive and skips all network — this is the nix/distro/offline contract, modeled on Zed's existing `LK_CUSTOM_WEBRTC` pattern for libwebrtc (`zed/nix/build.nix:234`).
-- `GHOSTTY_SOURCE_DIR` (kept from libghostty-rs) builds from a local ghostty checkout with Zig 0.15.x — the dev loop for anyone hacking on ghostty itself, and the path the artifact-publishing workflow uses.
+- `GHOSTTY_SOURCE_DIR` (kept from libghostty-rs) builds from a local ghostty checkout with Zig 0.16.x **[v2 amended: was 0.15.x]** — the dev loop for anyone hacking on ghostty itself, and the path the artifact-publishing workflow uses.
 - The ghostty commit pin, per-target artifact sha256s, and the vendored `bindings.rs` are updated together, in one file set, by one documented bump procedure; one Linux CI job builds from source at the pin so the escape hatch can never rot.
 
 This matches two precedents Zed contributors already live with daily: `webrtc-sys` downloads a prebuilt static libwebrtc in its build script (`~/.cargo/git/checkouts/livekit-rust-sdks-*/d0e27be/webrtc-sys/build.rs:102` calls `webrtc_sys_build::download_webrtc()`) **[verified]**, and `crates/zed/build.rs:103–118` downloads a ConPTY nupkg on Windows **[verified]**. It keeps the migration-period tax at ~zero for the thousands of contributors who will never touch ghostty internals, while the measured ~49 s cold / ~36 s warm source build stays one env var away for those who do.
@@ -211,6 +230,9 @@ We do **not** carry libghostty-rs's `pkg-config` feature (a system libghostty of
 | `GHOSTTY_VT_FROM_SOURCE` | CI source job, artifact workflow, exotic targets | `1` → git-fetch pinned commit + zig build |
 | `GHOSTTY_ZIG_SYSTEM_DIR` | hermetic source builds | forwarded to `zig build --system <dir>`; only meaningful with a source path |
 | `LIBGHOSTTY_VT_SYS_OPTIMIZE` | perf/debug investigation | zig optimize override, source builds only (same four values as today) |
+| `LIBGHOSTTY_VT_SYS_CPU` **[v2 amended]** | perf investigation on a known machine | zig `-Dcpu` override for source paths (`native`, `x86_64_v3`, …); default `baseline`, matching libghostty-rs HEAD (`build.rs:136,184`) and the published prebuilts (§0 row 3) |
+
+The `-Dvt-features` set is **not** an env var: it is `vt_features` in `ghostty_pin.toml` (§7) and is passed verbatim on every source build and by the publish workflow, so a source build can never link a different feature set than the prebuilt it replaces. **[v2 amended]**
 
 All of the above get `cargo:rerun-if-env-changed`. Additionally `rerun-if-changed=build.rs` (fixing the broken relative path, §3.1) and `rerun-if-changed=ghostty_pin.toml`. `TARGET`/`HOST`/`DEBUG`/`OPT_LEVEL` rerun-triggers are kept as today.
 
@@ -219,8 +241,9 @@ Profile mapping: **all paths default to ReleaseFast regardless of cargo profile*
 ### 6.3 Toolchain requirement and version check
 
 - Prebuilt path (default): **no toolchain requirements beyond what Zed already needs.** `zig` and `git` are not consulted.
-- Source paths: `zig` on PATH with version `>= 0.15.2, < 0.16` (ghostty's `requireZig` rule, §3.2). Before invoking the build, `build.rs` runs `zig version` and enforces this itself so the user gets our message, not a Zig `@compileError` buried in build output. `git` required only for path 3.
-- `script/linux` does **not** grow a zig dependency. `docs/src/development/linux.md` gains a short "Working on the ghostty terminal backend" subsection documenting `GHOSTTY_SOURCE_DIR` + the zig 0.15.2 tarball / `mise`/`zigup` install. CI's single source-build job uses `mlugg/setup-zig@v2` with `version: 0.15.2` (the exact pattern in `libghostty-rs/.github/workflows/windows-ci.yml:35–39`).
+- Source paths **[v2 amended]**: `zig` on PATH whose version satisfies ghostty's `requireZig` rule for the pinned commit — same `major.minor` as `ghostty_pin.toml`'s `zig` field and `patch >=` it; at the v2 pin that is **`>= 0.16.0, < 0.17`** (`ghostty/src/build/zig.zig:5-18`, `build.zig.zon:6`). `build.rs` runs `zig version`, parses the numeric prefix (`0.16.0-dev.…` counts as 0.16.0), and enforces the rule itself so the user gets our message, not a Zig `@compileError` buried in build output; the required version is read from the pin file, so a toolchain bump is a data change. `git` required only for path 3.
+- `script/linux` does **not** grow a zig dependency. `docs/src/development/linux.md` gains a short "Working on the ghostty terminal backend" subsection documenting `GHOSTTY_SOURCE_DIR` + the zig 0.16.0 tarball / `mise`/`zigup` install. CI's single source-build job uses `mlugg/setup-zig@v2` with `version: 0.16.0` (the exact pattern in `libghostty-rs/.github/workflows/windows-ci.yml:32-36` at `de9fd9b0fa`).
+- Every source build passes `-Dcpu=<LIBGHOSTTY_VT_SYS_CPU or baseline>` and `-Dvt-features=<pin>` in addition to v1's `-Demit-lib-vt=true -Doptimize=ReleaseFast -Demit-xcframework=false -Dapp-runtime=none` (and `-Dtarget` when cross-compiling). **[v2 amended]**
 
 ### 6.4 Failure modes and their exact messages
 
@@ -228,15 +251,16 @@ Every failure panics the build script (cargo convention) with a message that nam
 
 | Condition | Message (prefix `ghostty-vt-sys:`) |
 |---|---|
-| prebuilt download failed (network/404) | `failed to download prebuilt libghostty-vt for <triple> from <url>: <cause>. If you are offline, set GHOSTTY_VT_LIB_DIR to a directory containing libghostty-vt.a, or build from source with GHOSTTY_VT_FROM_SOURCE=1 (requires zig 0.15.x). See docs/ghostty-migration/build-strategy.md.` |
+| prebuilt download failed (network/404) | `failed to download prebuilt libghostty-vt for <triple> from <url>: <cause>. If you are offline, set GHOSTTY_VT_LIB_DIR to a directory containing libghostty-vt.a, or build from source with GHOSTTY_VT_FROM_SOURCE=1 (requires zig 0.16.x). See docs/ghostty-migration/build-strategy.md.` |
 | sha256 mismatch | `prebuilt libghostty-vt for <triple> failed checksum verification (expected <hash>, got <hash>). Refusing to link. Delete <path> and retry; if this persists, the release asset or the pin in ghostty_pin.toml is wrong.` |
-| no prebuilt published for target | `no prebuilt libghostty-vt for target <triple> (available: <list from pin manifest>). Build from source with GHOSTTY_VT_FROM_SOURCE=1 (requires zig 0.15.x), or set GHOSTTY_VT_LIB_DIR.` |
+| no prebuilt published for target | `no prebuilt libghostty-vt for target <triple> (available: <list from pin manifest>). Build from source with GHOSTTY_VT_FROM_SOURCE=1 (requires zig 0.16.x), or set GHOSTTY_VT_LIB_DIR.` |
 | `GHOSTTY_VT_LIB_DIR` lacks the archive | `GHOSTTY_VT_LIB_DIR is set to <dir> but it does not contain libghostty-vt.a` |
-| zig missing (source path) | `building libghostty-vt from source requires zig (>= 0.15.2, < 0.16) on PATH, but 'zig version' could not be run: <cause>. Install from https://ziglang.org/download/#release-0.15.2 or unset GHOSTTY_SOURCE_DIR/GHOSTTY_VT_FROM_SOURCE to use the prebuilt library.` |
-| zig wrong version | `zig <found> is not compatible: ghostty at the pinned commit requires >= 0.15.2 and < 0.16 (its build enforces same-minor). Install 0.15.2 from https://ziglang.org/download/#release-0.15.2.` |
+| zig missing (source path) | `building libghostty-vt from source requires zig (>= 0.16.0, < 0.17) on PATH, but 'zig version' could not be run: <cause>. Install from https://ziglang.org/download/#release-0.16.0 or unset GHOSTTY_SOURCE_DIR/GHOSTTY_VT_FROM_SOURCE to use the prebuilt library.` |
+| zig wrong version | `zig <found> is not compatible: ghostty at the pinned commit requires >= 0.16.0 and < 0.17 (its build enforces same-minor). Install 0.16.0 from https://ziglang.org/download/#release-0.16.0.` (versions come from the `zig` field of `ghostty_pin.toml`) **[v2 amended]** |
 | git clone fails (source path 3) | `failed to fetch ghostty <commit> from <repo>: <cause>. If offline, use GHOSTTY_SOURCE_DIR with an existing checkout.` |
 | `GHOSTTY_SOURCE_DIR` without `build.zig` | as today (§3.1) |
 | zig build itself fails | `zig build failed (status <s>) building libghostty-vt from <source dir>; see output above` |
+| link error for a trimmed symbol (`ghostty_kitty_graphics_*`, glyph protocol) | not a build.rs failure: the archive omits features listed with `-` in `vt_features` while the headers/bindings still declare them (§0 row 4). The vendored safe crate must keep those modules behind cargo features that default off. **[v2 amended]** |
 | unsupported target for source build | as today, plus the `zig_target()` table location |
 
 ### 6.5 Caching behavior
@@ -256,10 +280,13 @@ Every failure panics the build script (cargo convention) with a message that nam
 
   ```toml
   # Single source of truth for the ghostty native pin.
-  commit = "636ce3a46f30916ca4d55e46e36eb1b5dc8698a8"
-  release = "ghostty-636ce3a46f"   # tag in the prebuilt-artifacts repo
-  source_repo = "xipeng-jin/ghostty"   # owner/name of the pinned native source fork
+  commit = "8867c37c5…"                 # v2: an UPSTREAM ghostty commit (salvage-policy rule 6); exact 40-char value set by the vendoring ticket
+  release = "ghostty-8867c37c5"          # tag in the prebuilt-artifacts repo
+  source_repo = "ghostty-org/ghostty"    # [v2 amended] upstream, not the fork; flips back to xipeng-jin/ghostty only if the perf re-measure fails
   prebuilt_repo = "xipeng-jin/libghostty-vt-prebuilt"   # owner/name; upstream handoff = repo transfer + this line
+  zig = "0.16.0"                         # [v2 amended] ghostty's minimum_zig_version at `commit`; build.rs enforces same major.minor, patch >=
+  cpu = "baseline"                       # [v2 amended] -Dcpu used for the published prebuilts (documentation; build.rs default, LIBGHOSTTY_VT_SYS_CPU overrides source builds)
+  vt_features = "-kitty_graphics,-glyph_protocol"   # [v2 amended] -Dvt-features passed by the publish workflow AND every source build
 
   [sha256]
   x86_64-unknown-linux-gnu = "…"
@@ -269,11 +296,11 @@ Every failure panics the build script (cargo convention) with a message that nam
   ```
 
   No pin anywhere else: the native source repository and commit, the vendored `bindings.rs`, the prebuilt artifacts, and the source-build fallback all key off this file. (libghostty-rs keeps the pin as a `const` in build.rs, line 7; we move it to data so the bump diff is boring and greppable.)
-- **What we pin to:** a raw ghostty commit, not a tag — libghostty has no versioned releases (§3.3) and a pre-1.0 C API, so *only* the exact commit that `bindings.rs` was generated from is known-compatible. Prebuilt artifacts are content-addressed by that commit and sha256-pinned, so a tampered or re-uploaded asset cannot link.
+- **What we pin to:** a raw **upstream** ghostty commit, not a tag — libghostty still has no versioned release or tag at `8867c37c5` (README: "API signatures still in flux") and a pre-1.0 C API, so *only* the exact commit that `bindings.rs` was generated from is known-compatible. **[v2 amended]** The fork branch `zed/perf-style-capacity` (`636ce3a46f`, `std_capacity.styles` 128→512, still absent upstream at `page.zig:1820`) is not on the pin; the perf re-measure (§0 row 5) is the only thing that can put it back, and if it does, `source_repo` and `commit` change together in one PR like any other bump. Prebuilt artifacts are content-addressed by that commit and sha256-pinned, so a tampered or re-uploaded asset cannot link.
 - **Bump procedure (gist):**
   1. Trigger the artifact workflow at the new ghostty commit; it builds all matrix targets from source (`GHOSTTY_VT_FROM_SOURCE` path at the new commit) and publishes a `ghostty-<commit>` release with a sha256 manifest.
   2. One Zed PR: update `ghostty_pin.toml` (commit + hashes), regenerate `bindings.rs` from the same commit's headers (`bindgen-tool`-style feature, per the vendoring ticket), fix any API breakage.
-  3. CI on that PR proves both paths: every job links the new prebuilt; the dedicated source-build job (`GHOSTTY_VT_FROM_SOURCE=1`, zig 0.15.x) rebuilds at the pin, guaranteeing the escape hatch and the published artifact can't silently diverge or rot.
+  3. CI on that PR proves both paths: every job links the new prebuilt; the dedicated source-build job (`GHOSTTY_VT_FROM_SOURCE=1`, zig 0.16.x) rebuilds at the pin, guaranteeing the escape hatch and the published artifact can't silently diverge or rot.
 - **Relationship to vendored bindings:** bindings and native pin move atomically, in the same PR, always. A pin bump without regenerated bindings (or vice versa) must be un-mergeable; cheapest enforcement is the source-build CI job plus a header-hash recorded in `ghostty_pin.toml` that the bindings-regeneration step also stamps — details to the vendoring ticket.
 - **Cadence:** bump deliberately (when we need an upstream fix/API), not on a schedule; pre-1.0 API churn means every bump is potentially a code change, and the pin file makes each one auditable.
 
@@ -283,5 +310,8 @@ Every failure panics the build script (cargo convention) with a message that nam
 2. **Vendoring ticket interface** — **resolved** by the vendoring ticket: `crates/ghostty_vt_sys` + `crates/ghostty_vt`, `bindgen-tool` feature kept (`gen-bindings` bin restamps `headers_sha256`).
 3. **Nix derivation** — **resolved**, and the sketch here was walked back: nix consumes the prebuilt via a fixed-output `fetchurl` derivation wired as `GHOSTTY_VT_LIB_DIR`, not an in-tree source derivation ([artifact-pipeline.md §6](artifact-pipeline.md)).
 4. **`-Dsimd=false` variant** — **resolved: no** ([artifact-pipeline.md §7](artifact-pipeline.md)).
-5. **Windows specifics** (deferred to the Windows gate): msvc vs gnullvm target choice, `ghostty-vt-static.lib` naming, ubsan-rt exclusion behavior (§3.2) when linking with MSVC.
+5. **Windows specifics** (deferred to the Windows gate): msvc vs gnullvm target choice. **[v2 update]** `ghostty-vt-static.lib` naming and the MSVC link issues are now handled upstream (`GhosttyLibVt.zig:252-268`: ubsan rt off, no stack protector, links `ntdll`+`kernel32`; libghostty-rs links `static=ghostty-vt-static` on `windows-msvc`); what remains is runner substrate (SPEC §8.2).
 6. **Debug-symbols story** — **resolved: no Debug artifact**; `GHOSTTY_SOURCE_DIR` is the debugging story, and source builds now default to ReleaseFast (§6.2, [artifact-pipeline.md §7](artifact-pipeline.md)).
+7. **[v2]** **Artifact-pipeline re-validation** — the publish workflow must add `-Dcpu=baseline` explicitly and `-Dvt-features` from the pin file, move `setup-zig` to 0.16.0, and tag `ghostty-8867c37c5` (or the vendoring ticket's final pin). Routed to the artifact-pipeline ticket.
+8. **[v2]** **Vendoring** — regenerate `bindings.rs` at the upstream pin (`headers_sha256` restamp), keep `kitty-graphics` off by default, do not expose glyph-protocol; pin-file schema above (`zig`, `cpu`, `vt_features`) is part of the vendored crate. Routed to the vendoring ticket.
+9. **[v2]** **Perf re-measure inputs** are listed in §0 row 5; the verification ticket owns the run and decides `snapshot` on/off after it settles whether the differential harness uses `snapshot.h`.
