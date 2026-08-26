@@ -102,8 +102,10 @@ existing ghostty reads (B12/B13/B15) or on a small seam scan (B14).
 **Non-gaps the ticket suspected (v2 refinements):**
 
 - **OSC 52 read**: no longer "structurally impossible" — see §0.3. Zed's effective policy stays
-  write-only; the read callback is left NULL. `TerminalBackendEvent::ClipboardLoad` stays in the enum
-  (dead by policy, not by capability) so a future setting can wire it to `OPT_CLIPBOARD_READ` in one place.
+  write-only; the read callback is left NULL. ~~`TerminalBackendEvent::ClipboardLoad` stays in the enum~~
+  **Superseded by #31 (2026-08-26):** the variant is deleted — a ghostty read is a synchronous callback
+  that must reply before returning, so a future setting wires a seam callback, not an event
+  ([color-and-clipboard-contract.md §5](color-and-clipboard-contract.md)).
 - **Block selection**: unchanged — Zed's `SelectionType` has no `Block` variant
   (`crates/terminal/src/terminal.rs:151-156`); `SelectionRange.is_block` is always false in practice.
 - **Alt-screen reflow**: unchanged — alacritty skips reflow on the alt screen
