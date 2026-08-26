@@ -1,29 +1,42 @@
-> [!NOTE]
-> **v2 status (2026-08-25):** v1 decision record, salvaged as the v2 starting text (salvage-policy.md rule 1). **Not locked for v2**: the re-opened ticket amends this file in place and removes this banner on resolution. Source: `migration/libghostty` @ `e537270dac`.
+# PTY and threading architecture for the libghostty-vt terminal (v2)
 
-# PTY and threading architecture for the libghostty-vt terminal
+Status: **Decided for v2** (2026-08-26, ticket [#30](https://github.com/xipeng-jin/zed/issues/30), map [#27](https://github.com/xipeng-jin/zed/issues/27)).
+Supersedes: the v1 record of the same name on `migration/libghostty` (resolved 2026-07-15, last at `e537270dac`, written against ghostty `a887df42c5` and *before* the P4 landing). Re-validated at the v2 baseline (`migration/libghostty2` = `main` @ `38c5dd7c98`, ghostty `8867c37c5`, libghostty-rs `de9fd9b0fa`, portable-pty 0.9.0 / wezterm `8afe0ad307`); §0 lists what changed against v1 so the diff is legible.
 
-Wayfinder ticket: xipeng-jin/zed#30 — what replaces alacritty's `tty` module and
-`EventLoop`, and what threading model owns the ghostty `Terminal` inside Zed.
+Sources of truth read for this note:
 
-All Zed paths are relative to the repo root. External source trees referenced:
+- Zed seam (`migration/libghostty2`): `crates/terminal/src/{terminal.rs,alacritty.rs,pty_info.rs}`, `crates/terminal_view/src/{terminal_view.rs,terminal_scrollbar.rs}`, `Cargo.toml`, `.github/workflows/*`.
+- v1 execution record (`migration/libghostty`): `crates/terminal/src/pty.rs` (P4 landing, `566b794a6f` + `2425954382` + `1b452bb116`), `docs/ghostty-migration/divergence-ledger.md` (P4-005), `.github/workflows/pty_integration.yml`, ticket #45 (P4 landing summary; ConPTY forensic record; §8.2 amendment).
+- ghostty `8867c37c5`: `include/ghostty/vt/{terminal.h,render.h,screen.h,io.h}`, `src/lib_vt.zig`, `src/lib/TinyIo.zig`, `src/terminal/c/{terminal.zig,sys.zig}`, `src/terminal/{stream.zig,render.zig,modes.zig}`, `src/termio/Thread.zig`, `src/renderer/generic.zig`, and commits `da04b65d4`, `82df79ec8`, `a69a591af`.
+- libghostty-rs `de9fd9b0fa`: `crates/libghostty-vt/src/{terminal.rs,render.rs,alloc.rs,fmt.rs,io.rs}`, `crates/libghostty-vt-sys/src/bindings.rs`.
+- portable-pty: `~/.cargo/registry/src/index.crates.io-*/portable-pty-0.9.0` and the wezterm checkout at `8afe0ad307` (`~/.cargo/git/checkouts/wezterm-*/8afe0ad`).
 
-- **libghostty-rs**: `~/Projects/refs/libghostty-rs` (the vendored binding)
-- **ghostty**: `~/Projects/refs/ghostty` (upstream Zig application + C headers)
-- **alacritty fork**: `~/.cargo/git/checkouts/alacritty-20195d12a03fa0c5/4c12966`
-  (zed-industries/alacritty rev `4c129667…`, per `Cargo.lock`)
-- **portable-pty 0.9.0**: `~/.cargo/registry/src/index.crates.io-*/portable-pty-0.9.0`
-  (already resolved in Zed's `Cargo.lock:13773`)
+---
+
+## 0. What changed against v1
+
+| Point | v1 (2026-07-15) | v2 (2026-08-26) |
+|---|---|---|
+| (1) PTY layer | portable-pty 0.9.0 behind a Zed seam; git pin for the Windows `kill()` fix noted as a hazard | **Re-confirmed.** crates.io still at 0.9.0 (2025-02-11); the inverted `TerminateProcess` check is verified by diff against the pin, so the pin `8afe0ad307` stays mandatory. |
+| (2) Ownership | `!Send` core on the GPUI foreground inside the `Terminal` entity | **Re-confirmed.** `init_single_threaded` and `TinyIo` remove a per-instance TLS block and signal handlers; they add no thread, no shared state, and the header contract is unchanged. libghostty-rs still has zero `Send`/`Sync` impls. |
+| (3) Threads / channel / pump | Predicted: bounded(4)×64 KiB byte channel; pump "carrying bytes" with the 4 ms coalescing timer left to validation | **Amended to the landed P4 shape**: exit events ride the byte channel (`PtyOutput::Event`), pump ingests ≤4 batches per turn then yields, **no timer** (ledger P4-005 accepted: 84.2 MiB/s, 2.2 ms max stall). |
+| (4) Batch boundary | not considered (`vt_write_until_ground` did not exist) | **No split at parser ground** — `vt_write` already recovers from any split losslessly and `until_ground` costs 1–5 %. **New: a DEC 2026 snapshot gate** on the pump (skip `RenderState::update`/`Wakeup` while mode 2026 is set, 1000 ms watchdog) because ghostty, unlike alacritty's vte, does not absorb BSU/ESU below the API. |
+| (5) Lock-held reads | n/a (predates #52454/#62504) | **New section.** Every read has a terminal-level getter (`SCROLLBACK_ROWS`, `TOTAL_ROWS`, `CURSOR_X/Y`, `SCROLLBAR`, `ACTIVE_SCREEN`); `Row::is_clear` becomes a Zed-side `HAS_TEXT` scan; the "cannot lock inside `sync()`" constraint disappears; page-granular eviction needs a non-monotonic `SCROLLBACK_ROWS` guard. |
+| (6) Callback queue | `Rc<RefCell<VecDeque>>`, sync-answer callbacks from `Rc<Cell>` state | **Re-confirmed, extended.** The clipboard-write "reply" is a stack-frame function pointer that *must* be called before the callback returns — synchronous for Zed's unconditional-copy policy. Three new fire-and-forget variants (desktop notification, progress, unknown sequence). libghostty-rs's `on_clipboard_write` binds the pre-reply ABI → #33. |
+| (7) Windows | ConPTY hazards listed; exit via `try_wait` suggested | **Re-confirmed as landed**: 100 ms `try_wait` poller (background task, not a thread), detached `terminal-pty-closer` thread with inline-drop fallback, pinned `kill()`; §8.2 substrate constraint carried; hosted runners are advisory only (what they can/cannot prove is stated in §3.7). |
+
+Dropped from v1: §4 "how ghostty itself does it" (its `lockDemand`/`yieldToDemand` fairness apparatus and 4-buffer pipeline are historical context; the numbers survive as the constants in `pty.rs`), and the §8 open questions that other tickets have since closed (OSC 52 read, color queries, scrollback setter → #29; selection/search → #35).
 
 ---
 
 ## 1. Decision summary
 
 | # | Decision | One-line rationale |
-|---|----------|--------------------|
-| **D1** | **PTY layer: adopt `portable-pty`** behind a thin Zed-owned module (the successor of `crates/terminal/src/alacritty.rs`), with Zed-owned reader/writer threads. | Already a workspace dependency (`Cargo.toml:720`, used by `crates/acp_thread`); exposes exactly what `pty_info.rs` needs on both platforms; ships a ConPTY backend for the Windows follow-up; ~0 new code vs. a ~1,200-LOC unix-only port whose event loop is coupled to the vte parser we are deleting. |
-| **D2** | **Ownership: the GPUI foreground thread owns the `!Send` ghostty `Terminal` (and `RenderState`), stored directly in the `Terminal` entity.** A dedicated reader `std::thread` ships raw byte batches over a *bounded* channel to the existing foreground event pump, which calls `vt_write`; a writer thread drains an input channel. No mutex, no `unsafe`. | GPUI entities require only `T: 'static` and foreground tasks need not be `Send`, so this is legal; it preserves the entity's large synchronous API surface (the highest-risk part of the migration); backpressure via the bounded channel + kernel PTY buffer replaces ghostty's mutex-fairness machinery outright. The channel seam is kept identical to the dedicated-thread alternative, so ownership can be hoisted off the UI thread later without touching the PTY layer. |
-| **D3** | **Event flow: register ghostty's callbacks as `'static` closures that capture `Rc<RefCell<VecDeque<TerminalBackendEvent>>>` (plus small `Rc<Cell<…>>` state for synchronous-answer callbacks).** Callbacks fire synchronously inside `vt_write` — which, under D2, is always the foreground thread — and the queue is drained through the existing `process_event` immediately after each `vt_write`, preserving PTY write-back ordering. Reader-thread-origin events (`ChildExit`) keep using the existing `PtyEvent` channel. | Ghostty's vtable is synchronous-by-design (`terminal.rs:77-79` of the binding); running it on the thread that already owns the entity turns every event into ordinary foreground code, and answer-required callbacks (`on_size`, `on_device_attributes`, `on_color_scheme`) can return synchronously from foreground-visible state — impossible to do without round-trips in any cross-thread design. |
+|---|---|---|
+| **D1** | **PTY layer: `portable-pty`, git-pinned to wezterm `8afe0ad307`, behind the Zed-owned `crates/terminal/src/pty.rs` seam** (salvaged by file from v1 P4). | Only workspace dep candidate; API maps 1:1 onto `pty_info`'s needs on both platforms; `pre_exec` subsumes the alacritty-fork `SignalMask` fix; the pin carries the Windows `kill()` fix that 0.9.0 lacks (`src/win/mod.rs:40-49` is inverted). |
+| **D2** | **Ownership: the GPUI foreground owns the `!Send` ghostty `Terminal` + `RenderState`, stored in the `Terminal` entity. No mutex, no `unsafe`.** Reader/writer `std::thread`s move only `Send` byte buffers. | `T: 'static` is all GPUI entities need; the C contract is "one terminal, one thread, callbacks synchronous inside the write" (`terminal.h:78-83`) and `RenderState::update` takes `&Terminal` (`render.rs:327-370`), so the two-phase lock split is unusable cross-thread in safe Rust anyway. Preserves the entity's synchronous API and removes the lock wait the foreground already pays today. |
+| **D3** | **Event flow: ghostty callbacks push owned payloads into an `Rc<RefCell<VecDeque<TerminalBackendEvent>>>` drained right after each `vt_write`; sync-answer callbacks (size, DA, color scheme, enquiry/XTVERSION, clipboard-write reply) answer inline from foreground state.** Exit events ride the byte channel behind every byte already read. | Callbacks borrow their payload only for the call and may not re-enter `vt_write`; replying inside the callback is *required* for clipboard writes (`terminal.h:548-552,598-601`); PTY write-back ordering is preserved by construction. |
+| **D4** (new) | **Pump contract: ≤ `MAX_BATCHES_PER_TURN`(4) × `READ_BATCH_SIZE`(64 KiB) of `vt_write` per foreground turn, then `yield_now()`; no coalescing timer; batches are *not* split at parser ground; after each turn, `RenderState::update`/`Wakeup` are gated on DEC mode 2026 with a 1000 ms watchdog.** | P4-005 (measured) settles the timer; `stream.zig:685-702` shows `vt_write` already resynchronises at any boundary so `until_ground` buys nothing for 1–5 % cost; ghostty's render state does not check 2026 (`src/terminal/render.zig`), so synchronized output must be honoured at the snapshot, exactly as ghostty's own renderer does (`generic.zig:1275-1278`, `Thread.zig:38`). |
 
 ---
 
@@ -31,562 +44,165 @@ All Zed paths are relative to the repo root. External source trees referenced:
 
 ```mermaid
 flowchart LR
-    subgraph K["Kernel"]
-        PTYQ["PTY master fd<br/>(kernel tty queue =<br/>natural backpressure)"]
+    subgraph K["Kernel / ConPTY"]
+        PTYQ["PTY master<br/>(kernel tty queue / ConPTY pipe =<br/>natural backpressure)"]
         CHILD["shell / child process"]
     end
 
-    subgraph RT["reader std::thread ('terminal-pty-reader')"]
-        RD["blocking read()<br/>64 KiB buffer"]
-        WAIT["on EOF (Ok(0), EIO→EOF):<br/>child.wait() → ChildExit"]
+    subgraph RT["reader std::thread 'terminal-pty-reader'"]
+        RD["blocking read()<br/>READ_BATCH_SIZE = 64 KiB"]
+        WAIT["on EOF (Ok(0), EIO→EOF):<br/>reap_child → ChildExit, Exit, Wakeup<br/>sent as PtyOutput::Event on the SAME channel"]
     end
 
-    subgraph WT["writer std::thread ('terminal-pty-writer')"]
-        WR["blocking write()<br/>drains input channel"]
+    subgraph WT["writer std::thread 'terminal-pty-writer'"]
+        WR["blocking write()<br/>drains unbounded input channel"]
+    end
+
+    subgraph BG["GPUI background executor (Windows only)"]
+        POLL["exit poller task: try_wait every 100 ms<br/>→ PtyOutput::Event(ChildExit…)"]
+        CLOSER["detached 'terminal-pty-closer' thread<br/>ClosePseudoConsole off the UI thread"]
     end
 
     subgraph FG["GPUI foreground thread (no locks anywhere)"]
-        PUMP["event pump task<br/>(cx.spawn; today's subscribe() loop,<br/>terminal.rs:1315-1377)<br/>bounded batches per turn, then yield"]
+        PUMP["pump task (TerminalBuilder::subscribe)<br/>select(output_rx, events_rx)<br/>≤4 batches/turn → vt_write each → drain callbacks<br/>→ mode-2026 gate → Wakeup → yield_now()"]
         subgraph ENTITY["Terminal entity (owns everything below)"]
-            TERM["ghostty Terminal&lt;'static,'static&gt;<br/>(!Send — never leaves this thread)"]
-            RS["RenderState + Row/CellIterator<br/>(!Send)"]
-            CBQ["Rc&lt;RefCell&lt;VecDeque&lt;TerminalBackendEvent&gt;&gt;&gt;<br/>filled by callbacks inside vt_write"]
+            TERM["ghostty Terminal (!Send)"]
+            RS["RenderState + iterators (!Send)"]
+            CBQ["Rc&lt;RefCell&lt;VecDeque&lt;TerminalBackendEvent&gt;&gt;&gt;<br/>owned payloads pushed inside vt_write"]
             LC["last_content: Content (owned, Send)"]
         end
-        VIEW["TerminalView / element render<br/>reads last_content"]
+        VIEW["TerminalView / element render<br/>reads last_content, used_lines, total_lines"]
     end
 
-    CHILD -->|writes output| PTYQ
+    CHILD -->|output| PTYQ
     PTYQ -->|read| RD
-    RD -->|"bounded async_channel(4)<br/>Vec&lt;u8&gt; batches (Send)"| PUMP
-    WAIT -->|"PtyEvent channel (unbounded)"| PUMP
-    PUMP -->|"terminal.update(cx): vt_write(batch)"| TERM
-    TERM -->|"synchronous callbacks<br/>(pty-write, title, pwd, bell,<br/>clipboard, size, DA, color-scheme)"| CBQ
-    CBQ -->|"drained right after vt_write<br/>→ process_event(cx)"| ENTITY
-    ENTITY -->|"PtyWrite / DA / color replies:<br/>unbounded input channel"| WR
-    VIEW -->|"user keys/mouse → input()"| ENTITY
+    RD -->|"async_channel::bounded(4)<br/>PtyOutput::Bytes(Vec&lt;u8&gt;)"| PUMP
+    WAIT -->|"PtyOutput::Event (ordered after bytes)"| PUMP
+    POLL -->|"PtyOutput::Event"| PUMP
+    PUMP -->|"terminal.update(cx): backend.write(batch)"| TERM
+    TERM -->|"synchronous callbacks: write_pty, bell, title, pwd,<br/>clipboard_write(+reply), desktop_notification,<br/>progress_report, unknown_sequence"| CBQ
+    TERM -.->|"sync answers: size, DA, color_scheme,<br/>enquiry, xtversion"| ENTITY
+    CBQ -->|"drained after vt_write → process_event(cx)"| ENTITY
+    ENTITY -->|"PtyWrite / DA / clipboard replies:<br/>unbounded input channel"| WR
+    VIEW -->|"keys / mouse / paste → input()"| ENTITY
     WR -->|write| PTYQ
-    PTYQ -->|delivers input| CHILD
-    ENTITY -->|"resize: MasterPty::resize (TIOCSWINSZ ioctl, direct)<br/>+ terminal.resize(cols,rows,px)"| TERM
-    TERM -->|"sync() at frame time:<br/>RenderState::update → iterate → Content"| LC
+    PTYQ -->|input| CHILD
+    ENTITY -->|"resize: MasterPty::resize (ioctl / ResizePseudoConsole)<br/>+ terminal.resize(cols, rows, px)"| TERM
+    TERM -->|"sync() at frame time (unless mode 2026):<br/>RenderState::update → Content"| LC
     LC --> VIEW
 ```
 
-**Where the lock would be: nowhere.** Every access to the ghostty `Terminal` —
-`vt_write`, `resize`, selection/scroll mutation, and the per-frame
-`RenderState::update` — happens on the single foreground thread that owns it.
-The only cross-thread hand-offs are `Send` byte buffers (reader → foreground)
-and `Send` byte cows (foreground → writer). The bounded reader channel is the
-backpressure valve: when the foreground falls behind, the reader blocks, the
-kernel PTY queue fills, and the child's writes stall — the same flow-control
-mechanism ghostty documents for its 4-buffer pipeline
-(`src/termio/Exec.zig:1530-1535`: gather blocks when all buffers are in flight,
-"which is exactly when we should stop reading and let the kernel queue exert
-backpressure on the child").
+**Where the lock would be: nowhere.** Every touch of the ghostty `Terminal` — `vt_write`, `resize`, selection/scroll mutation, terminal-level data reads, the per-frame `RenderState::update` — happens on the single foreground thread that owns it. The cross-thread hand-offs are `Send` byte buffers (reader → foreground, bounded) and `Send` byte cows (foreground → writer, unbounded: a stalled child blocks the writer thread, not the UI). Backpressure: after four unconsumed batches the reader blocks, the kernel PTY queue fills, the child's `write()` stalls.
 
 ---
 
-## 3. Per-decision analysis
+## 3. Per-point re-validation
 
-### 3.1 D1 — PTY layer: `portable-pty`, not a port, not from scratch
+### 3.1 (1) PTY layer — re-confirmed: portable-pty, pinned, behind `pty.rs`
 
-**What the layer must provide** (from Zed's current seam):
+- **Version.** crates.io `max_version = 0.9.0`, `updated_at = 2025-02-11` (queried 2026-08-26). Zed `main` has `portable-pty = "0.9.0"` (`Cargo.toml:741`); sole consumer `acp_thread` uses only `portable_pty::ExitStatus::from` (`crates/acp_thread/src/terminal.rs:501,539`). v1 replaced the workspace entry with `{ git = "https://github.com/wezterm/wezterm", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }` (v1 `Cargo.toml:728`); `acp_thread` rides the pin unchanged since `ExitStatus` is untouched.
+- **Why the pin is still mandatory.** 0.9.0 `src/win/mod.rs:40-49` (`WinChild::do_kill`): `let res = TerminateProcess(...); if res != 0 { Err(err) } else { Ok(()) }` — inverted (`TerminateProcess` returns nonzero on success). `WinChild::kill` swallows it with `.ok()` (`:54-57`) but `WinChildKiller::kill` (`:71-79`) does not, and a `clone_killer()` killer is exactly what `pty.rs` stores (v1 `pty.rs:98,197`) — so on 0.9.0 every *successful* Windows kill reports `Err`. wezterm `8afe0ad30` ("pty: windows: fix kill() (#7709)") has `if res == 0 { Err(err) } else { Ok(()) }` (`pty/src/win/mod.rs:41-50`). No newer crates.io release carries it.
+- **API adequacy (unchanged).** `MasterPty::{resize, try_clone_reader, take_writer, process_group_leader, as_raw_fd, tty_name}` (`src/lib.rs:88-117`); `Child::{try_wait, wait, process_id, as_raw_handle}` (`:130-146`); `ChildKiller: Send + Sync` separable via `clone_killer` (`:150-157`). Unix `pre_exec` (`src/unix.rs:238-274`) resets SIGCHLD/HUP/INT/QUIT/TERM/ALRM, clears `sigprocmask`, `setsid()`, `TIOCSCTTY`, `close_random_fds()` — still subsumes the alacritty-fork `SignalMask` fix. Unix kill = `SIGHUP` (`src/lib.rs:322-333`), matching alacritty's `Pty::drop`.
+- **Seam.** `crates/terminal/src/pty.rs` (v1 P4) is the swap point and is salvaged **by file** under salvage-policy rule 3; only `terminal.rs` integration hunks are re-derived. Its `pub(super)` surface: `PtyOutput`, `output_channel()`, `PtyHandle` (`shutdown`, `resize`, `Drop`), the reader/writer spawners, and the Windows exit poller.
 
-- Unix `openpty` + shell spawn with cwd/env, setsid + controlling TTY
-  (`crates/terminal/src/alacritty.rs:177-183` wraps `tty::new`).
-- Handles for `PtyProcessInfo`: on unix a raw master fd + child pid
-  (`alacritty.rs:64-69` builds `ProcessIdGetter::new(pty.file().as_raw_fd(), pty.child().id())`;
-  the fd feeds `libc::tcgetpgrp` at `crates/terminal/src/pty_info.rs:37` and the pid is the
-  fallback at `pty_info.rs:42-44`); on Windows a raw process handle + pid
-  (`alacritty.rs:71-82`, consumed by `GetProcessId` at `pty_info.rs:50-66`).
-- Resize ioctl (`TIOCSWINSZ`), child-exit observation, and a future ConPTY path.
+### 3.2 (2) Ownership — re-confirmed: foreground-owned `!Send` core; the runtime changes do not touch the contract
 
-**Option A — port alacritty's `tty` + `EventLoop` into Zed.** Measured against
-the actual checkout:
+- **Header contract, verbatim** (`terminal.h:78-83`, repeated at `:2039-2042`): "All callbacks are invoked synchronously during VT writes. Callbacks must not call ghostty_terminal_vt_write() or ghostty_terminal_vt_write_until_ground() on the same terminal (no reentrancy). And callbacks must be very careful to not block for too long … since they are blocking further IO processing." `terminal.h:44-51`: "libghostty-vt does not create a timer or background thread." The continuation export adds: "The caller must serialize this operation with ghostty_terminal_vt_write() and all other access to the same terminal."
+- **`render.h:29-34,42-52,435-448`**: the two-phase `begin_update`/`end_update` split exists so a *renderer* thread can hold the lock briefly — but the safe binding's `RenderState::update`/`begin_update` take `&Terminal` (`render.rs:327-370`), pinning `RenderState` to the terminal's thread. Under D2 there is one thread, so plain `update` is used and the split is moot.
+- **`init_single_threaded`** (`da04b65d4`, 2026-07-21): "The C API is assumed to be single-threaded per VT instance … init_single_threaded does not register signal handlers … matches the execution model of the C VT API (single-threaded/not thread-safe within a single VT instance)." **`TinyIo`** (`82df79ec8`, 2026-08-09): "only supports the operations we need and doesn't support concurrency … runtime memory requirements by over 256KB (the thread-local storage std.Io.Threaded creates … is gone). TinyIo is POSIX-only: Windows keeps std.Io.Threaded". `src/terminal/c/terminal.zig:52-95`: `TerminalWrapper.io` is `lib.TinyIo` on POSIX (stateless, `src/lib/TinyIo.zig:1-38`: "plain blocking syscalls … doesn't support concurrency operations"; no `threadlocal`, no globals) and a per-terminal heap-allocated `std.Io.Threaded.init_single_threaded` on Windows, freed in `deinit`. The Io is used only for Kitty-graphics temp-file reads (`lib_vt.zig:40-49`), which v2 compiles out (`-Dvt-features=-kitty_graphics`, #28). Process-wide mutable state in the C layer: only `src/terminal/c/sys.zig:87 var global` (the `ghostty_sys` hooks, set once at startup) and `lib_vt.zig:167 msvc_fltused`. **Verdict: no new thread, no cross-terminal state; the contract is unchanged.**
+- **libghostty-rs `de9fd9b`**: `grep -rn "unsafe impl (Send|Sync)" crates/libghostty-vt/src` → none. `Terminal<'alloc,'cb>` = `Object<'alloc, ffi::TerminalImpl>` (`NonNull`, `alloc.rs:48-49`) + `Box<VTable>` of `'cb` closures without `Send` bounds (`terminal.rs:224-229`); `RenderState<'alloc>(Object<…>)` (`render.rs:224`); formatter/selection handles carry `PhantomData<&'t Terminal>` (`fmt.rs:20,27`). Both auto-`!Send`/`!Sync`, as in v1.
+- **Why not a dedicated terminal thread** (unchanged from v1, restated): it turns `sync`, selection, search, `used_lines`, cwd reads into async round-trips or stale mirrors; the reader/writer channel seams are identical under either design, so ownership can be hoisted later without touching `pty.rs`. **Why not `unsafe impl Send` + mutex**: unsound-by-contract (the binding documents possible thread-local state; Windows keeps a per-terminal `Io.Threaded`).
 
-- Size: unix-only ≈ **1,200 LOC** (`tty/unix.rs` ~470 non-test + `tty/mod.rs`
-  slimmed ~130 + `event_loop.rs` 486 + `sync.rs` FairMutex 49 + glue); with
-  Windows (`windows/{mod,conpty,child,blocking}.rs` ≈ 910 non-test LOC) ≈
-  **2,100–2,200 LOC**. Deps (`polling`, `rustix-openpty`, `rustix`,
-  `signal-hook`, `piper`, `miow`, `windows-sys`) are all already in Zed's tree.
-- The disqualifier is structural, not size: `event_loop.rs` three-way-couples
-  the poller timeout to the **vte parser's synchronized-update state** and to
-  `Arc<FairMutex<Term<U>>>` — `state.parser.advance(&mut **terminal, …)` runs
-  *inside* the loop under the Term lock (`event_loop.rs:154`), the poll timeout
-  is derived from `parser.sync_timeout()` (`event_loop.rs:229-231`), and
-  chunking is governed by `READ_BUFFER_SIZE = 0x10_0000` / `MAX_LOCKED_READ =
-  u16::MAX` (`event_loop.rs:24,27,140-162`). Porting it verbatim ports the
-  exact vte+FairMutex architecture this migration exists to remove; porting it
-  gutted leaves only the `tty/unix.rs` spawn code — which portable-pty already
-  provides.
-- One fork-specific asset, `SignalMask` (`tty/unix.rs:59-98`, Zed-authored for
-  zed#42234: children spawned from a background thread must not inherit its
-  blocked signal mask; threaded through `crates/terminal/src/terminal.rs:1042-1048,1191-1196`),
-  is *subsumed* by portable-pty: its `pre_exec` unconditionally clears the
-  signal mask with `sigprocmask(SIG_SETMASK, &empty_set, …)` and resets
-  SIGCHLD/SIGHUP/SIGINT/SIGQUIT/SIGTERM/SIGALRM to `SIG_DFL`
-  (`portable-pty-0.9.0/src/unix.rs:238-271`), so the child always starts with a
-  clean mask regardless of which executor thread spawned it.
+### 3.3 (3) Threads, channel, exit transport, pump — amended to the landed P4 design
 
-**Option B — adopt `portable-pty` (chosen).** Verified against the vendored
-0.9.0 source and the wezterm repo:
+Constants (v1 `pty.rs:28-50`): `READ_BATCH_SIZE = 64 * 1024`, `OUTPUT_CHANNEL_BATCHES = 4`, `MAX_BATCHES_PER_TURN = 4`, `EXIT_POLL_INTERVAL = 100 ms` (`#[cfg(windows)]`).
 
-- Already resolved in the workspace: `Cargo.toml:720`
-  (`portable-pty = "0.9.0"`), consumed by `crates/acp_thread/Cargo.toml:41`
-  (`crates/acp_thread/src/terminal.rs:406,444`). Zero new dependency weight;
-  its deps (`nix`, `libc`, `filedescriptor`, `downcast-rs`, `serial2`,
-  `winapi`, …, `Cargo.lock:13773-13791`) are already vendored.
-- API coverage (all in `portable-pty-0.9.0/src/lib.rs`):
-  `PtySystem::openpty(PtySize) -> PtyPair` (lib.rs:267), `SlavePty::spawn_command(CommandBuilder)
-  -> Box<dyn Child + Send + Sync>` (lib.rs:165), `MasterPty: Downcast + Send`
-  with `resize(PtySize)`, `try_clone_reader() -> Box<dyn Read + Send>`,
-  `take_writer() -> Box<dyn Write + Send>`, unix-only
-  `process_group_leader() -> Option<pid_t>` (tcgetpgrp, unix.rs:373-378) and
-  `as_raw_fd() -> Option<RawFd>` (lib.rs:88-114, unix.rs:366-368);
-  `Child::{try_wait, wait, process_id}` (lib.rs:130-141) and Windows-only
-  `Child::as_raw_handle` (lib.rs:145). **`ProcessIdGetter` maps 1:1**:
-  unix `(master.as_raw_fd(), child.process_id())`; Windows
-  `(child.as_raw_handle(), child.process_id())`.
-- Spawn semantics match alacritty's: `libc::openpty` + `FD_CLOEXEC`
-  (unix.rs:22-46), `pre_exec` does signal reset + `sigprocmask` clear +
-  `setsid()` + `ioctl(0, TIOCSCTTY, 0)` (unix.rs:238-271); `CommandBuilder`
-  supports `env`/`env_remove`/`env_clear` and `cwd`
-  (cmdbuilder.rs:299,342). The unix `Child` is literally `std::process::Child`
-  (lib.rs:272-289), so `process_id()` is `child.id()`.
-- Child-exit observation: **no SIGCHLD handling; the caller reaps**
-  (unix.rs — no signal code; `Child::wait/try_wait` delegate to std). The
-  reader's `Read` impl maps `EIO → Ok(0)` so Linux slave-close surfaces as a
-  clean EOF (unix.rs read impl; confirmed in wezterm source,
-  <https://github.com/wezterm/wezterm/blob/main/pty/src/unix.rs>). Our reader
-  thread therefore reaps: on `Ok(0)` it calls `child.wait()` and emits
-  `ChildExit(status)` — replacing alacritty's signal-hook SIGCHLD pipe
-  (`tty/unix.rs:325-332,430-449`) with strictly less machinery. This also
-  subsumes alacritty's `drain_on_exit` (`tty/mod.rs` `Options`,
-  `alacritty.rs:168`): a blocking reader by construction drains every byte
-  until EOF before reporting exit.
-- Costs, acknowledged: blocking reader ⇒ a dedicated thread per terminal
-  (section 3.2 wants one anyway); `ChildKiller::kill()` sends SIGHUP on unix
-  (maintainers' deliberate choice) — irrelevant to Zed, whose kill paths
-  already use `libc::killpg(SIGKILL/SIGTERM)` directly
-  (`pty_info.rs:149-175`); slow release cadence (0.9.0 Feb 2025, but `pty/`
-  still actively patched — e.g. the Windows `kill()` fix merged 2026-06-07,
-  wezterm#7709) — acceptable given the crate is small enough to vendor or fork
-  if ever needed; unconditional `serial2` dep (already in the lock file).
+- **Exit rides the byte channel.** `pub(super) enum PtyOutput { Bytes(Vec<u8>), Event(TerminalBackendEvent) }` over `async_channel::bounded(OUTPUT_CHANNEL_BATCHES)` (v1 `pty.rs:52-65`): "Exit-sequence events travel on this channel — not a side channel — so they cannot overtake still-queued output bytes." The reader thread drains every byte, then `reap_child`, then sends `ChildExit → Exit → Wakeup` (`exit_event_sequence`, `:438-446`) — subsuming alacritty's `drain_on_exit` by construction. The separate `events_rx` (`PtyEvent`) channel carries only Zed-side pty events. **v1's doc had exit on the `PtyEvent` channel; the landed design is the correct one and v2 adopts it.**
+- **Reader** `terminal-pty-reader` (`:375-418`): `read()` up to 64 KiB, `send_blocking`; on receiver-gone keeps draining and still reaps; Linux slave-hangup `EIO` → EOF handled by portable-pty. **Writer** `terminal-pty-writer` (`:423-430`) drains an `async_channel::unbounded` (`:210`). **Shutdown** (`:127-136`): close input channel, `killer.lock().kill()`, reader drains/reaps/exits.
+- **Pump** (v1 `terminal.rs:1646-1681`, `TerminalBuilder::subscribe`): `futures::stream::select(output_rx, events_rx)`; on `Bytes`, one `terminal.update` calls `backend.write(&bytes)` then `try_recv`s up to `MAX_BATCHES_PER_TURN` more `Bytes` — breaking and processing inline on an `Event` so exit stays ordered — then `process_event(Wakeup)`, then `yield_now().await`. **No timer.** Today's upstream pump (`terminal.rs:1352-1414` on `main`) has a 4 ms coalescing window and a >100-event break because *events* cross the channel while bytes are parsed elsewhere; when the foreground parses bytes itself, the batch cap does that job.
+- **Ledger P4-005 (verbatim, accepted)**: "no timer. Each turn ingests up to `MAX_BATCHES_PER_TURN × READ_BATCH_SIZE` (4 × 64 KiB) then yields; each emulator-origin event gets its own update … the empirical validation open question 6 asked for is the P4 sustained-flood benchmark: 84.2 MiB/s through the seam, max per-turn foreground stall 2.2 ms (release), echo latency ≤ 623 µs mean 264 µs during flood; interactive rows re-verified on the `:99` harness. Coalescing knobs remain a post-removal tuning rider (SPEC.md §6) if a real regression appears." These numbers are carried as **`unverified` for v2** (salvage rule 4) and re-fire with the perf re-run under #37.
 
-**Option C — Zed-owned module from scratch**: everything portable-pty does,
-written and maintained by us, with no offsetting benefit at this stage. The
-thin wrapper module we write around portable-pty (the `alacritty.rs`
-replacement) *is* the Zed-owned seam; if portable-pty ever becomes a
-liability, only that wrapper's internals change. Rejected as a starting point,
-retained as the exit strategy.
+### 3.4 (4) `vt_write_until_ground` / continuation — batches are not split at ground; a mode-2026 gate is added
 
-### 3.2 D2 — Ownership: foreground-thread ownership, dedicated threads only for blocking I/O
+- **What `until_ground` does** (`terminal.h:2081-2111`; `src/terminal/c/terminal.zig:910-935` → `src/terminal/stream.zig:607-654`): consumes "only the shortest prefix needed to reach ground" (finishes a pending UTF-8 codepoint byte-by-byte, `stream.zig:641-647`, then `consumeUntilGround`, `:650-652`); at ground already → consumes 0; `NO_VALUE` if the whole slice was consumed without reaching ground. Cost "anywhere from 1% to 5% slower than nextSlice" (`stream.zig:617-620`) and the tail after ground is not fed. Its stated purpose (`a69a591af`, 2026-08-12) is to "let embedders safely interleave custom VT sequences from multiple sources … doing custom APC or something mid-stream". `DATA_VT_GROUND` (`terminal.h:1921-1933`) is the read-only probe.
+- **Why the plain pump is already safe at any boundary.** `nextSliceCapped` (`stream.zig:685-702`) begins *every* `vt_write` by draining pending UTF-8 → `consumeUntilGround` → `consumeAllEscapes` → SIMD scan to the next ESC; the `TerminalWrapper` keeps a persistent stream precisely "to handle escape sequences split across multiple vt_write calls" (`c/terminal.zig:97-100`). Screen state is mutated only on dispatch (CSI final byte, OSC/DCS/APC terminator, complete codepoint; DCS accumulates via `dcs_put` and applies at `dcs_unhook`, `stream.zig:109-111`); partial sequences live in parser buffers and touch no cell. `RenderState.beginUpdate` reads only `flags.dirty`/`screens.active.dirty` (`src/terminal/render.zig:373-400`), never parser state. Callbacks fire inside `vt_write` and are drained after it on the same thread, so no event is observable before its grid effect. **There is no parser-level torn-snapshot risk; splitting at ground would cost 1–5 % plus a non-SIMD tail per batch for nothing.** Zed injects nothing into the VT stream (Zed→terminal traffic goes to the PTY writer), so the interleaving use case has no consumer.
+- **Continuation** (`OPT_CONTINUATION_MAX_BYTES`, `terminal.h:1421-1439`; `continuation_write/buf/alloc`, `:2113-2190`): opt-in retention of "the exact byte suffix needed to reconstruct unfinished VT parser or UTF-8 decoder state"; disabled by default; adds `trackContinuation` per feed when on (`stream.zig:602-605`). Irrelevant to the pump; if #37 adopts snapshots as golden state it is read between writes on the same thread.
+- **The consistency mechanism that *does* need handling is DEC mode 2026.** Today alacritty's `vte` absorbs BSU/ESU inside the event loop (`event_loop.rs:166,229`: `sync_bytes_count`, `sync_timeout`), so Zed never sees a partial frame. In ghostty, 2026 is an ordinary mode (`src/terminal/modes.zig:327`); `src/terminal/render.zig` never checks it; ghostty's own renderer skips the frame while it is set (`src/renderer/generic.zig:1275-1278`: "If we're in a synchronized output state, we pause all rendering") and its IO thread arms a **1000 ms** watchdog that force-clears the mode (`src/termio/Thread.zig:38 sync_reset_ms = 1000`, `:378-390`; `stream_handler.zig:711-714`); resize also clears it (`Terminal.zig:3997,4047`). **D4**: after each pump turn read mode 2026 (`DATA_MODE`, `GhosttyTerminalModeConfig`); while set, skip `RenderState::update` and do not emit `Wakeup`; arm a GPUI foreground timer (1000 ms, ghostty's number; alacritty used 150 ms) that clears the mode via `OPT_MODE` and forces a snapshot. This is a gate on the snapshot step, not a change to batch size or boundary. (v1 §5.A.3 anticipated this via `Mode::SYNC_OUTPUT`; it is now a stated decision.)
+- **Borrowed-string lifetime.** `DATA_TITLE`/`DATA_PWD` are "valid until the next mutating terminal call" (`terminal.h:1659-1665,1671-1677`; tightened from "next vt_write/reset"). libghostty-rs's `title()`/`pwd()` return `&str` tied to `&self` (`terminal.rs:884-890`), so the borrow checker already forbids holding them across `vt_write(&mut self)`. D3 copies to an owned `String` inside the callback drain — satisfies both wordings.
 
-**The constraint surface.** libghostty-vt types are `!Send`/`!Sync` by design —
-"all `libghostty-vt` types are `!Send` … since the C API is allowed to use
-thread-local state; they are also `!Sync` … as the C API is not guarded with
-mutexes" (`crates/libghostty-vt/src/lib.rs:50-72`). The binding's own
-recommendation, verbatim (same passage): "in a complex program we encourage you
-to create the terminal on a separate thread (or task in async programming), and
-use channels to communicate … Under sufficient load, it is generally more
-efficient to offload terminal emulation to its own operating system-level
-thread." GPUI offers exactly two safe homes for a `!Send` value:
+### 3.5 (5) #52454 / #62504 reads under a foreground-owned core with no lock
 
-1. **The foreground thread.** `ForegroundExecutor::spawn` requires only
-   `Future + 'static` / `R: 'static` (`crates/gpui/src/executor.rs:314-317`;
-   the executor itself is `!Send` via `not_send: PhantomData`,
-   `executor.rs:285,305-309`), and **entities require only `T: 'static`**
-   (`crates/gpui/src/app/entity_map.rs:114-122,156,423`) — so the ghostty
-   `Terminal` can live as a plain field of the Zed `Terminal` entity.
-2. **A dedicated `std::thread`.** `BackgroundExecutor::spawn` demands
-   `Send` futures and outputs (`executor.rs:89-91`), so the shared pool is
-   out; but raw threads are established Zed practice
-   (`crates/fs/src/fs_watcher.rs:1115`, `crates/http_proxy/src/proxy.rs:184`,
-   `crates/gpui_linux/src/linux/platform.rs:1295` spawns a writer thread, and
-   alacritty's own loop was a named thread, `event_loop.rs:205-206`).
+Rule: every "read while `sync()` holds the lock" becomes "read on the foreground between `vt_write` batches". Pump and `sync()` share the foreground, so no `vt_write` can interleave with any read; only *which* boundary a read sits at matters.
 
-A third option — `Mutex` + `unsafe impl Send` wrapper, replicating ghostty's
-Zig architecture literally — is rejected outright: it asserts precisely the
-guarantee the binding authors refuse to make (thread-local state in the C API,
-`lib.rs:58-60`), and CLAUDE.md forbids unsafe workarounds without clear
-justification. If upstream ever certifies thread mobility, this can be
-revisited; until then it is unsound-by-contract.
+**What is read under the lock today** (`main` @ `38c5dd7c98`):
 
-**Why foreground ownership wins over a dedicated terminal thread.**
+| Read | Where | Under D2 |
+|---|---|---|
+| `term.history_size()` | `terminal.rs:1781,1792` — comment `:1790-1791`: "history_size must be read here since process_hyperlink cannot lock term (sync() already holds the lock)" | `GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS` (15, "total rows minus viewport rows", `terminal.h:1686-1691`). The constraint vanishes; `process_hyperlink` may read the getter itself (keep the parameter only to keep it pure for tests). |
+| `display_offset(term)` | `:1720,1771` | `GHOSTTY_TERMINAL_DATA_SCROLLBAR` (9) → `{total, offset, len}` (`terminal.h:1625-1635`); header: "poll this once per frame or per write batch and diff" — the `sync()` cadence. |
+| `make_content` (`alacritty.rs:882-931`): `total_lines`, `display_offset`, `columns`, `screen_lines`, `history_size`, cursor cell, `adjusted_last_hovered_word` | `:2342` | `TOTAL_ROWS` (14), `SCROLLBAR`, `COLS`/`ROWS` (1/2) or render-state `DATA_COLS/ROWS` (`render.h:146-149`); `grid_lines_change` from the `TOTAL_ROWS` delta + `SCROLLBAR.offset` between consecutive `sync()`s; `GHOSTTY_RENDER_STATE_DATA_DIRTY` (3, `render.h:152`) short-circuits `Unchanged`. |
+| `grid().cursor.point.line` + `history_size` | `write_input` on `\r` (`:2170-2176`) → `pending_cwd_boundary = scrollback_position(...)` **before** `write_to_pty`; fallback in `record_cwd_change` (`:2846-2849`) | `GHOSTTY_TERMINAL_DATA_CURSOR_Y` (4, "row position within the active area", `terminal.h:1584-1589`) + `SCROLLBACK_ROWS`. Terminal-level, not the render-state cursor (`render.h:300-343`, viewport-relative, may be absent). Same moment, same semantics, no lock. |
+| `used_lines` (`alacritty.rs:809-821`): `ALT_SCREEN`, `total_lines`, cursor line, `screen_lines`, `grid[Line(n)].is_clear()`, `history_size` | `terminal.rs:1910-1920`, consumed per frame by `terminal_view.rs:350-363` (embedded terminals) — three separate `lock_unfair()`s per frame today | `ACTIVE_SCREEN` (6), `TOTAL_ROWS`, `CURSOR_Y`, `ROWS`, `SCROLLBACK_ROWS`. **No row-level "empty" flag exists** (`GHOSTTY_ROW_DATA_*`: WRAP, WRAP_CONTINUATION, GRAPHEME, STYLED, HYPERLINK, SEMANTIC_PROMPT, KITTY_VIRTUAL_PLACEHOLDER, DIRTY — `screen.h:260-317`); implement `is_clear` as "no cell has `GHOSTTY_CELL_DATA_HAS_TEXT`" (`screen.h:175`) over `ROW_DATA_CELLS_RAW` (`render.h:249-265`), scanning bottom-up `ROWS-1 → CURSOR_Y+1` on a bottom-pinned view. Whether a styled-but-blank row counts is the `used_lines` parity-row call (#29, row "used_lines P"). Becomes a plain method call during render. |
+| `cursor_style().blinking`, `colors()[i]` | `:1602-1606`, `:1622-1634` | `DATA_CURSOR_STYLE` (10); `ColorRequest` disappears (ghostty answers OSC 4/10/11 internally; #29/#31). |
 
-*(a) The per-frame snapshot is already a foreground full copy — and the
-foreground already blocks on the parser today.* Zed renders from
-`last_content`, rebuilt every frame by `sync()` → `make_content`, which locks
-the FairMutex **on the foreground** and copies the entire visible grid
-(`terminal.rs:2262-2271`, `alacritty.rs:807-848`). Meanwhile alacritty's IO
-thread holds that same lock for up to `MAX_LOCKED_READ` = 64 KiB of parsing per
-acquisition (`event_loop.rs:27,160-162`), and will *force-block* the lock when
-1 MiB of unparsed bytes accumulate (`event_loop.rs:140-145`). So today's
-worst-case frame stall ≈ one 64 KiB parse *plus* a full-grid copy, arbitrated
-by a fair lock. Under foreground ownership the same 64 KiB parse budget is
-simply *scheduled* on the foreground instead of *contended for* — the total
-foreground work per frame does not increase; the lock-wait disappears; and the
-copy itself shrinks because `RenderState::update` is incremental/dirty-tracked
-(`render.rs:16-26,34-51`) rather than a from-scratch grid walk.
+**Where the cwd event comes from today, and the ordering hazard.** Zed does not use OSC 7: `record_cwd_change` is called only from `pty_info.rs:229` — an OS cwd poll spawned on `Wakeup` (`terminal.rs:1614-1620`). The row paired with a change is the `\r`-time capture or, as a fallback, "cursor line when the poll lands". So "record at the row where the OSC arrived" is not something Zed does today; a foreground-owned core is exactly as precise, and *more* precise becomes possible: if Zed later adopts ghostty's `pwd_changed`/`title_changed` callbacks (fire synchronously inside `vt_write`, `terminal.h:1006-1027`), the callback must snapshot `SCROLLBACK_ROWS + CURSOR_Y` **inside the callback** (getters are non-mutating; the terminal is quiescent during a callback) and push `(row, owned String)` onto the D3 queue — reading after `vt_write` returns would be off by whatever output followed the OSC in the batch. That is the one place where "read at the batch boundary" is insufficient; it belongs to the map's `CURSOR_AT_PROMPT`/OSC 133 fog, and #30 only fixes that the queue payload can carry a row captured in-callback.
 
-*(b) The two-phase `begin_update`/`end_update` API — the headline argument for
-an IO-thread split — is unusable across threads in safe Rust anyway.* The split
-exists "for callers that synchronize access to the terminal state … a caller
-can hold its lock for this call only and then call end_update after releasing
-it" (`render.rs:362-380`; identically `include/ghostty/vt/render.h:44-52,363-377`).
-But `RenderState` is itself `!Send`/`!Sync` (same `Object<NonNull>` wrapper, no
-`unsafe impl` anywhere in the crate), and `begin_update` takes `&Terminal`
-(`render.rs:381-390`) — so in safe Rust the terminal and the render state are
-pinned to the *same* thread, and reading the resulting `Snapshot` (which
-mutably borrows the `RenderState`, `render.rs:258`) happens there too. The
-lock-split superpower simply does not survive the binding. On a single owning
-thread the one-call `update()` is equivalent and simpler (`render.rs:352-360`).
-What crosses threads is the *materialized* `Content` — owned and `Send` —
-exactly as `make_content` produces today.
+**Eviction.** `cwd_at_line` gives up once `history_size >= scrolling_history` (`:2870-2874`). ghostty prunes at page granularity, first-reached of bytes/lines (recon 6/6 §3), so `SCROLLBACK_ROWS` can drop by a page's rows at once. Treat any non-monotonic decrease in `SCROLLBACK_ROWS` between reads as "cap reached" in addition to the `>= max_lines` guard. Routed to #29 row "cwd history P".
 
-*(c) The entity's synchronous API is the migration's biggest risk, and
-foreground ownership keeps it intact.* `Terminal` exposes dozens of
-lock-and-read/mutate methods used across terminal_view, tasks, and the agent:
-`sync()` drains `InternalEvent`s (resize/scroll/selection/vi/clear) against the
-live term (`terminal.rs:2262-2271`, handlers at `terminal.rs:1597-1700`),
-plus `total_lines`/`viewport_lines` (`terminal.rs:1842-1848`), `get_content`
-(`:2279-2282`), `last_n_non_empty_lines` (`:2284-2287`), `select_all`
-(`:1879-1884`), `with_renderable_cells` (`:2273-2277`), hyperlink hit-testing
-(`alacritty.rs:924-932`), search (`alacritty.rs:1009-1023`). With a dedicated
-thread, every one becomes an async round-trip or a stale mirror; drag-selection
-and scroll pick up a frame of latency (mouse event → channel → thread applies →
-snapshot returns → next frame). With foreground ownership the bodies change
-from `self.term.lock()` to plain `&mut self.ghostty_term` — a mechanical,
-incremental rewrite, which is what this migration plan demands.
+### 3.6 (6) Callback queue given the reply-style clipboard write and the new callbacks — re-confirmed, extended
 
-*(d) Flood behavior is solvable with the same mechanism ghostty uses — the
-kernel, not a mutex.* The failure mode to design for: `cat huge_file` while the
-user resizes. Ghostty bounds lock-hold and gather latency with 64 KiB batches
-("One batch is also the unit of work the parse stage does per terminal lock
-acquisition, so this bounds both gather latency and lock hold time",
-`Exec.zig:1289-1292`) and gets flow control from a 4-buffer ring that blocks
-the gather stage, letting "the kernel queue exert backpressure on the child"
-(`Exec.zig:1280-1287,1530-1535`). We adopt the same numbers with less
-machinery: reader thread → `async_channel::bounded(4)` of 64 KiB batches →
-foreground pump processes a bounded number of batches per turn and yields
-(today's pump already coalesces on a 4 ms timer, caps at 100 events, and
-`yield_now()`s between rounds — `terminal.rs:1324-1373` — the shape survives,
-carrying bytes instead of parsed events). At a conservative parse throughput,
-4 × 64 KiB per turn is well under a frame budget; if profiling disagrees, the
-per-turn cap is one constant. Crucially, ghostty's *entire*
-`lockDemand`/`yieldToDemand` starvation apparatus
-(`src/renderer/State.zig:36-66` — unfair mutexes let "a running thread that
-unlocks and immediately relocks beat a sleeping waiter every time … without
-this signal the renderer can starve for as long as the output lasts") is a fix
-for a problem the no-lock design cannot have.
+Full `Effects` vtable at `8867c37c5` (`src/terminal/c/terminal.zig:273-289`, fn types `:297-355`):
 
-*(e) The escape hatch is preserved by construction.* The reader delivers
-`Vec<u8>` over a channel and the writer consumes `Cow<'static, [u8]>` over a
-channel — identical seams whether the consumer is the foreground pump or a
-dedicated terminal thread that owns `Terminal + RenderState` and pushes
-`Content` snapshots. If real-world profiling shows parse jank the foreground
-caps can't fix, ownership moves behind the same channels (the
-binding-recommended architecture) without touching D1 or the PTY threads. The
-things that would need rework are exactly the synchronous entity methods —
-which is why we don't pay that cost speculatively.
+| Callback | Nature | D3 handling |
+|---|---|---|
+| `write_pty(term, ud, bytes, len)` | fire-and-forget; bytes borrowed for the call | copy → `PtyWrite` → writer channel (stream order preserved) |
+| `bell`, `title_changed`, `pwd_changed` | fire-and-forget; read `DATA_TITLE`/`DATA_PWD` in the callback | copy to `String` → `Title`/`Pwd` queue events |
+| `desktop_notification({title, body})` (`terminal.h:820-847`) | fire-and-forget; strings borrowed | new `DesktopNotification{title, body}` variant; no consumer — debug log until a product ticket |
+| `progress_report({state, progress})` (`:855-898`) | fire-and-forget | new `ProgressReport{state, progress}` variant; same |
+| `unknown_sequence({tag=APC, value})` (`:398-412,1478-1497`; needs `OPT_UNKNOWN_MAX_BYTES > 0`) | fire-and-forget | new `UnknownSequence{bytes, truncated}` variant; off by default (triage aid) |
+| `color_scheme(*out) -> bool`, `device_attributes(*out) -> bool` (copied to `da_features_buf`, `c/terminal.zig:291-296`), `size(*out) -> bool` (XTWINOPS + mode-2048 report), `enquiry`/`xtversion -> GhosttyString` ("memory must remain valid until the callback returns", `:312-319`) | **synchronous answer** | answered inline from `Rc<Cell<Size>>`, static strings, and the theme — all foreground-visible under D2 |
+| `clipboard_write(const GhosttyClipboardWrite*)` (`terminal.h:490-624`) | **synchronous reply via `write->reply`** | see below |
+| `clipboard_read(const GhosttyClipboardRead*)` (`:719-723,1516-1524`; "must be answered before the callback returns") | sync reply | left NULL (#29 policy = alacritty `OnlyCopy`) |
 
-**Resulting thread inventory per terminal:** foreground (owner) + 1 reader
-`std::thread` (blocked in `read()`; doubles as the child reaper) + 1 writer
-`std::thread` (blocked in channel-recv/`write()`; keeps a stalled child from
-ever blocking the UI on `write`, and its drop-EOF semantics
-(`unix.rs` `UnixMasterWriter::drop` sends `\n` + VEOF) handle shutdown).
-Alacritty used 1 thread + a poller; ghostty uses 4 + app. Two blocked threads
-per terminal is the cost of portable-pty's blocking API and is cheap (stack
-pages only).
+**Clipboard-write reply contract.** `GhosttyClipboardWrite {size, location, contents*, contents_len, name, granted, can_remember, ctx, reply}`; `GhosttyClipboardWriteReply {size, result, remember}`. `terminal.h:548-552`: "This must happen within the clipboard write request callback. This struct is only valid during that time. Calling `reply` more than once is safely ignored. Returning without replying denies the write." `:598-601`: "The embedder may ask for permission to write or perform the write async, but the callback itself is synchronous and the reply function must be called during the lifetime of this function. While this callback is active the VT stream is paused." The implementation confirms it: `ClipboardWriteCtx` and `request` are **stack locals** of `clipboardWriteTrampoline` (`c/terminal.zig:426-437`) and the reply trampoline dereferences that frame (`:441-455`) — replying after return or from another thread is a use-after-return. `result` only reaches protocols with an ack (OSC 5522); OSC 52 / OSC 1337 discard it (`:497-502`). **Consequence:** "async-style" means the *write* may be deferred, not the reply. Zed's policy is unconditional copy, so the callback copies each `contents[i]` into owned `Vec<u8>`, pushes `ClipboardStore{location, contents}` onto the queue, and calls `reply(SUCCESS, remember=false)` before returning. Queue shape unchanged; one added call.
 
-**Callback lifetimes under D2.** `Terminal<'alloc: 'cb, 'cb>` ties callbacks to
-the `'cb` parameter (`crates/libghostty-vt/src/terminal.rs:229-235`, trait
-bounds `FnMut(…) + 'cb` at `terminal.rs:1498-1510`). Storing the terminal in a
-`'static` entity forces `Terminal<'static, 'static>` — i.e. callbacks may
-capture only owned/`'static` data. That is not a constraint in practice: the
-binding's own guidance is interior-mutability handles ("use types that allow
-safe interior mutability … and pass a shared reference into each effect
-handler", `terminal.rs:81-93`), and `Rc` clones moved into each closure satisfy
-`'static` cleanly. No self-reference arises: the entity owns the `Rc`s and the
-terminal; the terminal's vtable owns clones; the callbacks never reference the
-entity itself.
+**Binding gap → #33.** libghostty-rs `de9fd9b` binds the *pre-reply* ABI: `ffi::ClipboardWrite` is `{size, location, contents, contents_len}` (`bindings.rs:2282-2295`) and `on_clipboard_write` returns `ffi::ClipboardWriteResult` (`terminal.rs:2037-2051`); against `8867c37c5` the C callback returns `void` and the struct has grown. `CLIPBOARD_READ` and `UNKNOWN_SEQUENCE` have no binding; `vt_write_until_ground`/`DATA_VT_GROUND` are unbound (`terminal.rs:301-303` binds `vt_write` only). The re-vendor must regenerate these; the safe wrapper should expose `ClipboardWrite::reply(self, …)` consuming the borrow so once-only-in-callback is enforced by the type system.
 
-### 3.3 D3 — Event flow: synchronous callbacks → foreground queue → existing `TerminalBackendEvent` handling
+**Queue invariants.** Every fire-and-forget callback borrows its payload only for the call → every queued event owns its data. No callback requires `Send`; none may re-enter `vt_write` → the drain runs after the write returns (as v1 did). `self.events: VecDeque<InternalEvent>` (Zed-side, drained by `sync()`) stays a plain field on `&mut self`; only the ghostty-callback queue needs `Rc<RefCell<…>>`, because the C callbacks run while `vt_write(&mut self)` holds the terminal borrow.
 
-Ghostty's model: "All callbacks are invoked synchronously during
-`vt_write`. Callbacks must be very careful to not block for too long"
-(`terminal.rs:77-79`). Under D2 the thread calling `vt_write` is the foreground
-thread, inside a `terminal.update(cx, …)` — so callbacks run where `cx` already
-lives. The mapping, per callback (registration macro at `terminal.rs:1404`,
-handlers at `terminal.rs:1533-1691`):
+### 3.7 (7) Windows — re-confirmed as landed; what hosted runners can and cannot prove
 
-| ghostty callback | fires when | maps to | mechanism |
-|---|---|---|---|
-| `on_pty_write` (`:1536-1547`) | DA/DSR/DECRQM responses | `TerminalBackendEvent::PtyWrite` → `write_to_pty` | push bytes into the `Rc<RefCell<VecDeque<…>>>` queue; drained FIFO immediately after `vt_write` returns |
-| `on_title_changed` (`:1588-1595`) | OSC 0/2 | `Title(String)` → breadcrumbs (`terminal.rs:1516-1531`) | callback copies `term.title()` (borrowed `&str` valid only until the next `vt_write`, `terminal.rs:617-623` — must be owned before queueing) |
-| `on_pwd_changed` (`:1602-1609`) | OSC 7 | new: feeds cwd tracking alongside `pty_info` | copy `term.pwd()` (`terminal.rs:630-636`), queue |
-| `on_bell` (`:1551-1558`) | BEL | `Bell` → `cx.emit(Event::Bell)` | queue |
-| `on_clipboard_write` (`:1678-1690`) | OSC 52 / OSC 1337 writes | `ClipboardStore(String)` → `cx.write_to_clipboard` | queue (copy contents; borrowed for callback duration only, `terminal.rs:1238-1244`); return `Ok(())` |
-| `on_size` (`:1613-1626`) | XTWINOPS 14/16/18 | replaces `TextAreaSizeRequest` | **must answer synchronously** (`-> Option<SizeReportSize>`): read an `Rc<Cell<TerminalBounds>>` the entity updates on every resize |
-| `on_color_scheme` (`:1633-1646`) | CSI ? 996 n | new (no alacritty equivalent) | answer from an `Rc<Cell<ColorScheme>>` mirroring the current theme |
-| `on_device_attributes` (`:1653-1666`) | CSI c / > c / = c | replaces vte's internal DA handling | answer with a `const` `DeviceAttributes` |
-| `on_xtversion`, `on_enquiry` (`:1574-1581,1562-1569`) | CSI > q / ENQ | new | static strings |
+**Design (v1 P4, carried).**
+- **Exit observation**: ConPTY reader EOF arrives only after `ClosePseudoConsole`, so EOF cannot signal exit. A `BackgroundExecutor` task (not a thread; `spawn_exit_poller`, v1 `pty.rs:493-533`) calls `try_wait` (`GetExitCodeProcess` vs `STILL_ACTIVE`, portable-pty `src/win/mod.rs:26-38,88-90`) every `EXIT_POLL_INTERVAL = 100 ms` under the shared child mutex; on exit it `take()`s the child so the reader's later `reap_child` returns `None`, and sends the exit sequence on the byte channel. A fixed timer is used instead of the `pty_info` refresh because that refresh is wakeup-driven and a silently exiting child produces no wakeups (`pty.rs:44-50`). `WaitForSingleObject` on `as_raw_handle` is the documented fallback.
+- **Closer thread**: `PtyHandle::Drop` hands the master to a detached `terminal-pty-closer` thread (`pty.rs:139-171`; commit `2425954382`): `ClosePseudoConsole` can block until output drains while the reader is blocked sending into the bounded channel whose only consumer is the dropping thread — the UI foreground in production. Inline-drop fallback if thread spawn fails (`1b452bb116`): "forgetting the master instead would leak the pseudoconsole and its conhost for the process lifetime, so a rare blocking close (spawn only fails under resource exhaustion) is the lesser evil."
+- **Kill**: `TerminateProcess` via the pinned `kill()` fix (§3.1).
 
-**Ordering is preserved for free.** Zed today has an explicit invariant that
-color-request responses must stay ordered relative to other PTY writes — "an
-application sending `OSC 11 ; ? ST` followed by `CSI c` … would receive the
-response to `CSI c` first" if handled out of band
-(`terminal.rs:1573-1585`). Under D3 every response-producing callback fires
-synchronously *in stream order* inside `vt_write`, and either answers inline
-(sync-return callbacks) or lands in one FIFO queue drained before the next
-`vt_write` — so responses enter the writer channel in exactly the order the
-queries arrived. This is strictly stronger than the current architecture, which
-relies on the single event channel plus careful handling.
+**Substrate constraint (#45, signed 2026-07-21, SPEC v1 §8.2).** On GitHub-hosted `windows-latest` (Server 2022), ConPTY sessions through portable-pty emit a ~20-byte preamble (`ESC[6n` …) and then starve: the child never executes, `STILL_ACTIVE` forever, shape varying per runner instance. Ruled out with commits: workflow YAML (`pty::` filter must be quoted), `core.longpaths` + `CARGO_NET_GIT_FETCH_WITH_CLI` (both mechanical fixes must be re-applied), MSVC quoting, test interleaving, cold start, gpui timers, null std handles, the in-box conhost (a sideloaded modern OpenConsole reproduced it). The no-GPUI control (run 29603970998) starved identically → substrate, not Zed code. Untried: `windows-2025` image; case-sorted environment block under `CREATE_UNICODE_ENVIRONMENT`.
 
-**What reaches the entity from other threads** stays on the existing
-`PtyEvent`/unbounded-channel path (`terminal.rs:743-745`, pump at
-`terminal.rs:1315-1377`): byte batches (new), `ChildExit(status)` from the
-reader thread after reaping, and `Exit` for abnormal teardown. `Wakeup` is no
-longer a channel event at all — the pump emits `cx.emit(Event::Wakeup)` itself
-after each round of `vt_write`s (it is already the foreground). Of the current
-`TerminalBackendEvent` variants (`terminal.rs:706-721`): `Wakeup`,
-`MouseCursorDirty`, `CursorBlinkingChange` become foreground-derived (the last
-from `Snapshot::cursor_blinking`, `render.rs:476-478`, compared frame-over-frame);
-`ClipboardLoad` has **no ghostty equivalent** — OSC 52 *reads* "are always
-ignored and never forwarded" (`terminal.rs:1676-1677`) — see Open questions;
-`ColorRequest` likely disappears into libghostty's internal color state
-(it owns default/override colors and answers queries via `on_pty_write`) —
-verification tracked in Open questions.
+**What P4-equivalent acceptance can be proven on GitHub-hosted runners:**
+- Windows compilation and clippy of the seam and `pty.rs`;
+- the `TerminateProcess → try_wait → exit sequence` path (the one ConPTY shape green in every run);
+- all non-PTY Class A/B unit tests;
+- weakly, that the closer thread does not hang the dropping thread (the 90-minute hang stopped after `2425954382`).
+
+**What cannot be proven there** — anything requiring the child to execute and emit bytes: spawn/echo, resize read-back, exit status of a normally exiting child, shutdown-without-EOF-wait with output in flight, kill mid-output, orphan checks. Therefore the P4 item "PTY suite green on Windows CI incl. ConPTY shutdown/exit/kill" is dischargeable only on a self-hosted Windows runner plus the §8.2 real-hardware smoke (pwsh echo, resize, one-shot task exit, the P4-001 `cmd.exe` quoting probe, close mid-output, quit with live terminals).
+
+**Upstream substrate at the v2 baseline**: every Windows job in upstream Zed CI (`run_tests.yml`, `run_bundling.yml`, `release*.yml`, `after_release.yml`; 11 occurrences) uses `self-32vcpu-windows-2022`; no hosted Windows runner exists upstream. That label resolves only in upstream's org — on the fork it queues forever unless a runner with that label is attached. **v2 keeps the amendment unchanged**: Linux PTY suite gating; fork's hosted Windows job advisory (`continue-on-error: true`, with the two mechanical fixes); Windows Class A/B + the three-test ConPTY suite bind on `self-32vcpu-windows-2022` (at upstreaming) and at the §8.2 gate (#40).
 
 ---
 
-## 4. How ghostty itself does it — and the mapping onto Zed's seam
+## 4. DisplayOnly / headless subprocess mapping (unchanged in substance, re-cited)
 
-Ghostty runs **four dedicated threads per surface** plus the app thread
-(`src/Surface.zig:715-728`, `src/termio/Exec.zig:139-144,1436-1440`):
-
-1. **renderer thread** (`src/renderer/Thread.zig`) — frame building;
-2. **termio writer thread** (`src/termio/Thread.zig`) — PTY *writes* and control
-   messages; its module doc states the split's purpose: "The goal is to offload
-   as much from the reader thread as possible since it is the hot path in
-   parsing VT sequences" (`Thread.zig:1-9`);
-3. **io-reader (parse) thread** — calls `io.processOutput(batch)`
-   (`Exec.zig:1469`), which locks and runs the VT stream
-   (`src/termio/Termio.zig:643-649`);
-4. **io-gather thread** — the `read()` syscalls, feeding a ring of **4 × 64 KiB**
-   buffers with condvar hand-off and kernel-queue backpressure
-   (`Exec.zig:1280-1292,1338-1384,1530-1535`; motivation: macOS caps each
-   master read at ~1 KiB, so a serial read/parse loop stalls producers,
-   `Exec.zig:1257-1266`).
-
-The `Terminal` is shared **by mutex, not by thread ownership**:
-`renderer_state.mutex` guards "the terminal, devmode, etc."
-(`src/renderer/State.zig:13-17`). Who locks: parse thread for one 64 KiB batch
-per acquisition (`Exec.zig:1289-1292`); writer thread briefly per control
-message (resize `Termio.zig:474-498` — note the ioctl happens *outside* the
-lock at `Termio.zig:472`, then "Enter the critical area that we want to keep
-small"); the app thread for short reads (key-encode options, selection). The
-renderer's frame snapshot is the C API's two-phase split in situ: `updateFrame`
-locks via `lockDemand`, runs `terminal_state.beginUpdate(state.terminal)`
-inside — "Work that doesn't require terminal access (e.g. style
-denormalization) is deferred to the endUpdate call outside of this critical
-section, keeping our lock hold time as short as possible"
-(`src/renderer/generic.zig:1173-1212`) — and `endUpdate` + link search + GPU
-cell building outside. Because unfair mutexes let the hot parse loop starve the
-renderer, ghostty adds an explicit demand/hand-off protocol
-(`State.zig:36-66`, parse thread yields between batches at
-`Exec.zig:1490-1493`). Events to the app go through mailboxes + an `xev.Async`
-wakeup, with an unlock-push-relock dance when a queue is full to avoid deadlock
-(`src/termio/stream_handler.zig:125-140`, `src/termio/mailbox.zig:61-95`).
-Child exit is an `xev.Process` watcher on the writer thread's loop
-(`Exec.zig:106-163,272-308`) — no SIGCHLD handler.
-
-**Mapping onto Zed.** Ghostty's architecture answers a question Zed doesn't
-have: how to share one terminal between *two non-UI hot loops* (parse thread,
-renderer thread). Zed has no renderer thread — GPUI's per-frame view pass *is*
-the foreground — so the mutex split would buy Zed nothing except the
-starvation problem it forces ghostty to hand-solve. What we take from ghostty
-is the load-bearing numerology and layering, relocated:
-
-| ghostty | Zed (this design) |
-|---|---|
-| io-gather thread + 4×64 KiB ring, kernel backpressure | reader `std::thread` + `bounded(4)` channel of 64 KiB batches |
-| io-reader thread parsing one batch per lock hold | foreground pump `vt_write`-ing a bounded number of batches per turn, then yielding |
-| writer thread (xev stream writes; "offload the hot path") | writer `std::thread` draining the input channel |
-| `renderer_state.mutex` + `lockDemand` fairness | *(no lock — single owner)* |
-| `beginUpdate` in-lock / `endUpdate` out-of-lock frame snapshot | single-call `RenderState::update` in `sync()` (`render.rs:352-360`) — the split is moot with one owner |
-| resize: ioctl outside lock, `terminal.resize` inside, 25 ms coalescing (`termio/Thread.zig:27-33,376-438`) | resize: `MasterPty::resize` + `terminal.resize` back-to-back in `sync()`; Zed already coalesces pending resizes (`terminal.rs:1966-1969`) |
-| surface mailbox + `rt_app.wakeup()` | callback queue drained in-update + `cx.emit` |
-| `xev.Process` exit watcher | reader thread reaps at EOF |
-
-**The seam file.** `crates/terminal/src/alacritty.rs` is replaced by a
-`ghostty.rs` sibling with the same private surface (`terminal.rs:63-73`
-imports): `open_pty` → portable-pty `openpty`+`spawn_command`;
-`spawn_event_loop` → spawn reader/writer threads, return a `PtySender`-shaped
-handle (`notify`/`resize`/`shutdown`, today `alacritty.rs:84-108`) where
-`notify` feeds the writer channel, `resize` calls `MasterPty::resize` and
-queues the terminal-side resize, `shutdown` closes the writer channel and kills
-the child to unblock the reader; `new_term` → `Terminal::new` + callback
-registration + `RenderState`/`RowIterator`/`CellIterator` construction;
-`make_content` → `RenderState::update` + row/cell iteration
-(`render.rs:189-246`) materializing the same `Content` struct. `Terminal`
-entity fields change: `term: Arc<AlacrittyTermLock>` + `output_processor`
-(`terminal.rs:1413-1415`) become the owned ghostty `Terminal`, `RenderState`,
-iterator handles, and the `Rc` callback-state handles. `ProcessIdGetter` gets
-`From<&PtyHandles>` impls mirroring `alacritty.rs:64-82`.
+- `TerminalBuilder::new_display_only` (`terminal.rs:937-1040`) + `Terminal::write_output` (`:1892-1908`) is **already a foreground parse** on the calling thread (`convert_lf_to_crlf` → lock → `Processor::advance` → `Wakeup`); under D2 it becomes `backend.write(&converted)` + the callback drain. `make_display_only_terminal()` tests (`:5705-5850`, the #52454 cwd tests) never parse bytes and carry over unchanged (Class B).
+- `spawn_task_subprocess` (`:3172-3270`) parses stdout and stderr with two `Processor`s under the lock from a background task — impossible with a `!Send` core. v2: both pipes feed the same bounded `PtyOutput::Bytes` channel; one parser on the foreground; inter-pipe ordering is already arbitrary today (independent lock holds), so nothing is lost. Exit detection stays a `try_status` poller (20 ms) on the background executor sending `ChildExit`/`Exit` as `PtyOutput::Event`. `SubprocessHandle` and `Drop for Terminal` (`:3157-3160`, `:3274-3276`) are unchanged.
 
 ---
 
-## 5. Interleaving walkthrough (no deadlock, no starvation)
+## 5. Feeds into other tickets
 
-All four scenarios share one invariant: **only the foreground touches the
-terminal, and every foreground turn is bounded**. There is no lock anywhere in
-the data path, so deadlock requires a channel cycle — and the only
-foreground-blocking channel operation is `events_rx.next().await` (async,
-yields). The reader may block on the bounded data channel (by design —
-backpressure) and the writer may block on `write()` (by design — a stalled
-child); neither is ever awaited-on synchronously by the foreground.
-
-**A. PTY output burst (`cat bigfile`).**
-1. Child writes; kernel PTY queue fills. Reader thread `read()`s 64 KiB,
-   `send_blocking`s into the bounded(4) channel, loops. After 4 unconsumed
-   batches it blocks → kernel queue fills → child's `write()` stalls
-   (ghostty's documented flow control, `Exec.zig:1530-1535`).
-2. The foreground pump task wakes, enters `terminal.update`, `vt_write`s up to
-   the per-turn batch cap; callbacks fire inline and queue events; queue is
-   drained (`process_event`); `cx.emit(Event::Wakeup)`; pump `yield_now()`s
-   (exactly the existing pump's coalesce-then-yield shape,
-   `terminal.rs:1324-1373`). Other foreground work (input, frames) interleaves
-   at each yield. Parse work per turn ≤ cap × 64 KiB — the same bound as
-   alacritty's `MAX_LOCKED_READ` hold that the foreground *already waits out
-   today* via the FairMutex (`event_loop.rs:27,140-162`).
-3. Synchronized-output mode (DEC 2026) short-circuits rendering, not parsing:
-   `Mode::SYNC_OUTPUT` is queryable (`terminal.rs:952` of the binding), and
-   `sync()` can skip snapshotting while it's set — mirroring ghostty's
-   check-inside-critical-section (`generic.zig:1179-1182`).
-
-**B. User types.**
-1. Key event → `Terminal::input()` on the foreground (`terminal.rs:1990-1994`)
-   → `write_to_pty` → non-blocking push into the writer channel
-   (`terminal.rs:1974-1988` keeps its shape; `PtySender::notify`,
-   `alacritty.rs:89-91`).
-2. Writer thread wakes, `write()`s to the master fd. If the child isn't
-   reading, the writer thread blocks — the UI does not (alacritty made the
-   same trade with its unbounded `write_list`, `event_loop.rs:328-331`).
-3. Echo comes back through scenario A. Because input never waits on the parse
-   path, typing stays responsive mid-flood; the per-turn cap guarantees the
-   pump yields to input handling.
-
-**C. User resizes (during a flood).**
-1. Element layout queues `InternalEvent::Resize`, coalescing with any pending
-   one (`terminal.rs:1966-1969`).
-2. Next frame, `sync()` (foreground) processes it: `MasterPty::resize(PtySize)`
-   — the TIOCSWINSZ ioctl, cheap and lock-free, same placement as ghostty's
-   outside-the-lock ioctl (`Termio.zig:472`) — then
-   `terminal.resize(cols, rows, cell_w_px, cell_h_px)` (`terminal.rs:329-346`
-   of the binding; it also disables synchronized output and sends the mode-2048
-   in-band report itself).
-3. Ordering vs. the flood: resize and `vt_write` are both foreground; they
-   serialize in whatever order the executor runs the frame and the pump —
-   no torn state is possible, and the child observes SIGWINCH after the ioctl
-   regardless of parse progress. Ghostty needs a 25 ms coalescing timer on a
-   separate thread for this (`termio/Thread.zig:27-33`); Zed's per-frame
-   `sync()` already coalesces naturally.
-
-**D. Frame renders.**
-1. `TerminalView` calls `sync(window, cx)`: drain `InternalEvent`s against the
-   owned terminal, then `RenderState::update(&terminal)` → `Snapshot` →
-   iterate rows/cells → fresh `Content` into `last_content`
-   (replacing `terminal.rs:2262-2271` + `alacritty.rs:807-848`).
-2. Cost: bounded by viewport size, *reduced* by dirty tracking
-   (`Dirty::Clean/Partial/Full` + per-row flags, `render.rs:34-51,443-447,626-638`)
-   even though phase 1 keeps full-`Content` semantics — a `Clean` frame can
-   return the previous `Content` untouched, an optimization
-   `make_content` could never make.
-3. No acquisition latency: today this step waits on the FairMutex behind a
-   ≤64 KiB parse; now it starts immediately. Worst case added wait: the pump
-   is mid-`vt_write` of one 64 KiB batch on the same thread — the identical
-   magnitude, minus lock overhead and minus the second grid copy.
-
----
-
-## 6. DisplayOnly / HeadlessTerminal mapping
-
-The non-PTY path gets *simpler*. Today `write_output` locks the shared term
-and runs the vte processor on the foreground (`terminal.rs:1829-1840`) — under
-D2 it becomes a direct `self.ghostty_term.vt_write(&converted)` plus the same
-callback-queue drain (note: the foreground already parses on this path today,
-which is further precedent for D2). The headless subprocess pump
-(`spawn_task_subprocess`, `terminal.rs:3012-3109`) currently parses stdout and
-stderr on *background* threads through two vte processors serialized by the
-FairMutex (`terminal.rs:3040-3072`) — that cannot survive (no lock, `!Send`
-terminal), and instead its pumps send raw byte chunks over the same
-bounded channel the PTY reader uses; the foreground pump `vt_write`s them.
-`TerminalType::DisplayOnly` (`terminal.rs:1399-1405`) keeps meaning "no
-`PtySender`, writes are no-ops" (`terminal.rs:1974-1988`); `HeadlessTerminal`
-gating (`terminal.rs:77-92`) is untouched. One semantic nit: the current code
-interleaves stdout/stderr at lock granularity; the channel serializes at batch
-granularity — same observable class of interleaving.
-
----
-
-## 7. Windows / ConPTY forward-compatibility
-
-Linux ships first; the design must merely not paint Windows into a corner. It
-doesn't:
-
-- **The PTY layer is already cross-platform.** portable-pty's ConPTY backend
-  (`src/win/{conpty,psuedocon,procthreadattr}.rs`) prefers a sideloaded
-  `conpty.dll`/`OpenConsole.exe` and falls back to kernel32
-  `CreatePseudoConsole` (`psuedocon.rs:34-90`); spawn uses
-  `EXTENDED_STARTUPINFO_PRESENT` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`.
-  `Child::as_raw_handle` + `process_id` feed `ProcessIdGetter` exactly as the
-  alacritty `child_watcher()` path does now (`alacritty.rs:71-82`,
-  `pty_info.rs:50-66`).
-- **The threading model is platform-agnostic.** Blocking pipe reader on the
-  reader thread mirrors both alacritty's Windows implementation (dedicated
-  blocking threads, `tty/windows/blocking.rs`) and ghostty's ("still is on
-  Windows" a serial read loop, `Exec.zig:1250-1252`). Nothing in D2/D3 assumes
-  unix fds.
-- **Known hazards to budget for at the Windows gate** (not blockers now):
-  EOF on the ConPTY output pipe only arrives once the pseudoconsole is closed —
-  shutdown must kill the child *and* drop the master (wezterm#1396; related
-  #4206, #463); `ChildKiller::kill()` on Windows was broken until wezterm#7709
-  (merged 2026-06-07, unreleased at 0.9.0) — Zed's own `pty_info` kill path
-  covers this; exit observation should use `try_wait` polling or
-  `WaitForSingleObject` on `as_raw_handle` rather than relying on reader EOF
-  ordering.
-
----
-
-## 8. Open questions (deferred to later tickets)
-
-1. **OSC 52 clipboard *read*** — libghostty ignores read requests entirely
-   (`terminal.rs:1676-1677`); Zed currently answers them via `ClipboardLoad`
-   (`terminal.rs:1539-1548`). Decide: accept the (security-motivated)
-   regression, or upstream a read callback.
-2. **OSC 4/10/11 color queries** — confirm libghostty answers `?` queries
-   internally from its color state via `on_pty_write` (its color model,
-   `terminal.rs:156-227`, suggests yes), which would retire
-   `TerminalBackendEvent::ColorRequest` and Zed's theme-fallback logic
-   (`terminal.rs:1573-1585`). Needs a quick conformance test.
-3. **Mode-change notifications** — no `on_mode_change` callback exists;
-   `CursorBlinkingChange`, `MouseCursorDirty`, and alternate-scroll defaults
-   must be derived per-frame from `Snapshot`/`Terminal::mode` diffs. Verify
-   cost is negligible.
-4. **Runtime scrollback reconfiguration** — `Options.max_scrollback` is
-   creation-time (`terminal.rs:239-246`); Zed changes it via settings
-   (`apply_config`, `alacritty.rs:149-151`). Recreate-and-replay vs. upstream
-   setter.
-5. **Selection / search / vi-mode / hyperlink mapping** onto ghostty's
-   selection & `grid_ref` APIs (separate wayfinder tickets); ditto
-   `append_text_to_term`'s replacement — plain `vt_write` of styled text should
-   eliminate that documented-unsafe hack (`alacritty.rs:972-1007`).
-6. **Tuning** — channel capacity (start at ghostty's 4) and per-turn batch cap
-   need empirical validation on Linux under `yes`/`cat`-flood with concurrent
-   typing; also whether interactive trickles need a ghostty-style
-   small-batch fast path (`bridge_threshold`, `Exec.zig:1296-1300`) or whether
-   the pump's existing 4 ms coalescing timer suffices.
-7. **`PtyEvent`/`TerminalBackendEvent` slimming** — several variants become
-   foreground-internal under D3; decide whether to keep the enum shape for the
-   incremental swap or slim it in the same PR.
+- **#33 (vendoring)**: regenerate bindings for the reply-style `ClipboardWrite` (`bindings.rs:2282-2295` is stale), bind `CLIPBOARD_READ`/`UNKNOWN_SEQUENCE`, `vt_write_until_ground`/`DATA_VT_GROUND` (unused by the pump; bind for completeness), `DATA_MODE`/`OPT_MODE` for the 2026 gate.
+- **#29 rows**: `used_lines` styled-blank semantics; cwd-history eviction guard (non-monotonic `SCROLLBACK_ROWS`).
+- **#36 (seam/phases)**: `pty.rs` salvaged by file; `TerminalBuilder::subscribe` hunk re-derived against the new `main` pump (`:1352-1414`) with the 2026 gate added; three new `TerminalBackendEvent` variants.
+- **#37 (verification)**: P4 flood/latency numbers re-fire as `unverified`; the Windows acceptance split above is the CI matrix input; a 2026 BSU/ESU conformance case (frame not snapshotted mid-BSU; watchdog fires at 1000 ms).
+- **#40 (gates)**: §8.2 constraint carried verbatim; `windows-2025` and the env-block ordering remain non-binding diagnostics.
+- **Map fog**: in-callback `(row, pwd)` capture for a future OSC 7/133 producer stays under the `CURSOR_AT_PROMPT` fog item.
