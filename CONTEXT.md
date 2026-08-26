@@ -15,3 +15,6 @@ Vocabulary shared by the migration map (`xipeng-jin/zed#27`) and the decision re
 - **Obsolete** — ledger status: invalidated by the re-charting reconnaissance before any re-firing; kept for the record, never re-fired.
 - **Verified** — ledger status: re-fired under v2 and re-adjudicated by the responsible ticket.
 - **Re-charting reconnaissance** — the delta surveys (comments 4/6–6/6 on the map) that replaced the charting-time surveys; where they conflict, the deltas win.
+- **Platform gate** — the per-platform acceptance list (macOS, Windows) that must be green before the Alacritty-removal phase may execute. Recorded in `docs/ghostty-migration/verification-strategy.md §9`.
+- **Binding evidence** — evidence a platform gate accepts toward discharge. Each gate item names who can produce its binding evidence (the fork, or upstream at upstreaming time).
+- **Advisory** — CI evidence that is diagnostic only and never binding, regardless of its result.

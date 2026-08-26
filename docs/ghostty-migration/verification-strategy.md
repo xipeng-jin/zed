@@ -169,22 +169,53 @@ checklist in the removal-phase PR description:
 
 ## 9. Platform gates (macOS, Windows)
 
-Decision record for [ticket #40](https://github.com/xipeng-jin/zed/issues/40). The bar is
-asymmetric by decision: **macOS runs the full Linux-grade program on real macOS hardware;
-Windows runs a reduced bar scoped to the PTY layer**, where all Windows-specific risk lives
-(the vt core is platform-independent and the Linux differential corpus vouches for it).
+Decision record for [ticket #40](https://github.com/xipeng-jin/zed/issues/40), **re-validated
+for v2 on 2026-08-26** (grilling session; the v1 text of 2026-07-15 plus the §8.2 amendment of
+2026-07-21 is the starting position). The bar is asymmetric by decision: **macOS runs the full
+Linux-grade program on real macOS hardware; Windows runs a reduced bar scoped to the PTY
+layer**, where all Windows-specific risk lives (the vt core is platform-independent and the
+Linux differential corpus vouches for it). Terms *platform gate*, *advisory*, and *binding
+evidence* are defined in `CONTEXT.md`.
+
+Sources for the v2 pass: ghostty `8867c37c5` (`src/build/GhosttyLibVt.zig:250-268`,
+`:340-420`, `src/build/LibsystemOverrideStep.zig`, commits `1fe1b2d23`, `84254a9d8`,
+`d65cb5128`); libghostty-rs `de9fd9b0fa` (`build.rs`, commits `bac73b9`, `1f135a3`); this
+fork's `.github/workflows/*` and `script/bundle-windows.ps1`; `Cargo.toml:741`
+(`portable-pty = "0.9.0"`); ticket #45's forensic record and remaining-work checklist;
+[pty-threading-architecture.md §3.7](pty-threading-architecture.md) and
+[artifact-pipeline.md §3.1](artifact-pipeline.md).
+
+### 9.0 What moved since v1 (re-validation table)
+
+| v1 item | v2 disposition |
+|---|---|
+| Asymmetric bar (macOS full, Windows PTY-scoped) | **Re-confirmed.** |
+| §8.2 amendment (hosted Windows runners advisory) | **Folded in from the start** (§9.2), with the substrate owner stated: the fork cannot run `self-32vcpu-windows-2022` (label resolves only in upstream's org — every Windows job on the fork uses it, so they never run here), so the self-hosted CI half is an **upstreaming-time** criterion and the fork's gate discharges on real-hardware evidence (§9.2.1). |
+| Deferred: msvc vs gnullvm | **Closed: msvc.** Zed's Windows bundles are `*-pc-windows-msvc` (`bundle-windows.ps1:47`); gnullvm would be a whole-Zed toolchain change, not a terminal decision, and the upstream fixes target msvc-static specifically. |
+| Deferred: `ghostty-vt-static.lib` naming | **Resolved upstream.** ghostty names the static archive `ghostty-vt-static.lib` (avoids the DLL import-lib collision); libghostty-rs `bac73b9` links `static=ghostty-vt-static` on `windows-msvc`. |
+| Deferred: ubsan-rt under MSVC | **Resolved upstream, asymmetry recorded.** `GhosttyLibVt.zig:250-268`: `bundle_ubsan_rt = false` on all Windows targets (LNK4229 `/exclude-symbols`), `stack_protector = false` on msvc static (no `BufferOverflowU` for consumers), `_fltused` exported (`lib_vt.zig`), `ntdll`+`kernel32` linked. Consequence: the Windows archive carries no ubsan runtime and no stack cookies while Linux/macOS archives bundle ubsan-rt — a debug-aid asymmetry, not a production defence, accepted. The only gate residue is that the artifact link smoke must be **warning-free** (§9.2.2) so an upstream regression of these fixes is caught. |
+| Windows aarch64 | **In scope of the Windows gate, artifact-only** (§9.2.2). The fork bundles `aarch64-pc-windows-msvc` (`run_bundling.yml` `bundle_windows_aarch64`, cross-target on the x86_64 runner); P10 deletes alacritty, so every bundled target needs a core. libghostty-rs `1f135a3` removed only its `windows-11-arm` CI job; `zig_target()` still maps the triple and the upstream fixes key on `abi == .msvc`, not arch. Runtime validation on ARM64 Windows is **not** required (no hardware) — recorded as a known gap. Supersedes artifact-pipeline.md §3.1's "x86_64 MSVC only". |
+| macOS program vs Apple linker changes | **Artifact only; program unchanged** (§9.1). Apple `ld` (`d65cb5128`, `initLibApple`) links only the **dylib**, which v2 never uses; `LibsystemOverrideStep` post-processes the **static archive** (memcpy/memmove/memset/libm rebound to libSystem) and needs Apple's `nmedit`, so a non-Darwin build silently ships the slower variant. `osVersionMinLibVt` changes only the iOS floor. |
+| portable-pty git pin | **Re-confirmed mandatory.** Still `0.9.0` at `Cargo.toml:741`; the inverted `kill()` is verified in [pty-threading-architecture.md §3.2](pty-threading-architecture.md). |
+| #45 remaining-work checklist | **Absorbed verbatim into §9.2.1** so the gate record is self-contained; #45 stays a frozen forensic record (map "Out of scope"). |
+| Blocking classification | **Both gates still block P10**, with the Windows CI half split out as upstreaming-time (§9.3). |
 
 ### 9.1 macOS gate — full program
 
 Every §8 criterion 1–8 re-run on a dedicated macOS machine, with these platform bindings:
 
 - **Perf baseline is macOS-local**: the alacritty baseline (§6) is re-recorded on the same
-  macOS machine before comparison; the 20%/no-cliff bar is unchanged. The §6 suite gains a
-  **sustained-flood scenario** (`yes`/`cat` of a large file, measuring total throughput and
-  input-echo latency during the flood) targeting the macOS ~1 KiB master-read cap; it also
-  runs on Linux, where it doubles as the channel/batch-tuning validation from the
-  architecture note's open question 6. Remediation for a failure is the reserved tuning
-  path (channel capacity, batch cap, dedicated-terminal-thread escape hatch), not redesign.
+  macOS machine before comparison; the 20%/no-cliff bar is unchanged. The sustained-flood
+  scenario (lands at P4 per the spec-lock amendment below; targets the macOS ~1 KiB
+  master-read cap, total throughput + input-echo latency during the flood) is **re-recorded**
+  on the macOS machine. Remediation for a failure is the reserved tuning path (channel
+  capacity, batch cap, dedicated-terminal-thread escape hatch), not redesign.
+- **[v2] Artifact under test is the Darwin-built static archive.** v2 links
+  `libghostty-vt-static.a`, never the dylib, so the Apple-`ld` change is irrelevant; but the
+  archive must have passed `LibsystemOverrideStep` (built on a Darwin runner, per
+  artifact-pipeline.md §3.1). A cross-built archive binds memcpy/libm to bundled compiler-rt
+  and is **disqualified as gate evidence** — the perf baseline and the soak run only on
+  override-applied artifacts. No variant comparison is part of the program.
 - **`/usr/bin/login` wrapper, ghostty behavior**: portable-pty does not wrap the shell in
   `login` (alacritty_terminal does today for `Shell::System`), so Zed's macOS spawn layer
   owns the wrapper — ported from **ghostty's** exec-layer behavior, not alacritty's, as a
@@ -198,39 +229,84 @@ Every §8 criterion 1–8 re-run on a dedicated macOS machine, with these platfo
   sessions per week (builds, agent-tool runs, debugger use, long build floods), zero
   unresolved P0/P1 terminal issues at exit, alacritty in-tree as rollback throughout. May
   run concurrently with the Linux soak.
+- **CI**: macOS Class A/B suites green on the fork's existing macOS CI
+  (`namespace-profile-mac-large`, `run_tests.yml`).
 
 ### 9.2 Windows gate — reduced bar
 
-1. **Windows CI suites green** on the existing `self-32vcpu-windows-2022` runner, including
-   the Class A/B dispositions of §4.
-2. **ConPTY PTY integration suite** (extends §5's PTY seam tests; runs on the Windows CI
-   runner) covering the two §7 hazards from the architecture note — ConPTY delivers EOF only
-   after the pseudoconsole is dropped, and child-exit observation must not depend on
+Target ABI is **msvc** (closed, §9.0). Evidence is split by who can produce it:
+
+#### 9.2.1 Binding on the fork (blocks P10)
+
+1. **Real-hardware manual smoke** on a real Windows machine, dev build (absorbed from #45):
+   - spawn the default shell (pwsh) and `cmd`, echo round-trip, typing-latency sanity;
+   - resize — the child's reported console size follows the pane;
+   - run a one-shot task and confirm the exit status surfaces;
+   - paste multi-line text;
+   - **P4-001 probe**: a `ShellKind::Cmd` task with spaced/quoted args (e.g.
+     `cmd /C echo "hello world"`) — portable-pty MSVC-quotes unconditionally and cmd.exe does
+     not parse backslash-escaped quotes; documented exit if it bites: raw-cmdline patch in the
+     portable-pty fork path;
+   - kill a hung process;
+   - close a terminal while the child is mid-output — verifies the detached
+     `ClosePseudoConsole` closer thread: no UI freeze, no orphaned conhost or child;
+   - quit Zed with live terminals open — no orphaned processes.
+2. **ConPTY PTY integration suite run locally on that hardware** (`cargo test -p terminal
+   --lib` on the Windows box; output attached to the gate record). The three tests extend §5's
+   PTY seam tests and cover the two §7 hazards from the architecture note — ConPTY delivers
+   EOF only after the pseudoconsole is dropped, and child-exit observation must not depend on
    reader-EOF ordering:
    - *Shutdown*: spawn `cmd.exe` through the seam, close the terminal; assert the child
      terminated, the reader thread joined within a timeout (no EOF-wait hang), and no
      orphaned `OpenConsole.exe`/conhost processes remain.
    - *Exit observation*: spawn a command exiting with a known code; assert the exit is
-     observed with the right code while the master is still open. Mechanism decision:
-     **`try_wait` polling on the existing `pty_info` cadence** (no new thread, matches the
-     current alacritty `child_watcher` approach); `WaitForSingleObject` on
-     `as_raw_handle()` is the documented fallback if polling latency ever bites.
+     observed with the right code while the master is still open. Mechanism: **`try_wait`
+     polling** every 100 ms on a background task (as landed in v1 P4;
+     pty-threading-architecture.md §3.7); `WaitForSingleObject` on `as_raw_handle()` is the
+     documented fallback if polling latency ever bites.
    - *Kill path*: kill a long-running child; assert termination and reader-thread join.
-3. **`ChildKiller::kill()` fix sourced by git pin**: portable-pty is pinned as a git
-   dependency to the wezterm-repo rev containing wezterm#7709 (merged 2026-06-07, absent
-   from the 0.9.0 crates.io release), matching the existing `alacritty_terminal` git-pin
-   precedent. Returning to a crates.io release once one ships is a post-removal follow-up,
-   not a gate.
-4. **Manual smoke checklist on real Windows hardware**: open the terminal in PowerShell and
-   `cmd`, run a task, resize, paste multi-line text, kill a hung process, close the terminal
-   while a child is running.
+   Windows Class A/B dispositions (§4) ride along on the same local run.
+3. **`ChildKiller::kill()` fix sourced by git pin**: portable-pty pinned to wezterm
+   `8afe0ad307` (wezterm#7709, absent from 0.9.0), matching the `alacritty_terminal` git-pin
+   precedent. Returning to a crates.io release once one ships is a post-removal follow-up.
+4. **Re-adjudicate ledger P4-001** (cmd.exe quoting) from the probe's outcome.
+
+#### 9.2.2 Binding on the fork, artifact-side (blocks P10)
+
+5. **Artifact matrix widened to `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`**,
+   both cross-compiled from the Linux runner (no host-only post-processing on Windows), inner
+   file `ghostty-vt-static.lib`. Smoke is **link-only** and must be **warning-free** (no
+   LNK4229, no unresolved `BufferOverflowU`/`_fltused`/`Nt*` symbols) — this is the
+   verification that upstream's msvc-static fixes still hold. aarch64 gets no runtime
+   evidence (known gap: no ARM64 Windows hardware); it is in the matrix because the fork
+   bundles it and P10 removes the fallback core.
+
+#### 9.2.3 Binding at upstreaming (does not block P10 on the fork)
+
+6. **Windows CI green on upstream's self-hosted runners** (`self-32vcpu-windows-2022`):
+   Class A/B + the three-test ConPTY suite, i.e. v1's `pty_integration.yml` Windows job
+   re-pointed at that label with `continue-on-error` dropped, carrying the two mechanical
+   fixes (quoted `pty::` filter; `core.longpaths` + `CARGO_NET_GIT_FETCH_WITH_CLI`).
+
+**Advisory, never binding**: the fork's GitHub-hosted Windows job (`continue-on-error:
+true`). Hosted `windows-latest` starves ConPTY below the seam in bare portable-pty (#45,
+run 29603970998, no-GPUI control) and proves only compile/clippy and the
+`TerminateProcess → try_wait` path (pty-threading-architecture.md §3.7). Non-binding
+diagnostics if anyone rehabilitates hosted runners: the `windows-2025` image and
+portable-pty's case-sorted environment block under `CREATE_UNICODE_ENVIRONMENT`.
 
 ### 9.3 Blocking classification
 
-All §9.1 and §9.2 items **block the removal phase**. Explicitly riding after removal:
-migrating portable-pty from the git pin back to a crates.io release, and any channel/batch
-tuning beyond the perf bar (including activating the dedicated-terminal-thread escape
-hatch), which happens only if a real regression appears.
+**Both gates block P10.** On the fork that means: all of §9.1, and §9.2.1 + §9.2.2 — alacritty
+is the rollback, and removing it before any Windows runtime evidence exists would leave
+Windows users with no fallback. §9.2.3 (self-hosted Windows CI) binds at upstreaming, not at
+P10; it is the honest statement of what the fork can produce, not a relaxation of the bar.
+The two soaks may overlap and the Windows items may complete during them.
+
+Explicitly riding after removal: migrating portable-pty from the git pin back to a crates.io
+release; any channel/batch tuning beyond the perf bar (including activating the
+dedicated-terminal-thread escape hatch), which happens only if a real regression appears;
+runtime validation on ARM64 Windows if hardware ever becomes available.
 
 ## Amendment (spec lock, 2026-07-16)
 
