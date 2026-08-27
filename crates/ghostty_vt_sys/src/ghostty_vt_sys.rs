@@ -1,0 +1,76 @@
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(clippy::all)]
+#![allow(rustdoc::all)]
+
+mod bindings;
+
+use std::ops::Deref;
+
+pub use bindings::*;
+
+/// Initialize a "sized" FFI object.
+#[macro_export]
+macro_rules! sized {
+    ($ty:ty) => {{
+        let mut t = <$ty as ::std::default::Default>::default();
+        t.size = ::std::mem::size_of::<$ty>();
+        t
+    }};
+}
+
+impl<S> From<S> for bindings::String
+where
+    S: Deref<Target = str>,
+{
+    fn from(value: S) -> Self {
+        Self {
+            ptr: value.as_ptr(),
+            len: value.len(),
+        }
+    }
+}
+
+impl bindings::String {
+    /// # Safety
+    ///
+    /// The caller must uphold that the associated lifetime is valid
+    /// with the given context behind the FFI string, and that it contains
+    /// valid UTF-8 data.
+    pub unsafe fn to_str<'a>(self) -> &'a str {
+        // SAFETY: To be upheld by caller
+        let slice = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
+        unsafe { std::str::from_utf8_unchecked(slice) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bindings;
+
+    #[test]
+    fn sized_macro_sets_the_size_field() {
+        let colors = crate::sized!(bindings::RenderStateColors);
+        assert_eq!(
+            colors.size,
+            std::mem::size_of::<bindings::RenderStateColors>()
+        );
+    }
+
+    #[test]
+    fn ffi_string_round_trips_static_str() {
+        let raw = bindings::String::from("ghostty");
+        assert_eq!(raw.len, "ghostty".len());
+        // SAFETY: The source string is `'static` and valid UTF-8.
+        assert_eq!(unsafe { raw.to_str() }, "ghostty");
+    }
+
+    #[test]
+    fn ffi_string_round_trips_borrowed_string() {
+        let owned = String::from("terminal");
+        let raw = bindings::String::from(owned.as_str());
+        // SAFETY: `owned` outlives the conversion and contains valid UTF-8.
+        assert_eq!(unsafe { raw.to_str() }, "terminal");
+    }
+}

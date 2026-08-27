@@ -82,6 +82,8 @@ members = [
     "crates/fs_benchmarks",
     "crates/fuzzy",
     "crates/fuzzy_nucleo",
+    "crates/ghostty_vt",
+    "crates/ghostty_vt_sys",
     "crates/git",
     "crates/git_hosting_providers",
     "crates/git_ui",
@@ -348,6 +350,8 @@ file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
+ghostty_vt = { path = "crates/ghostty_vt" }
+ghostty_vt_sys = { path = "crates/ghostty_vt_sys" }
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
@@ -655,6 +659,7 @@ image = { version = "0.25.1", default-features = false, features = [
 imara-diff = "0.2.0"
 indexmap = { version = "2.7.0", features = ["serde"] }
 indoc = "2"
+int-enum = "1.2.0"
 inventory = "0.3.19"
 itertools = "0.14.0"
 js-sys = "0.3"

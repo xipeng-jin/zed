@@ -1,0 +1,34 @@
+[package]
+name = "ghostty_vt_sys"
+version = "0.1.0"
+description = "Raw FFI bindings for libghostty-vt, the Ghostty terminal emulation library"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+links = "ghostty-vt"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ghostty_vt_sys.rs"
+doctest = false
+
+[features]
+kitty-graphics = []
+bindgen-tool = ["dep:bindgen", "dep:libc", "dep:heck", "dep:sha2"]
+
+[dependencies]
+bindgen = { version = "0.72.1", optional = true }
+libc = { workspace = true, optional = true }
+heck = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[build-dependencies]
+sha2.workspace = true
+
+[[bin]]
+name = "gen-bindings"
+path = "tools/gen_bindings.rs"
+required-features = ["bindgen-tool"]
