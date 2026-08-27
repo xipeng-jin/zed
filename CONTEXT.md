@@ -18,3 +18,5 @@ Vocabulary shared by the migration map (`xipeng-jin/zed#27`) and the decision re
 - **Platform gate** — the per-platform acceptance list (macOS, Windows) that must be green before the Alacritty-removal phase may execute. Recorded in `docs/ghostty-migration/verification-strategy.md §9`.
 - **Binding evidence** — evidence a platform gate accepts toward discharge. Each gate item names who can produce its binding evidence (the fork, or upstream at upstreaming time).
 - **Advisory** — CI evidence that is diagnostic only and never binding, regardless of its result.
+- **Logical line** — one or more grid rows joined across soft wraps up to a hard newline. The unit search and hover operate on: a match never crosses a hard newline and always sees a soft wrap as no boundary.
+- **Cache-retrofit gate** — the measured foreground extraction cost above which the stateless search design is replaced by a snapshot-keyed extraction cache. Thresholds live in `docs/ghostty-migration/search-and-hyperlinks.md §1.2`.
