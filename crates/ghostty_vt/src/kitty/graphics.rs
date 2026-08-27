@@ -823,7 +823,7 @@ pub struct SourceRect {
 
 /// Z-layer classification for kitty graphics placements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum Layer {
     /// Match all placements; apply no filtering (default behavior).
     #[default]
@@ -840,7 +840,7 @@ pub enum Layer {
 /// Pixel format of a Kitty graphics image.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, int_enum::IntEnum)]
 #[non_exhaustive]
-#[repr(u32)]
+#[repr(i32)]
 #[expect(missing_docs, reason = "missing upstream docs")]
 pub enum ImageFormat {
     #[default]
@@ -854,7 +854,7 @@ pub enum ImageFormat {
 /// Compression of a Kitty graphics image.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, int_enum::IntEnum)]
 #[non_exhaustive]
-#[repr(u32)]
+#[repr(i32)]
 #[expect(missing_docs, reason = "missing upstream docs")]
 pub enum Compression {
     #[default]

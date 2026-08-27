@@ -229,7 +229,7 @@ pub struct Terminal<'alloc: 'cb, 'cb> {
 }
 
 /// Default visual style used when the cursor style is reset.
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
 #[non_exhaustive]
 pub enum CursorStyle {
@@ -802,6 +802,30 @@ impl<'alloc: 'cb, 'cb> Terminal<'alloc, 'cb> {
         self.set_optional(Opt::SCROLLBACK_MAX_LINES, v.as_ref())?;
         Ok(self)
     }
+    /// Set the maximum content bytes retained for each unsupported terminal
+    /// sequence. Zero (the default) disables capture; the raw
+    /// `GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE` callback is not wrapped here.
+    pub fn set_unknown_max_bytes(&mut self, v: usize) -> Result<&mut Self> {
+        self.set(Opt::UNKNOWN_MAX_BYTES, &v)?;
+        Ok(self)
+    }
+    /// Set the name of the terminfo entry this terminal runs as, reported in
+    /// response to an XTGETTCAP query for `TN` (e.g. `xterm-256color`).
+    ///
+    /// The string is copied into the terminal. `None` clears the name; a
+    /// name longer than 128 bytes returns [`Error::InvalidValue`].
+    pub fn set_terminfo_name(&mut self, name: Option<&str>) -> Result<&mut Self> {
+        let name = name.map(ffi::String::from);
+        self.set_optional(Opt::TERMINFO_NAME, name.as_ref())?;
+        Ok(self)
+    }
+    /// Set the maximum decoded bytes per Kitty clipboard protocol (OSC 5522)
+    /// write transaction. `None` reverts to the built-in 64 MiB default;
+    /// `usize::MAX` removes the limit.
+    pub fn set_clipboard_write_max_bytes(&mut self, v: Option<usize>) -> Result<&mut Self> {
+        self.set_optional(Opt::CLIPBOARD_WRITE_MAX_BYTES, v.as_ref())?;
+        Ok(self)
+    }
 
     /// Get the cursor column position (0-indexed).
     pub fn cursor_x(&self) -> Result<u16> {
@@ -875,6 +899,23 @@ impl<'alloc: 'cb, 'cb> Terminal<'alloc, 'cb> {
     /// failures limited to external effects or query responses do not set it.
     pub fn vt_processing_error(&self) -> Result<bool> {
         self.get(Data::VT_PROCESSING_ERROR)
+    }
+    /// Whether VT processing is at ground, i.e. not in the middle of any
+    /// UTF-8, ESC, CSI, or OSC sequence. At ground it is safe to insert
+    /// out-of-band VT sequences.
+    pub fn is_vt_ground(&self) -> Result<bool> {
+        self.get(Data::VT_GROUND)
+    }
+    /// Whether the cursor is currently at a semantic shell prompt or input
+    /// area (OSC 133). False when no semantic prompt information is
+    /// available or the alternate screen is active.
+    pub fn is_cursor_at_prompt(&self) -> Result<bool> {
+        self.get(Data::CURSOR_AT_PROMPT)
+    }
+    /// The configured maximum decoded bytes per Kitty clipboard protocol
+    /// write transaction; see [`Terminal::set_clipboard_write_max_bytes`].
+    pub fn clipboard_write_max_bytes(&self) -> Result<usize> {
+        self.get(Data::CLIPBOARD_WRITE_MAX_BYTES)
     }
     /// Get the terminal title as set by escape sequences (e.g. OSC 0/2).
     ///
@@ -1438,7 +1479,7 @@ impl From<TertiaryDeviceAttributes> for ffi::DeviceAttributesTertiary {
 
 /// Color scheme reported in response to a CSI ? 996 n query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(i32)]
 #[expect(missing_docs, reason = "self-explanatory")]
 pub enum ColorScheme {
     Light = ffi::ColorScheme::LIGHT,
@@ -1484,7 +1525,7 @@ impl From<ColorScheme> for ffi::ColorScheme::Type {
 
 /// Amount of compression work to perform before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum CompressionMode {
     /// Perform one bounded compression step suitable for idle scheduling.
     Incremental = ffi::TerminalCompressionMode::INCREMENTAL,
@@ -1494,7 +1535,7 @@ pub enum CompressionMode {
 
 /// Scheduling result from terminal compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum CompressionResult {
     /// Retained-mapping reclamation is unavailable on this target.
     Unsupported = ffi::TerminalCompressionResult::UNSUPPORTED,
@@ -1551,6 +1592,171 @@ impl<'t> ClipboardWrite<'t> {
             std::slice::from_raw_parts((*self.ptr).contents, (*self.ptr).contents_len).iter()
         })
     }
+    /// Name of the writing program for permission prompts, if the protocol
+    /// carries one; empty otherwise.
+    pub fn name(&self) -> &'t str {
+        // SAFETY: We trust libghostty to give us a valid borrowed string
+        // within the lifetime of the callback.
+        unsafe { (*self.ptr).name.to_str() }
+    }
+    /// Whether the terminal already holds a session grant for this request.
+    /// The embedder should skip any permission prompt and perform the write.
+    pub fn granted(&self) -> bool {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { (*self.ptr).granted }
+    }
+    /// Whether the program supplied a session password, so the embedder may
+    /// offer to remember the user's decision via
+    /// [`ClipboardWriteReply::remember`].
+    pub fn can_remember(&self) -> bool {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { (*self.ptr).can_remember }
+    }
+
+    /// Answer the request. libghostty ignores everything after the first
+    /// reply, and a request that returns without a reply is denied.
+    ///
+    /// # Safety
+    ///
+    /// `self.ptr` must still be the borrowed request of the running callback.
+    unsafe fn reply(&self, result: ffi::ClipboardWriteResult::Type, remember: bool) {
+        let mut reply = ffi::sized!(ffi::ClipboardWriteReply);
+        reply.result = result;
+        reply.remember = remember;
+        // SAFETY: Upheld by caller; the reply is borrowed only for this call.
+        unsafe {
+            if let Some(reply_fn) = (*self.ptr).reply {
+                reply_fn(self.ptr, &raw const reply);
+            }
+        }
+    }
+}
+
+/// A successful answer to a clipboard write request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardWriteReply {
+    /// Record a session grant so future requests from the same program skip
+    /// the permission prompt. Only honored when
+    /// [`ClipboardWrite::can_remember`] is set.
+    pub remember: bool,
+}
+
+/// A synchronous request to read clipboard contents (OSC 52 `?` or a Kitty
+/// clipboard protocol read).
+///
+/// The request and every string it borrows are valid only for the callback
+/// duration.
+#[derive(Clone, Debug)]
+pub struct ClipboardRead<'t> {
+    ptr: *const ffi::ClipboardRead,
+    _phan: PhantomData<&'t ()>,
+}
+
+impl<'t> ClipboardRead<'t> {
+    /// # Safety
+    ///
+    /// Caller must ensure that the given pointer has the correct lifetime.
+    unsafe fn from_raw(ptr: *const ffi::ClipboardRead) -> Self {
+        Self {
+            ptr,
+            _phan: PhantomData,
+        }
+    }
+
+    /// Get the clipboard to read.
+    pub fn location(&self) -> ClipboardLocation {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { *self.ptr }
+            .location
+            .try_into()
+            .unwrap_or(ClipboardLocation::Standard)
+    }
+    /// The MIME types the program wants, in order of preference. Protocols
+    /// that only carry text (OSC 52) request `text/plain`. Empty when the
+    /// program only wants the list of available types.
+    pub fn mimes(&self) -> impl ExactSizeIterator<Item = &'t str> + use<'t> {
+        // SAFETY: We trust libghostty to give us a valid pointer and length
+        // within the lifetime of the callback; strings are borrowed for the
+        // same duration.
+        unsafe { std::slice::from_raw_parts((*self.ptr).mimes, (*self.ptr).mimes_len) }
+            .iter()
+            .map(|mime| unsafe { mime.to_str() })
+    }
+    /// Whether the program also wants the list of MIME types available on
+    /// the clipboard, delivered through [`ClipboardReadReply::available`].
+    pub fn list(&self) -> bool {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { (*self.ptr).list }
+    }
+    /// Name of the requesting program for permission prompts, if the
+    /// protocol carries one; empty otherwise.
+    pub fn name(&self) -> &'t str {
+        // SAFETY: Valid borrowed string for the lifetime of the callback.
+        unsafe { (*self.ptr).name.to_str() }
+    }
+    /// Whether the terminal already holds a session grant for this request.
+    pub fn granted(&self) -> bool {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { (*self.ptr).granted }
+    }
+    /// Whether the program supplied a session password, so the embedder may
+    /// offer to remember the user's decision via
+    /// [`ClipboardReadReply::remember`].
+    pub fn can_remember(&self) -> bool {
+        // SAFETY: Valid pointer for the lifetime of the callback.
+        unsafe { (*self.ptr).can_remember }
+    }
+
+    /// Answer the request; see [`ClipboardWrite::reply`].
+    ///
+    /// # Safety
+    ///
+    /// `self.ptr` must still be the borrowed request of the running callback.
+    unsafe fn reply(&self, reply: &ffi::ClipboardReadReply) {
+        // SAFETY: Upheld by caller; the reply is borrowed only for this call.
+        unsafe {
+            if let Some(reply_fn) = (*self.ptr).reply {
+                reply_fn(self.ptr, std::ptr::from_ref(reply));
+            }
+        }
+    }
+}
+
+/// One owned MIME representation in a clipboard read reply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardReadContent {
+    /// MIME type of the representation.
+    pub mime: String,
+    /// Binary-safe representation data.
+    pub data: String,
+}
+
+/// A successful answer to a clipboard read request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardReadReply {
+    /// The clipboard contents, one entry per MIME representation.
+    pub contents: Vec<ClipboardReadContent>,
+    /// All MIME types available on the clipboard. Only consulted when
+    /// [`ClipboardRead::list`] is set.
+    pub available: Vec<String>,
+    /// Record a session grant so future requests from the same program skip
+    /// the permission prompt. Only honored when
+    /// [`ClipboardRead::can_remember`] is set.
+    pub remember: bool,
+}
+
+/// Possible errors caused by a clipboard read callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
+#[repr(i32)]
+pub enum ClipboardReadError {
+    /// The clipboard read was denied by policy or the user.
+    Denied = ffi::ClipboardReadResult::DENIED,
+    /// The clipboard or the requested representations are unsupported.
+    Unsupported = ffi::ClipboardReadResult::UNSUPPORTED,
+    /// The clipboard is temporarily unavailable.
+    Busy = ffi::ClipboardReadResult::BUSY,
+    /// The clipboard read failed due to an I/O error.
+    IoError = ffi::ClipboardReadResult::IO_ERROR,
 }
 
 /// An iterator into a borrowed array of MIME representations.
@@ -1612,7 +1818,7 @@ impl<'t> ClipboardContent<'t> {
 /// Protocol-specific destination identifiers are normalized to these values
 /// before the clipboard write callback is invoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum ClipboardLocation {
     /// The standard system clipboard.
     Standard = ffi::ClipboardLocation::STANDARD,
@@ -1627,7 +1833,7 @@ pub enum ClipboardLocation {
 /// Protocols without write acknowledgements, including OSC 52 and iTerm2
 /// OSC 1337 Copy, ignore this result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 pub enum ClipboardWriteError {
     /// The clipboard write was denied by policy or the user.
     Denied = ffi::ClipboardWriteResult::DENIED,
@@ -1706,7 +1912,7 @@ impl<'t> ProgressReport<'t> {
 
 /// State of a terminal progress report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 #[non_exhaustive]
 pub enum ProgressState {
     /// Remove any visible progress indication.
@@ -2032,19 +2238,76 @@ handlers! {
     /// invoked. OSC 52 and iTerm2 OSC 1337 Copy writes therefore use the same
     /// callback shape.
     ///
-    /// OSC 52 clipboard read requests (\"?\") are always ignored and never
-    /// forwarded to this callback.
+    /// OSC 52 clipboard read requests (\"?\") go to
+    /// [`Terminal::on_clipboard_read`] instead.
+    ///
+    /// The request is answered synchronously from the callback's return
+    /// value; libghostty denies a write that is not answered.
     pub fn on_clipboard_write(
         &mut self,
         tag = CLIPBOARD_WRITE,
         from = GhosttyTerminalClipboardWriteFn(
             write: *const ffi::ClipboardWrite
-        ) -> ffi::ClipboardWriteResult::Type,
-        to = <'t>ClipboardWriteFn(ClipboardWrite<'t>) -> std::result::Result<(), ClipboardWriteError>,
+        ),
+        to = <'t>ClipboardWriteFn(ClipboardWrite<'t>) -> std::result::Result<ClipboardWriteReply, ClipboardWriteError>,
     ) |term, func| {
-        match func(&term, unsafe { ClipboardWrite::from_raw(write) }) {
-            Ok(_) => ffi::ClipboardWriteResult::SUCCESS,
-            Err(e) => e.into()
+        let request = unsafe { ClipboardWrite::from_raw(write) };
+        let (result, remember) = match func(&term, request.clone()) {
+            Ok(reply) => (ffi::ClipboardWriteResult::SUCCESS, reply.remember),
+            Err(e) => (e.into(), false),
+        };
+        // SAFETY: `write` is the borrowed request of this very callback.
+        unsafe { request.reply(result, remember) };
+    }
+
+    /// Call the given function when the running program requests clipboard
+    /// contents via OSC 52 with a `?` payload or a Kitty clipboard protocol
+    /// (OSC 5522) read.
+    ///
+    /// The request is answered synchronously from the callback's return
+    /// value. Without a handler, OSC 52 reads are ignored and OSC 5522 reads
+    /// are refused with EPERM.
+    pub fn on_clipboard_read(
+        &mut self,
+        tag = CLIPBOARD_READ,
+        from = GhosttyTerminalClipboardReadFn(
+            read: *const ffi::ClipboardRead
+        ),
+        to = <'t>ClipboardReadFn(ClipboardRead<'t>) -> std::result::Result<ClipboardReadReply, ClipboardReadError>,
+    ) |term, func| {
+        let request = unsafe { ClipboardRead::from_raw(read) };
+        let mut reply = ffi::sized!(ffi::ClipboardReadReply);
+        match func(&term, request.clone()) {
+            Ok(answer) => {
+                // The ffi views borrow `answer`, which outlives the reply call.
+                let contents: Vec<ffi::ClipboardContent> = answer
+                    .contents
+                    .iter()
+                    .map(|content| ffi::ClipboardContent {
+                        mime: ffi::String::from(content.mime.as_str()),
+                        data: ffi::String::from(content.data.as_str()),
+                    })
+                    .collect();
+                let available: Vec<ffi::String> = answer
+                    .available
+                    .iter()
+                    .map(|mime| ffi::String::from(mime.as_str()))
+                    .collect();
+                reply.result = ffi::ClipboardReadResult::SUCCESS;
+                reply.contents = contents.as_ptr();
+                reply.contents_len = contents.len();
+                reply.available = available.as_ptr();
+                reply.available_len = available.len();
+                reply.remember = answer.remember;
+                // SAFETY: `read` is the borrowed request of this very callback;
+                // `contents`/`available` outlive the call.
+                unsafe { request.reply(&reply) };
+            }
+            Err(e) => {
+                reply.result = e.into();
+                // SAFETY: As above.
+                unsafe { request.reply(&reply) };
+            }
         }
     }
 
@@ -2377,6 +2640,78 @@ mod tests {
             tracked.set(&mut second, Point::Active(PointCoordinate { x: 0, y: 0 })),
             Err(Error::InvalidValue)
         ));
+    }
+
+    #[test]
+    fn clipboard_write_is_answered_through_the_reply_callback() {
+        let seen = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(80, 24).expect("terminal should initialize");
+        terminal
+            .on_clipboard_write(|_term, write| {
+                let contents: Vec<(String, String)> = write
+                    .contents()
+                    .map(|content| (content.mime.to_owned(), content.data.to_owned()))
+                    .collect();
+                seen.borrow_mut()
+                    .push((write.location(), contents, write.granted()));
+                Ok(ClipboardWriteReply { remember: false })
+            })
+            .expect("callback should register");
+
+        // OSC 52, clipboard "c", base64("hello").
+        terminal.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\");
+        // A denied write must also be answered without panicking.
+        terminal
+            .on_clipboard_write(|_term, _write| Err(ClipboardWriteError::Denied))
+            .expect("callback should re-register");
+        terminal.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\");
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, ClipboardLocation::Standard);
+        assert_eq!(
+            seen[0].1,
+            vec![("text/plain".to_owned(), "hello".to_owned())]
+        );
+    }
+
+    #[test]
+    fn clipboard_read_reply_reaches_the_pty() {
+        let pty = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(80, 24).expect("terminal should initialize");
+        terminal
+            .on_pty_write(|_term, data| pty.borrow_mut().extend_from_slice(data))
+            .expect("callback should register");
+        terminal
+            .on_clipboard_read(|_term, read| {
+                assert_eq!(read.location(), ClipboardLocation::Standard);
+                assert_eq!(read.mimes().collect::<Vec<_>>(), vec!["text/plain"]);
+                Ok(ClipboardReadReply {
+                    contents: vec![ClipboardReadContent {
+                        mime: "text/plain".to_owned(),
+                        data: "hello".to_owned(),
+                    }],
+                    available: Vec::new(),
+                    remember: false,
+                })
+            })
+            .expect("callback should register");
+
+        // OSC 52 read request: the terminal answers with the base64 contents.
+        terminal.vt_write(b"\x1b]52;c;?\x1b\\");
+        let response = String::from_utf8(pty.borrow().clone()).expect("response is ASCII");
+        assert!(
+            response.contains("52;c;aGVsbG8="),
+            "expected an OSC 52 response carrying base64(hello), got {response:?}"
+        );
+
+        // Without a reply (denied), OSC 52 gets no response at all.
+        pty.borrow_mut().clear();
+        terminal
+            .on_clipboard_read(|_term, _read| Err(ClipboardReadError::Denied))
+            .expect("callback should re-register");
+        terminal.vt_write(b"\x1b]52;c;?\x1b\\");
+        assert!(!String::from_utf8_lossy(&pty.borrow()).contains("aGVsbG8="));
     }
 
     #[test]

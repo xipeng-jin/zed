@@ -109,7 +109,7 @@ impl<L: log::Log + 'static> Logger for L {
 
 /// Log severity levels for the log callback.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, int_enum::IntEnum)]
-#[repr(u32)]
+#[repr(i32)]
 #[non_exhaustive]
 #[expect(missing_docs, reason = "missing upstream docs")]
 pub enum Level {

@@ -479,11 +479,43 @@ impl Snapshot<'_, '_> {
         }
     }
 
+    /// Get the whole cursor state in one call (one FFI round trip instead
+    /// of eight `get`s).
+    pub fn cursor(&self) -> Result<Cursor> {
+        let mut cursor = ffi::sized!(ffi::RenderStateCursor);
+        let result = unsafe {
+            ffi::ghostty_render_state_get(
+                self.0.0.as_raw(),
+                ffi::RenderStateData::CURSOR,
+                (&raw mut cursor).cast(),
+            )
+        };
+        from_result(result)?;
+
+        Ok(Cursor {
+            viewport: cursor.viewport_has_value.then_some(CursorViewport {
+                x: cursor.viewport_x,
+                y: cursor.viewport_y,
+                at_wide_tail: cursor.wide_tail,
+            }),
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            password_input: cursor.password_input,
+            visual_style: CursorVisualStyle::try_from(cursor.visual_style)
+                .map_err(|_| Error::InvalidValue)?,
+        })
+    }
+
     /// Get the current color information from a render state.
     pub fn colors(&self) -> Result<Colors> {
         let mut colors = ffi::sized!(ffi::RenderStateColors);
-        let result =
-            unsafe { ffi::ghostty_render_state_colors_get(self.0.0.as_raw(), &raw mut colors) };
+        let result = unsafe {
+            ffi::ghostty_render_state_get(
+                self.0.0.as_raw(),
+                ffi::RenderStateData::COLORS,
+                (&raw mut colors).cast(),
+            )
+        };
         from_result(result)?;
 
         Ok(Colors {
@@ -504,6 +536,13 @@ impl Snapshot<'_, '_> {
             ffi::RenderStateOption::DIRTY,
             &(dirty as ffi::RenderStateDirty::Type),
         )
+    }
+
+    /// Reset the global dirty state *and* every row's dirty flag after a
+    /// complete frame has been rendered.
+    pub fn clean(&self) -> Result<()> {
+        let result = unsafe { ffi::ghostty_render_state_clean(self.0.0.as_raw()) };
+        from_result(result)
     }
 }
 
@@ -570,6 +609,25 @@ impl RowIteration<'_, '_> {
     pub fn next(&mut self) -> Option<&Self> {
         if unsafe { ffi::ghostty_render_state_row_iterator_next(self.iter.0.as_raw()) } {
             Some(self)
+        } else {
+            None
+        }
+    }
+
+    /// Advance to the next *dirty* row, skipping clean rows in libghostty.
+    ///
+    /// Returns the viewport row index (0-based) of the dirty row together
+    /// with the positioned iterator.
+    pub fn next_dirty(&mut self) -> Option<(u16, &Self)> {
+        let mut row_index: u16 = 0;
+        let advanced = unsafe {
+            ffi::ghostty_render_state_row_iterator_next_dirty(
+                self.iter.0.as_raw(),
+                &raw mut row_index,
+            )
+        };
+        if advanced {
+            Some((row_index, self))
         } else {
             None
         }
@@ -912,6 +970,21 @@ pub struct CursorViewport {
     pub at_wide_tail: bool,
 }
 
+/// All cursor state of a render state, read with [`RenderState::cursor`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    /// Viewport position, or `None` when the cursor is outside the viewport.
+    pub viewport: Option<CursorViewport>,
+    /// Whether the cursor is visible based on terminal modes.
+    pub visible: bool,
+    /// Whether the cursor should blink based on terminal modes.
+    pub blinking: bool,
+    /// Whether the cursor is at a password input field.
+    pub password_input: bool,
+    /// The visual style of the cursor.
+    pub visual_style: CursorVisualStyle,
+}
+
 /// Render-state color information.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Colors {
@@ -926,7 +999,7 @@ pub struct Colors {
 }
 
 /// Dirty state of a render state after update.
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
 pub enum Dirty {
     /// Not dirty at all; rendering can be skipped.
@@ -938,7 +1011,7 @@ pub enum Dirty {
 }
 
 /// Visual style of the cursor.
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, int_enum::IntEnum)]
 #[non_exhaustive]
 pub enum CursorVisualStyle {
@@ -962,6 +1035,40 @@ mod tests {
     /// type `*const &T` (a pointer to the local reference), not `*const T`.
     /// C reads stack-address bytes into the dirty field, the next `update`
     /// propagates them, and `dirty()` fails enum decoding.
+    #[test]
+    fn structured_cursor_matches_field_reads() {
+        let mut terminal = Terminal::new(20, 5).unwrap();
+        terminal.vt_write(b"ab");
+        let mut state = RenderState::new().unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+
+        let cursor = snapshot.cursor().unwrap();
+        assert_eq!(cursor.viewport, snapshot.cursor_viewport().unwrap());
+        assert_eq!(cursor.viewport.map(|v| v.x), Some(2));
+        assert_eq!(cursor.visible, snapshot.cursor_visible().unwrap());
+        assert_eq!(cursor.visual_style, snapshot.cursor_visual_style().unwrap());
+    }
+
+    #[test]
+    fn next_dirty_and_clean_track_row_dirty_state() {
+        let mut terminal = Terminal::new(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[3;1Hx");
+        let mut state = RenderState::new().unwrap();
+        let mut rows = RowIterator::new().unwrap();
+
+        let snapshot = state.update(&terminal).unwrap();
+        snapshot.clean().unwrap();
+        assert_eq!(snapshot.dirty().unwrap(), Dirty::Clean);
+        assert!(rows.update(&snapshot).unwrap().next_dirty().is_none());
+
+        terminal.vt_write(b"\x1b[3;1Hy");
+        let snapshot = state.update(&terminal).unwrap();
+        let mut iteration = rows.update(&snapshot).unwrap();
+        let (dirty_row, _) = iteration.next_dirty().expect("one dirty row expected");
+        assert_eq!(dirty_row, 2);
+        assert!(iteration.next_dirty().is_none());
+    }
+
     #[test]
     fn dirty_decodes_after_set_dirty_then_update() {
         let terminal = Terminal::new(8, 3).unwrap();

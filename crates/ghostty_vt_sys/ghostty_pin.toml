@@ -27,7 +27,7 @@ vt_features = "-kitty_graphics,-glyph_protocol"
 # commit. Stamped by `cargo run -p ghostty_vt_sys --features bindgen-tool
 # --bin gen-bindings`; verified by build.rs on pinned source builds so a pin
 # bump without regenerated bindings cannot land silently.
-headers_sha256 = ""
+headers_sha256 = "8eff67afab1344ecdd4b005c1f95abcf9f19df000572393e8e7b11fc7eedaef5"
 
 # Per-target sha256 of the prebuilt libghostty-vt release assets
 # (libghostty-vt-<commit10>-<target>.tar.gz), the sole build-time trust root
