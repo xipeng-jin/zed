@@ -21,7 +21,7 @@ cpu = "baseline"
 # source build can never link a different feature set than the prebuilt it
 # replaces. The C headers and src/bindings.rs still declare the trimmed
 # symbols; the safe crate keeps them behind cargo features that default off.
-vt_features = "-kitty_graphics,-glyph_protocol"
+vt_features = "-kitty_graphics,-glyph_protocol,-snapshot"
 
 # sha256 over the installed C headers (include/ghostty/**) at the pinned
 # commit. Stamped by `cargo run -p ghostty_vt_sys --features bindgen-tool

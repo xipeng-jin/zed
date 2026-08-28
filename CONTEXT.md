@@ -14,6 +14,12 @@ Vocabulary shared by the migration map (`xipeng-jin/zed#27`) and the decision re
 - **Unverified** — ledger/perf status: recorded under v1, not yet re-fired by the v2 differential harness or benchmark. Carries no weight in a v2 gate.
 - **Obsolete** — ledger status: invalidated by the re-charting reconnaissance before any re-firing; kept for the record, never re-fired.
 - **Verified** — ledger status: re-fired under v2 and re-adjudicated by the responsible ticket.
+- **Retired** — ledger status: the divergence no longer exists at the v2 pin; the entry's waiver never fired on the v2 harness and was deleted. Kept for the record.
+- **Waiver** — the harness-side permit for one ledger entry: names the entry, pins the divergence's shape, and fails the run if it never fires. The only way a divergence passes the differential corpus.
+- **Attribution A/B** — the perf-gate procedure that explains a failing scenario by re-running it with exactly one candidate change applied (v2: the v1 fork patch) rather than by instrumenting the core.
+- **Fork-patch trigger** — the single stated condition under which v2 abandons the upstream pin for a fork commit. Recorded in `docs/ghostty-migration/verification-strategy.md §6.3`.
+- **Chunking equivalence** — the harness property that a transcript yields the same seam state and PTY responses regardless of how its bytes are split into writes.
+- **Harness probe** — a ghostty-side observation installed only in the differential harness, never in the product seam (e.g. the unknown-sequence callback). Triage or invariant, never a comparison field.
 - **Re-charting reconnaissance** — the delta surveys (comments 4/6–6/6 on the map) that replaced the charting-time surveys; where they conflict, the deltas win.
 - **Platform gate** — the per-platform acceptance list (macOS, Windows) that must be green before the Alacritty-removal phase may execute. Recorded in `docs/ghostty-migration/verification-strategy.md §9`.
 - **Binding evidence** — evidence a platform gate accepts toward discharge. Each gate item names who can produce its binding evidence (the fork, or upstream at upstreaming time).

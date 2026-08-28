@@ -105,9 +105,11 @@ perf work on a known machine).
 - `[sha256]` — per-target digests of the prebuilt archives (empty until the
   artifact pipeline publishes `release`; see "Build contract" step 4).
 
-Bindings at the pin: 190 `ghostty_*` functions declared; the trimmed
-ReleaseFast/baseline archive exports 180 (0 `ghostty_kitty_graphics_*`,
-12 `ghostty_snapshot_*`, 0 wuffs).
+Bindings at the pin: 190 `ghostty_*` functions declared; the archive trimmed
+with `-kitty_graphics,-glyph_protocol` exported 180 (0 `ghostty_kitty_graphics_*`,
+12 `ghostty_snapshot_*`, 0 wuffs). Since 2026-08-28 the pin also trims
+`-snapshot` (verification-strategy.md §0): expected 167 exports, 0
+`ghostty_snapshot_*`; re-measured when the first prebuilt release is stamped.
 
 ## Regenerating bindings (pin bump)
 

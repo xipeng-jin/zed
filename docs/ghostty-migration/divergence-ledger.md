@@ -1,5 +1,5 @@
 > [!NOTE]
-> **v2 status (2026-08-25):** v1 record, salvaged by file (salvage-policy.md rule 4): every entry/number is **unverified** until the v2 harness re-fires it on the v2 CPU policy. Source: `migration/libghostty` @ `e537270dac`.
+> **v2 status (2026-08-28, ticket #37):** v1 record, salvaged by file (salvage-policy.md rule 4). 42 entries: 41 **unverified**, 1 **obsolete** (P5-001). Mechanics for the first v2 harness run are fixed in [verification-strategy.md §3.4](verification-strategy.md#34-divergence-ledger): every waiver still fails the run if it never fires; each `unverified` entry then becomes `verified` (fires, shape holds), `retired: no longer diverges at <pin>` (never fires, waiver deleted), or `superseded by <id>` (fires, shape changed → new entry). Gate point 3 requires zero `unverified` entries. Expected outcomes per entry: parity-matrix.md §5. Source: `migration/libghostty` @ `e537270dac`.
 
 # Divergence ledger
 

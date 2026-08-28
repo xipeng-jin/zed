@@ -1,5 +1,5 @@
 > [!NOTE]
-> **v2 status (2026-08-25):** v1 record, salvaged by file (salvage-policy.md rule 4): every entry/number is **unverified** until the v2 harness re-fires it on the v2 CPU policy. Source: `migration/libghostty` @ `e537270dac`.
+> **v2 status (2026-08-28, ticket #37):** v1 record, salvaged by file (salvage-policy.md rule 4) — **history only, no v2 gate reading may cite these numbers.** The v2 gate is defined in [verification-strategy.md §6.1–§6.3](verification-strategy.md#6-performance): the same five scenarios and 20 % bar; alacritty re-recorded and ghostty measured in **one** release run, ghostty = the upstream **baseline** prebuilt `ghostty-8867c37c55` with the trimmed `vt_features` (no fork patch); the `sustained_scroll` row-reuse cache carries as seam code; a `colored_dump` failure is attributed by A/B against fork patch `636ce3a46f`, and the patch is re-pinned only if the A/B attributes the failure — otherwise the swap is held, never adjudicated. The v2 numbers are appended below this file's history when the run happens. Source: `migration/libghostty` @ `e537270dac`.
 
 # Alacritty performance baseline (P7)
 
